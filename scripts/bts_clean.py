@@ -18,6 +18,10 @@ if os.name == "nt" and "HADOOP_HOME" not in os.environ:
         os.environ["HADOOP_HOME"] = str(hadoop_dir)
         os.environ["PATH"] = str(hadoop_dir / "bin") + os.pathsep + os.environ.get("PATH", "")
 
+# Ensure PySpark workers use the active Python interpreter.
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
 
 def get_spark_session(app_name="bts_cleaning"):
     return (
@@ -140,8 +144,12 @@ def main():
     spark = get_spark_session()
     try:
         summary = clean_bts_data(spark)
-        print("BTS cleaning completed successfully:")
+        total_retained = summary["retained_records"].sum()
+        print("-" * 80)
+        print(f"BTS Cleaning Summary Table (Total Retained Flights: {total_retained:,}):")
+        print("-" * 80)
         print(summary.to_string(index=False))
+        print("-" * 80)
         return 0
     finally:
         spark.stop()

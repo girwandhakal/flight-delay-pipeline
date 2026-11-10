@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import sys
 
 import pandas as pd
 from pyspark.sql import SparkSession
@@ -16,6 +17,11 @@ if os.name == "nt" and "HADOOP_HOME" not in os.environ:
     if (hadoop_dir / "bin" / "winutils.exe").exists():
         os.environ["HADOOP_HOME"] = str(hadoop_dir)
         os.environ["PATH"] = str(hadoop_dir / "bin") + os.pathsep + os.environ.get("PATH", "")
+
+# Ensure PySpark workers use the active Python interpreter.
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
 
 def get_spark_session(app_name="bts_features"):
     return (
@@ -139,8 +145,12 @@ def main():
     spark = get_spark_session()
     try:
         summary = build_features(spark)
-        print("Feature engineering and chronological splitting completed:")
+        total_flights = summary["total_flights"].sum()
+        print("-" * 80)
+        print(f"Chronological Splitting Summary (Total Processed Flights: {total_flights:,}):")
+        print("-" * 80)
         print(summary.to_string(index=False))
+        print("-" * 80)
         return 0
     finally:
         spark.stop()

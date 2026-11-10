@@ -114,11 +114,8 @@ def main():
     completed, skipped, failed = 0, 0, []
 
     for year, month in iter_months(settings["start_month"], settings["end_month"]):
-
         period = f"{year}-{month:02d}"
-
         try:
-
             folder = ROOT / settings["output_directory"] / str(year) / f"{month:02d}"
             folder.mkdir(parents=True, exist_ok=True)
             url = build_download_url(year, month)
@@ -127,28 +124,23 @@ def main():
 
             if csv_path.exists():
                 skipped += 1
-                print(f"Skipped {period}: CSV already exists.", flush=True)
+                print(f"  Skipped {period}: CSV already exists.", flush=True)
                 continue
 
-            # download the bts zip files
             download_file(url, zip_path)
-
-            # extract csv from the zip files
             extract_csv(zip_path, csv_path)
-
             completed += 1
-            print(f"Completed {period}", flush=True)
+            print(f"  Completed {period}", flush=True)
 
         except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, EOFError) as error:
-
             failed.append(period)
-            print(f"Failed {period}: {error}", flush=True)
+            print(f"  Failed {period}: {error}", flush=True)
 
-    print(f"Completed: {completed}; skipped: {skipped}; failed: {len(failed)}", flush=True)
-    
+    print("-" * 80)
+    print(f"BTS Acquisition Summary: Completed: {completed}; Skipped: {skipped}; Failed: {len(failed)}")
     if failed:
-        print("Failed months: " + ", ".join(failed), flush=True)
-    # A nonzero exit status lets the caller know the range is incomplete.
+        print("  Failed months: " + ", ".join(failed))
+    print("-" * 80)
     return 1 if failed else 0
 
 

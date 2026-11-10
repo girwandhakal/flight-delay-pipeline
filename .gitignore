@@ -17,3 +17,5 @@ manifests/*.part
 spark-warehouse/
 metastore_db/
 derby.log
+/envs/hadoop/
+output.txt

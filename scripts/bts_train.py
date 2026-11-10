@@ -7,11 +7,12 @@ from pathlib import Path
 import sys
 
 import pandas as pd
-from pyspark.ml import Pipeline, PipelineModel
+from pyspark.ml import Pipeline
 from pyspark.ml.classification import LogisticRegression
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml.feature import OneHotEncoder, StringIndexer, VectorAssembler
 from pyspark.ml.functions import vector_to_array
+from pyspark.ml.tuning import ParamGridBuilder, TrainValidationSplit
 from pyspark.sql import functions as F
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,7 +41,8 @@ CATEGORICAL_FEATURES = [
 ]
 NUMERIC_FEATURES = ["CRSElapsedTime", "Distance"]
 TARGET_COL = "ArrDel15"
-REG_PARAMS = [0.01, 0.1, 1.0]
+REG_PARAMS = [0.001, 0.01, 0.1, 1.0]
+ELASTIC_NET_PARAMS = [0.0, 0.5, 1.0]
 THRESHOLDS = [round(i * 0.05, 2) for i in range(1, 20)]
 
 
@@ -146,10 +148,10 @@ def train(spark, gold_dir=None, models_dir=None, results_dir=None):
     train_data = spark.read.parquet(str(gold_dir / "train"))
     val_data = spark.read.parquet(str(gold_dir / "val"))
 
-    print("\n--- [Step 1/4] Fitting Preprocessor on Training Flights ---", flush=True)
-    preprocessor = build_preprocessor().fit(train_data)
-    train_features = preprocessor.transform(train_data).select("features", TARGET_COL).cache()
-    val_features = preprocessor.transform(val_data).select("features", TARGET_COL).cache()
+    print("\n--- [Step 1/4] Preparing Training and Validation Flights ---", flush=True)
+    columns = CATEGORICAL_FEATURES + NUMERIC_FEATURES + [TARGET_COL]
+    train_features = train_data.select(*columns).cache()
+    val_features = val_data.select(*columns).cache()
     selected_scores = None
 
     try:
@@ -176,44 +178,41 @@ def train(spark, gold_dir=None, models_dir=None, results_dir=None):
         print(f"  Always On-Time Reference:      Accuracy = {references['always_ontime']['accuracy']:.4f}, F1 = {references['always_ontime']['f1']:.4f}", flush=True)
         print(f"  Training Prevalence Reference: Accuracy = {references['train_prevalence']['accuracy']:.4f}, F1 = {references['train_prevalence']['f1']:.4f}", flush=True)
 
-        # Candidate model evaluations across regularization parameters.
-        print("\n--- [Step 3/4] Training Logistic Regression Candidates ---", flush=True)
-        candidates = []
-        selected_model = None
-        selected_default = None
-        selected_reg = None
+        print("\n--- [Step 3/4] Automatic Hyperparameter Search ---", flush=True)
+        estimator = LogisticRegression(
+            featuresCol="features", labelCol=TARGET_COL, family="binomial",
+            standardization=True, maxIter=100, tol=1e-6,
+        )
+        grid = (ParamGridBuilder()
+                .addGrid(estimator.regParam, REG_PARAMS)
+                .addGrid(estimator.elasticNetParam, ELASTIC_NET_PARAMS)
+                .build())
+        evaluator = BinaryClassificationEvaluator(
+            labelCol=TARGET_COL, metricName="areaUnderPR",
+        )
+        # Fit encoders inside each tuning split; later validation months stay separate.
+        search = TrainValidationSplit(
+            estimator=Pipeline(stages=build_preprocessor().getStages() + [estimator]),
+            estimatorParamMaps=grid, evaluator=evaluator,
+            trainRatio=0.8, seed=42, parallelism=1, collectSubModels=False,
+        )
+        print(f"  Searching {len(grid)} combinations by internal validation PR-AUC...", flush=True)
+        fitted_search = search.fit(train_features)
+        selected_model = fitted_search.bestModel
+        classifier = selected_model.stages[-1]
+        selected_reg = classifier.getRegParam()
+        selected_elastic_net = classifier.getElasticNetParam()
+        candidates = [
+            {"reg_param": params[estimator.regParam],
+             "elastic_net_param": params[estimator.elasticNetParam],
+             "internal_pr_auc": score}
+            for params, score in zip(grid, fitted_search.validationMetrics)
+        ]
+        print(f"  Selected regParam={selected_reg}, elasticNetParam={selected_elastic_net}", flush=True)
 
-        for idx, reg_param in enumerate(REG_PARAMS, start=1):
-            print(f"  Candidate {idx}/{len(REG_PARAMS)} (regParam={reg_param}):", flush=True)
-            model = LogisticRegression(
-                featuresCol="features",
-                labelCol=TARGET_COL,
-                family="binomial",
-                standardization=True,
-                elasticNetParam=0.0,
-                regParam=reg_param,
-                maxIter=100,
-                tol=1e-6,
-            ).fit(train_features)
-
-            scores = predict(model, val_features).select(TARGET_COL, "p_delayed", "prediction").cache()
-            try:
-                metrics = evaluate_predictions(scores)
-            finally:
-                scores.unpersist()
-
-            candidates.append({"reg_param": reg_param, **metrics})
-            print(f"    Validation PR-AUC: {metrics['pr_auc']:.4f} | ROC-AUC: {metrics['roc_auc']:.4f} | F1 (at 0.5): {metrics['f1']:.4f}", flush=True)
-
-            # Choose candidate with highest validation PR-AUC; tie-break with higher regularization.
-            if selected_model is None or (metrics["pr_auc"], reg_param) > (selected_default["pr_auc"], selected_reg):
-                selected_model, selected_default, selected_reg = model, metrics, reg_param
-
-        print(f"  => Selected Best Model: regParam={selected_reg} (PR-AUC: {selected_default['pr_auc']:.4f})", flush=True)
-
-        # Select decision threshold on best candidate.
-        print("\n--- [Step 4/4] Tuning Classification Threshold (Maximizing F1) ---", flush=True)
+        print("\n--- [Step 4/4] Validation and Threshold Selection ---", flush=True)
         selected_scores = predict(selected_model, val_features).select(TARGET_COL, "p_delayed", "prediction").cache()
+        selected_default = evaluate_predictions(selected_scores)
         threshold, search_df = tune_threshold(selected_scores)
 
         best_row = search_df.loc[search_df["threshold"] == threshold].iloc[0]
@@ -235,9 +234,15 @@ def train(spark, gold_dir=None, models_dir=None, results_dir=None):
             "validation_rows": val_count,
             "selected_model": {
                 "reg_param": selected_reg,
+                "elastic_net_param": selected_elastic_net,
                 "best_threshold": threshold,
                 "validation_metrics_at_selected_threshold": selected_metrics,
                 "validation_metrics_at_default_0_5": selected_default,
+            },
+            "tuning": {
+                "method": "Spark TrainValidationSplit", "metric": "areaUnderPR",
+                "train_ratio": 0.8, "seed": 42, "combinations": len(grid),
+                "scope": "random split within training only; winner refitted on all training rows",
             },
             "candidate_comparison": candidates,
             "reference_baselines": references,
@@ -247,8 +252,7 @@ def train(spark, gold_dir=None, models_dir=None, results_dir=None):
         models_dir.mkdir(parents=True, exist_ok=True)
         results_dir.mkdir(parents=True, exist_ok=True)
 
-        pipeline = PipelineModel(stages=preprocessor.stages + [selected_model])
-        pipeline.write().overwrite().save(str(models_dir / "baseline_pipeline"))
+        selected_model.write().overwrite().save(str(models_dir / "baseline_pipeline"))
 
         threshold_info = {
             "threshold": threshold,
@@ -278,6 +282,7 @@ def main():
         print("Selected BTS Baseline Model Summary:")
         print("-" * 80)
         print(f"  Selected Regularization (regParam): {selected['reg_param']}")
+        print(f"  Selected Elastic Net:              {selected['elastic_net_param']}")
         print(f"  Optimized Decision Threshold:       {selected['best_threshold']:.2f}")
         print(f"  Validation PR-AUC:                  {val_metrics['pr_auc']:.4f}")
         print(f"  Validation ROC-AUC:                 {val_metrics['roc_auc']:.4f}")
