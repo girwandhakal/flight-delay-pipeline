@@ -9,14 +9,16 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import bts_clean
 import bts_download
+import bts_evaluate
 import bts_train
 import bts_transform
 
 STAGES = [
-    ("Stage 1/4", "BTS Data Acquisition (Download)", bts_download.main),
-    ("Stage 2/4", "BTS Data Cleaning (Bronze -> Silver)", bts_clean.main),
-    ("Stage 3/4", "Feature Engineering & Chronological Splitting (Silver -> Gold)", bts_transform.main),
-    ("Stage 4/4", "Baseline Model Training & Validation (Gold -> Models)", bts_train.main),
+    ("Stage 1/5", "BTS Data Acquisition (Download)", bts_download.main),
+    ("Stage 2/5", "BTS Data Cleaning", bts_clean.main),
+    ("Stage 3/5", "Feature Engineering & Chronological Splitting", bts_transform.main),
+    ("Stage 4/5", "Baseline Model Training & Validation", bts_train.main),
+    ("Stage 5/5", "Baseline Model Evaluation", bts_evaluate.main),
 ]
 
 

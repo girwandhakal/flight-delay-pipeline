@@ -37,7 +37,7 @@ def load_config(root=ROOT):
     settings = json.loads((root / "config.json").read_text(encoding="utf-8"))["datasets"]["bts"]
     # Run the generator now so invalid dates fail before any files are written.
     list(iter_months(settings["start_month"], settings["end_month"]))
-    directory = Path(settings["output_directory"])
+    directory = Path(settings.setdefault("output_directory", "data/bronze/bts"))
     if directory.is_absolute() or not (root / directory).resolve().is_relative_to(root.resolve()):
         raise ValueError("output_directory must be relative and stay inside the project.")
     return settings
@@ -111,12 +111,16 @@ def extract_csv(zip_path, destination):
 # Process each requested month and report which months completed, skipped, or failed.
 def main():
     settings = load_config()
+    for layer in ("bronze", "silver", "gold", "quarantine"):
+        (ROOT / "data" / layer / "bts").mkdir(parents=True, exist_ok=True)
+    output_directory = ROOT / settings["output_directory"]
+    output_directory.mkdir(parents=True, exist_ok=True)
     completed, skipped, failed = 0, 0, []
 
     for year, month in iter_months(settings["start_month"], settings["end_month"]):
         period = f"{year}-{month:02d}"
         try:
-            folder = ROOT / settings["output_directory"] / str(year) / f"{month:02d}"
+            folder = output_directory / str(year) / f"{month:02d}"
             folder.mkdir(parents=True, exist_ok=True)
             url = build_download_url(year, month)
             zip_path = folder / url.rsplit("/", 1)[1]

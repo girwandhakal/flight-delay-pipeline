@@ -12,7 +12,7 @@ from pyspark.ml.classification import LogisticRegression
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml.feature import OneHotEncoder, StringIndexer, VectorAssembler
 from pyspark.ml.functions import vector_to_array
-from pyspark.ml.tuning import ParamGridBuilder, TrainValidationSplit
+from pyspark.ml.tuning import ParamGridBuilder
 from pyspark.sql import functions as F
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -150,7 +150,7 @@ def train(spark, gold_dir=None, models_dir=None, results_dir=None):
 
     print("\n--- [Step 1/4] Preparing Training and Validation Flights ---", flush=True)
     columns = CATEGORICAL_FEATURES + NUMERIC_FEATURES + [TARGET_COL]
-    train_features = train_data.select(*columns).cache()
+    train_features = train_data.select("FlightDate", *columns).cache()
     val_features = val_data.select(*columns).cache()
     selected_scores = None
 
@@ -190,24 +190,42 @@ def train(spark, gold_dir=None, models_dir=None, results_dir=None):
         evaluator = BinaryClassificationEvaluator(
             labelCol=TARGET_COL, metricName="areaUnderPR",
         )
-        # Fit encoders inside each tuning split; later validation months stay separate.
-        search = TrainValidationSplit(
-            estimator=Pipeline(stages=build_preprocessor().getStages() + [estimator]),
-            estimatorParamMaps=grid, evaluator=evaluator,
-            trainRatio=0.8, seed=42, parallelism=1, collectSubModels=False,
-        )
-        print(f"  Searching {len(grid)} combinations by internal validation PR-AUC...", flush=True)
-        fitted_search = search.fit(train_features)
-        selected_model = fitted_search.bestModel
-        classifier = selected_model.stages[-1]
-        selected_reg = classifier.getRegParam()
-        selected_elastic_net = classifier.getElasticNetParam()
+        months = [row.month for row in train_features.select(
+            F.trunc("FlightDate", "month").alias("month")
+        ).distinct().orderBy("month").collect()]
+        if None in months or len(months) < 4:
+            raise ValueError("Chronological cross-validation requires valid FlightDate values and at least four training months")
         candidates = [
             {"reg_param": params[estimator.regParam],
              "elastic_net_param": params[estimator.elasticNetParam],
-             "internal_pr_auc": score}
-            for params, score in zip(grid, fitted_search.validationMetrics)
+             "fold_pr_auc": []}
+            for params in grid
         ]
+        folds = []
+        print(f"  Searching {len(grid)} combinations across 3 chronological folds...", flush=True)
+        for month in months[-3:]:
+            fold_train = train_features.filter(F.col("FlightDate") < F.lit(month))
+            fold_val = train_features.filter(F.trunc("FlightDate", "month") == F.lit(month))
+            # Fit once per fold: preprocessing does not depend on classifier parameters.
+            preprocessor = build_preprocessor().fit(fold_train)
+            encoded_train = preprocessor.transform(fold_train).cache()
+            encoded_val = preprocessor.transform(fold_val).cache()
+            try:
+                for params, candidate in zip(grid, candidates):
+                    model = estimator.fit(encoded_train, params)
+                    candidate["fold_pr_auc"].append(evaluator.evaluate(model.transform(encoded_val)))
+            finally:
+                encoded_train.unpersist()
+                encoded_val.unpersist()
+            folds.append({"train_before": month.isoformat(), "validation_month": month.strftime("%Y-%m")})
+            print(f"  Finished fold: train before {month}, validate {month:%Y-%m}", flush=True)
+        for candidate in candidates:
+            candidate["internal_pr_auc"] = sum(candidate["fold_pr_auc"]) / len(folds)
+        best = max(range(len(grid)), key=lambda i: candidates[i]["internal_pr_auc"])
+        selected_model = Pipeline(stages=build_preprocessor().getStages() + [estimator]).fit(train_features, grid[best])
+        classifier = selected_model.stages[-1]
+        selected_reg = classifier.getRegParam()
+        selected_elastic_net = classifier.getElasticNetParam()
         print(f"  Selected regParam={selected_reg}, elasticNetParam={selected_elastic_net}", flush=True)
 
         print("\n--- [Step 4/4] Validation and Threshold Selection ---", flush=True)
@@ -240,9 +258,10 @@ def train(spark, gold_dir=None, models_dir=None, results_dir=None):
                 "validation_metrics_at_default_0_5": selected_default,
             },
             "tuning": {
-                "method": "Spark TrainValidationSplit", "metric": "areaUnderPR",
-                "train_ratio": 0.8, "seed": 42, "combinations": len(grid),
-                "scope": "random split within training only; winner refitted on all training rows",
+                "method": "expanding-window chronological cross-validation", "metric": "areaUnderPR",
+                "folds": folds, "combinations": len(grid),
+                "aggregation": "mean PR-AUC across folds",
+                "scope": "last three training months scored separately using only earlier flights; winner refitted on all training rows",
             },
             "candidate_comparison": candidates,
             "reference_baselines": references,
