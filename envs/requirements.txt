@@ -4,3 +4,4 @@ matplotlib>=3.8,<4
 seaborn>=0.13,<0.14
 tqdm>=4.66,<5
 ipykernel>=6,<8
+pytest>=8,<10

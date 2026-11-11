@@ -28,10 +28,17 @@ python scripts/bts_transform.py
 python scripts/bts_train.py
 ```
 
-Run tests:
+Run tests from the project root:
 ```bash
-python -m unittest discover tests
+conda activate cs523_project_env
+python -m pip install -r envs/requirements.txt
+python -m pytest
 ```
+
+Pytest shows compact pass/fail progress and a final summary. Passing-test output
+is captured; failures show tracebacks and captured logs. To see individual test
+names, use `python -m pytest -v`. To include the warnings summary, add
+`-o addopts="-q"`.
 
 ## Current Progress
 
