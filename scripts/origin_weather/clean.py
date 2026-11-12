@@ -6,15 +6,18 @@ import json
 
 from scripts.results import records, update_results
 
-from pyspark.sql import functions as F, Window
+from pyspark.sql import functions as F, types as T, Window
 
 from .download import (
     ROOT,
-    MEASUREMENTS,
     REPORTS,
     load_config,
     standard_offset,
     write_json,
+)
+from .measurements import (
+    SOURCE_FIELDS, NUMERIC_FEATURES, MISSING_FLAGS, INDICATOR_FLAGS,
+    FEATURE_COLUMNS, UNITS, decode_weather,
 )
 
 
@@ -56,12 +59,19 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
         spark.read.option("header", True)
         .option("mode", "FAILFAST")
         .csv(paths)
-        .select(
+    )
+    audit_columns = [name for name in ("LATITUDE", "LONGITUDE", "ELEVATION") if name in raw.columns]
+    missing = set(SOURCE_FIELDS) - set(raw.columns)
+    if missing:
+        raise ValueError(f"Weather source lacks required LCDv2 fields: {sorted(missing)}")
+    raw = (
+        raw.select(
             "STATION",
             "DATE",
             "REPORT_TYPE",
             "REM",
-            *MEASUREMENTS,
+            *SOURCE_FIELDS,
+            *audit_columns,
             F.input_file_name().alias("source_file"),
         )
         .withColumnRenamed("STATION", "station_id")
@@ -78,16 +88,14 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
             F.from_unixtime(csv_clock.cast("long") - F.col("standard_offset")).cast("timestamp")
         ),
     )
-    for source, output in MEASUREMENTS.items():
-        numeric = F.when(
-            F.trim(F.col(source)).rlike(r"^[+-]?(\d+(\.\d*)?|\.\d+)$"),
-            F.col(source).cast("double"),
-        )
-        numeric = F.when(F.abs(numeric) != float("inf"), numeric)
-        if source != "HourlyDryBulbTemperature":
-            numeric = F.when(numeric >= 0, numeric)
-        parsed = parsed.withColumn(output, numeric)
-    parsed = parsed.cache()
+    schema = T.StructType(
+        [T.StructField(name, T.DoubleType(), True) for name in NUMERIC_FEATURES]
+        + [T.StructField(name, T.IntegerType(), False) for name in [*MISSING_FLAGS, *INDICATOR_FLAGS]]
+    )
+    decode = F.udf(lambda *tokens: decode_weather(dict(zip(SOURCE_FIELDS, tokens))), schema)
+    parsed = parsed.withColumn("decoded_weather", decode(*SOURCE_FIELDS)).select(
+        "*", "decoded_weather.*"
+    ).drop("decoded_weather").cache()
     try:
         inconsistent = F.col("REPORT_TYPE").isin(REPORTS) & (
             metar_clock != F.date_format("observation_utc", "ddHHmm")
@@ -122,7 +130,7 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
             F.sha2(
                 F.concat_ws(
                     "|",
-                    *[F.coalesce(F.col(c), F.lit("")) for c in ["REM", *MEASUREMENTS]],
+                    *[F.coalesce(F.col(c), F.lit("")) for c in ["REM", *SOURCE_FIELDS]],
                 ),
                 256,
             ),
@@ -136,8 +144,9 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
                 "source_file",
                 "REPORT_TYPE",
                 "REM",
-                *MEASUREMENTS,
-                *MEASUREMENTS.values(),
+                *SOURCE_FIELDS,
+                *FEATURE_COLUMNS,
+                *audit_columns,
             )
             .withColumn("year", F.year("observation_utc"))
             .withColumn("month", F.month("observation_utc"))
@@ -178,7 +187,7 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
                 F.max("gap_minutes").alias("max_gap_minutes"),
                 *[
                     F.sum(F.col(name).isNull().cast("int")).alias(name + "_missing")
-                    for name in MEASUREMENTS.values()
+                    for name in NUMERIC_FEATURES
                 ],
             )
             .toPandas()
@@ -191,10 +200,13 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
                 "source_contract": {
                     "timestamp_basis": "metar_verified_utc_or_local_standard",
                     "report_types": REPORTS,
-                    "fields": MEASUREMENTS,
-                    "units": manifest["units"],
+                    "fields": SOURCE_FIELDS,
+                    "numeric_features": NUMERIC_FEATURES,
+                    "missingness_flags": MISSING_FLAGS,
+                    "indicator_flags": INDICATOR_FLAGS,
+                    "units": UNITS,
                     "time_evidence": "CSV clocks are interpreted as UTC or local standard time only when the embedded METAR/SPECI UTC clock agrees. Disagreements and missing embedded clocks are quarantined, including observed DST-transition source anomalies.",
-                    "quality_policy": "Strict numeric tokens only; flagged/suffixed values become null. Preserve original values and REM. Negative wind/visibility become null.",
+                    "quality_policy": "Strict finite numeric tokens; flagged/suffixed tokens become null. Negative values are allowed only for temperature/dew point; humidity must be 0-100 and pressure positive. Trace precipitation is encoded as lower-bound 0 mm plus a trace flag. Direction uses sine/cosine plus calm/variable flags. Weather contractions are multi-hot; blank/unsupported codes remain unknown rather than clear. Cloud oktas and lowest BKN/OVC/VV ceiling are decoded; CSV heights are multiplied by 100 to meters. No ceiling is distinguished from missing ceiling. All features use one report; no forward fill. Raw fields and REM are retained.",
                     "duplicate_priority": "FM-15, FM-16, source filename, raw-value SHA-256",
                 },
             },

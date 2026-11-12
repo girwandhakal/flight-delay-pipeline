@@ -14,17 +14,14 @@ from zoneinfo import ZoneInfo
 
 from scripts.results import replace_file
 
+from .measurements import MEASUREMENTS, SOURCE_FIELDS, UNITS
+
 ROOT = Path(__file__).resolve().parents[2]
 BASE_URL = "https://www.ncei.noaa.gov/oa/local-climatological-data/v2"
 SOURCES = {
     "airports.dat": "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat",
     "isd_history.csv": "https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv",
     "lcd_stations.txt": BASE_URL + "/doc/lcdv2-station-list.txt",
-}
-MEASUREMENTS = {
-    "HourlyDryBulbTemperature": "origin_temperature_c",
-    "HourlyWindSpeed": "origin_wind_speed_ms",
-    "HourlyVisibility": "origin_visibility_km",
 }
 REPORTS = ["FM-15", "FM-16"]
 
@@ -260,7 +257,7 @@ def validate_file(path, station_id, year, time_zone):
     offset = timedelta(seconds=standard_offset(time_zone, year))
     with Path(path).open(encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
-        required = {"STATION", "DATE", "REPORT_TYPE", "REM", *MEASUREMENTS}
+        required = {"STATION", "DATE", "REPORT_TYPE", "REM", *SOURCE_FIELDS}
         if not required.issubset(reader.fieldnames or []):
             raise ValueError(f"Invalid LCDv2 header: {path}")
         for row in reader:
@@ -314,6 +311,8 @@ def download_weather(requests, directory):
         }
     )
     manifest["timestamp_basis"] = "metar_verified_utc_or_local_standard"
+    manifest["units"] = UNITS.copy()
+    manifest["weather_fields"] = SOURCE_FIELDS
     manifest["complete"] = False
     write_json(manifest_path, manifest)
     for station_id, year, time_zone in sorted(set(requests)):

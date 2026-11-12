@@ -47,6 +47,6 @@
   ],
   "origin_weather": {
     "max_age_minutes": 120,
-    "publication_lag_minutes": 15
+    "publication_lag_minutes": 0
   }
 }

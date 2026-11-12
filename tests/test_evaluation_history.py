@@ -1,4 +1,4 @@
-"""Check single-file result updates and failure recovery without Spark."""
+"""Check result updates, history snapshots and failure recovery without Spark."""
 
 import json
 from pathlib import Path
@@ -16,6 +16,7 @@ from pipeline import main as pipeline
 class ResultsTests(unittest.TestCase):
     def test_updates_preserve_other_models_and_stages(self):
         with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp) / "results"
             update_results({"bts": {"training": {"fit": 1}, "validation": {"f1": 0.2}},
                             "bts_origin_weather": {"validation": {"f1": 0.3}}}, tmp)
             for run in range(3):
@@ -30,6 +31,7 @@ class ResultsTests(unittest.TestCase):
 
     def test_retraining_clears_only_that_models_stale_test_and_run(self):
         with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp) / "results"
             update_results({"bts": {"test": {"f1": 0.1}, "run_id": "old"},
                             "bts_origin_weather": {"test": {"f1": 0.2}}}, tmp)
             path = update_results({"bts": {"training": {"fit": 2}, "validation": {}}}, tmp)
@@ -40,6 +42,7 @@ class ResultsTests(unittest.TestCase):
 
     def test_failed_serialization_or_publication_preserves_file(self):
         with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp) / "results"
             path = update_results({"bts": {"test": {"run": 1}}}, tmp)
             previous = path.read_bytes()
             with self.assertRaises(ValueError):
@@ -49,6 +52,33 @@ class ResultsTests(unittest.TestCase):
                     update_results({"bts": {"test": {"run": 2}}}, tmp)
             self.assertEqual(path.read_bytes(), previous)
             self.assertEqual(list(Path(tmp).iterdir()), [path])
+
+    def test_archives_exact_previous_bytes_for_each_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history = root / "results_history"
+            path = update_results({"bts": {"test": {"run": 0}}}, root / "results")
+            self.assertFalse(history.exists())
+            previous = []
+            for run in (1, 2):
+                previous.append(path.read_bytes())
+                update_results({"bts": {"test": {"run": run}}}, root / "results")
+            snapshots = sorted(history.iterdir())
+            self.assertEqual([p.read_bytes() for p in snapshots], previous)
+            for snapshot in snapshots:
+                self.assertRegex(snapshot.name, r"^results_\d{8}T\d{12}Z_[0-9a-f]{32}\.json$")
+            self.assertEqual(list(path.parent.iterdir()), [path])
+            self.assertEqual(json.loads(path.read_text())["bts"]["test"]["run"], 2)
+
+    def test_archive_failure_preserves_latest_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = update_results({"bts": {"test": {"run": 0}}}, root / "results")
+            previous = path.read_bytes()
+            (root / "results_history").write_text("blocked")
+            with self.assertRaises(FileExistsError):
+                update_results({"bts": {"test": {"run": 1}}}, root / "results")
+            self.assertEqual(path.read_bytes(), previous)
 
     def test_evaluation_uses_current_model_and_rejects_an_unrelated_fit(self):
         with tempfile.TemporaryDirectory() as tmp:

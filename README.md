@@ -74,7 +74,7 @@ The shared `scripts/bts/train.py` trains either feature set. For weather, it use
 
 Small lookup tables live under `data/reference/weather/`: airport time zones and exact ICAO/WBAN station links. Reference construction cross-checks NOAA's LCD inventory and station history, accepts only a unique match within 5 km of the named airport and leaves ambiguous/unmapped origins without weather. This is an identifier linkage check, not nearest-station selection. OpenFlights airport metadata is current, so historical metadata availability is not established. The retained source files and hashes document the evidence and OpenFlights' ODbL attribution.
 
-Weather CSV clocks can use UTC or local standard time. Each hourly observation is normalized only when one of those interpretations matches its embedded METAR/SPECI UTC clock; inconsistent or missing clocks are quarantined. Scheduled flights use historical airport civil time, including DST; ambiguous/nonexistent departures remain unmatched. Default matching uses the latest report 15-120 minutes before scheduled departure. Flagged numeric measurements become missing rather than zero. The lag is a research assumption, not proof of publication availability.
+Weather CSV clocks can use UTC or local standard time. Each hourly observation is normalized only when one of those interpretations matches its embedded METAR/SPECI UTC clock; inconsistent or missing clocks are quarantined. Scheduled flights use historical airport civil time, including DST; ambiguous/nonexistent departures remain unmatched. Default matching uses the latest report at or before scheduled departure, up to 120 minutes old. The zero-minute publication lag assumes reports are available at their observation timestamps; historical publication availability is not established. Flagged numeric measurements become missing rather than zero. Existing generated datasets, models and results retain their original matching policy until the weather experiment is rebuilt and retrained.
 
 Outputs:
 
@@ -101,7 +101,13 @@ All reported results live in `results/results.json`, keyed by feature set (`bts`
 `bts_origin_weather`). Cleaning counts, split counts, training/search settings,
 validation scores, test scores and subgroup metrics are sections of that file.
 Weather quality and coverage are included as JSON tables;
-no result CSVs, Markdown reports, figures or automatic history folders are written.
+no result CSVs, Markdown reports or figures are written.
+Before each update, the existing JSON is archived in the root-level
+`results_history/results_<UTC timestamp>_<unique ID>.json`. A pipeline run can
+produce several snapshots because stages publish separately; standalone stages
+archive results too. The first write has nothing to archive. Archives preserve
+the exact previous file and are excluded from Git. If archiving fails, the
+latest file is left unchanged. History is retained until manually removed.
 Each update preserves other models and unrelated stages. Retraining clears that
 model's previous test scores; test results appear only after explicit evaluation
 (or the existing BTS end-to-end pipeline's evaluation stage). Failed JSON writes
@@ -115,6 +121,7 @@ internal manifest used to reload a frozen comparison stay under `models/`.
 - BTS download script and downloader tests.
 - Environment specifications for the project.
 - Exploratory data analysis (`notebooks/eda_bts.ipynb`) examining data quality, arrival-delay frequency, schedule features, and diurnal delay patterns.
+- Origin-weather EDA (`notebooks/eda_origin_weather.ipynb`) showing the original LCDv2 schema, retained source columns, basic counts, missing values, summary statistics, and weather distributions.
 - Data cleaning (`scripts/bts/clean.py`) producing 7,487,515 cleaned silver records across 13 months.
 - Feature engineering and chronological splitting (`scripts/bts/build_features.py`) writing partitioned gold datasets.
 - Baseline logistic regression modeling, threshold selection, and validation evaluation (`scripts/bts/train.py`).

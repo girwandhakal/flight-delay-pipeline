@@ -15,17 +15,18 @@ from pyspark.sql import SparkSession, functions as F
 
 from scripts.bts import train
 from scripts.origin_weather import build_features as features, clean, download
+from scripts.origin_weather.measurements import SOURCE_FIELDS, FEATURE_COLUMNS, NUMERIC_FEATURES, decode_weather
 from pipeline import main as pipeline
 
 
-HEADER = ["STATION", "DATE", "REPORT_TYPE", "REM", *download.MEASUREMENTS]
+HEADER = ["STATION", "DATE", "REPORT_TYPE", "REM", *SOURCE_FIELDS]
 
 
 def raw_csv(rows):
     stream = io.StringIO()
     writer = csv.writer(stream)
     writer.writerow(HEADER)
-    writer.writerows(rows)
+    writer.writerows(list(row) + [""] * (len(HEADER) - len(row)) for row in rows)
     return stream.getvalue().encode()
 
 
@@ -256,17 +257,25 @@ class WeatherSparkTests(unittest.TestCase):
                 (
                     "USW00094846",
                     datetime(2024, 1, 1, 17, 46, tzinfo=timezone.utc),
-                    "future",
+                    "too_new_with_lag",
                     9.0,
                     9.0,
                     9.0,
                 ),
+                ("USW00094846", datetime(2024, 1, 1, 18, tzinfo=timezone.utc), "at_departure", 6.0, 7.0, None),
+                ("USW00094846", datetime(2024, 1, 1, 18, 1, tzinfo=timezone.utc), "future", 9.0, 9.0, 9.0),
             ],
             "station_id string, observation_utc timestamp, source_file string, origin_temperature_c double, origin_wind_speed_ms double, origin_visibility_km double",
         )
-        joined = features.build_origin_features(cutoffs, weather, {"files": {}}).cache()
+        decoded = decode_weather({"HourlyDryBulbTemperature": "4", "HourlyWindSpeed": "5"})
+        for name in FEATURE_COLUMNS:
+            if name not in weather.columns:
+                weather = weather.withColumn(name, F.lit(decoded[name]).cast("double" if name in NUMERIC_FEATURES else "int"))
+        joined = features.build_origin_features(
+            cutoffs, weather, {"files": {}}, publication_lag_minutes=15
+        ).cache()
         try:
-            features.validate_cohort(flights, joined)
+            features.validate_cohort(flights, joined, publication_lag_minutes=15)
             rows = {row.flight_id: row for row in joined.collect()}
             self.assertEqual(rows["a"].source_file, "eligible")
             self.assertEqual(rows["b"].origin_weather_age_minutes, 15)
@@ -280,6 +289,17 @@ class WeatherSparkTests(unittest.TestCase):
                 features.validate_cohort(
                     flights, joined.withColumn("ArrDel15", F.lit(1))
                 )
+        finally:
+            joined.unpersist()
+
+        joined = features.build_origin_features(cutoffs, weather, {"files": {}}).cache()
+        try:
+            features.validate_cohort(flights, joined)
+            rows = {row.flight_id: row for row in joined.collect()}
+            self.assertEqual(rows["a"].source_file, "at_departure")
+            self.assertEqual(rows["b"].origin_weather_age_minutes, 0)
+            self.assertEqual(rows["a"].origin_available_utc, rows["a"].scheduled_departure_utc)
+            self.assertEqual(rows["c"].origin_weather_missing, 1)
         finally:
             joined.unpersist()
 
@@ -383,6 +403,50 @@ class WeatherSparkTests(unittest.TestCase):
             ("USW00003937", 2025, "America/Chicago"),
         ])
 
+    def test_expanded_fields_flow_from_cleaning_into_training_inputs(self):
+        values = dict(zip(SOURCE_FIELDS, [
+            "20", "4", "16.093", "T", "8", "090", "70", "-2", "1013.2",
+            "-RA:02 FG:2 |RA FG |RA", "BKN:07 0.91",
+        ]))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "bronze/2024/LCD_USW00094846_2024.csv"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(raw_csv([[
+                "USW00094846", "2024-01-01T17:50:00", "FM-15", "METAR KORD 011750Z",
+                *[values[name] for name in SOURCE_FIELDS],
+            ]]))
+            manifest = {
+                "complete": True, "timestamp_basis": "metar_verified_utc_or_local_standard",
+                "units": {}, "files": {"fixture": {
+                    "station_id": "USW00094846", "year": 2024,
+                    "time_zone": "America/Chicago", "status": "verified",
+                }},
+            }
+            observations = clean.clean_weather(
+                self.spark, root / "bronze", root / "silver", root / "quarantine",
+                manifest, root / "report",
+            )
+            flights = self.spark.createDataFrame(
+                [("a", date(2024, 1, 1), "ORD", "1200", "train", 0)],
+                "flight_id string, FlightDate date, Origin string, CRSDepTime string, split string, ArrDel15 int",
+            )
+            cutoffs = features.build_flight_cutoffs(self.spark, flights, self.references())
+            enriched = features.build_origin_features(cutoffs, observations, manifest).cache()
+            try:
+                features.validate_cohort(flights, enriched)
+                train.validate_weather(enriched, "expanded fixture")
+                row = enriched.first()
+                self.assertEqual(row.origin_weather_age_minutes, 10)
+                self.assertEqual(row.origin_wind_direction_sin, 1)
+                self.assertEqual(row.origin_cloud_ceiling_m, 91)
+                self.assertEqual(row.origin_precipitation_trace, 1)
+                self.assertEqual(row.origin_precipitation_missing, 0)
+                self.assertEqual(row.origin_weather_rain, 1)
+                self.assertEqual(row.origin_weather_fog, 1)
+            finally:
+                enriched.unpersist()
+
     def test_weather_imputation_is_training_only_and_reloadable(self):
         row = [
             "AA",
@@ -403,7 +467,8 @@ class WeatherSparkTests(unittest.TestCase):
             0,
             0,
         ]
-        missing = row[:9] + [None] * 4 + [1] * 4
+        row = row[:9] + [10.0] * len(features.WEATHER_NUMERIC) + [0] * len(features.WEATHER_FLAGS)
+        missing = row[:9] + [None] * len(features.WEATHER_NUMERIC) + [1] * len(features.WEATHER_FLAGS)
         schema = (
             "Reporting_Airline string, Origin string, Dest string, Month int, DayOfWeek int, DepHour int, ArrHour int, CRSElapsedTime double, Distance double, "
             + ", ".join(f"{name} double" for name in features.WEATHER_NUMERIC)

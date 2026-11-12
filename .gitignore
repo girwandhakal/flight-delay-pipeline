@@ -18,6 +18,7 @@ models/**
 !models/.gitkeep
 results/**
 !results/.gitkeep
+/results_history/
 figures/**
 !figures/.gitkeep
 manifests/*.part

@@ -10,15 +10,11 @@ from pyspark.sql import functions as F, types as T, Window
 
 from scripts.results import records, update_results
 
-from .download import ROOT, MEASUREMENTS, load_config, standard_offset, write_json
+from .download import ROOT, load_config, standard_offset, write_json
+from .measurements import NUMERIC_FEATURES, MISSING_FLAGS, INDICATOR_FLAGS, FEATURE_COLUMNS
 
-WEATHER_NUMERIC = [*MEASUREMENTS.values(), "origin_weather_age_minutes"]
-WEATHER_FLAGS = [
-    "origin_weather_missing",
-    "origin_temperature_missing",
-    "origin_wind_speed_missing",
-    "origin_visibility_missing",
-]
+WEATHER_NUMERIC = [*NUMERIC_FEATURES, "origin_weather_age_minutes"]
+WEATHER_FLAGS = ["origin_weather_missing", *MISSING_FLAGS, *INDICATOR_FLAGS]
 
 
 def load_references(directory):
@@ -167,10 +163,13 @@ def required_station_years(cutoffs, max_age_minutes):
 
 
 def build_origin_features(
-    cutoffs, observations, manifest, max_age_minutes=120, publication_lag_minutes=15
+    cutoffs, observations, manifest, max_age_minutes=120, publication_lag_minutes=0
 ):
     if not 0 <= publication_lag_minutes <= max_age_minutes or max_age_minutes <= 0:
         raise ValueError("Invalid weather age/lag.")
+    missing = set(FEATURE_COLUMNS) - set(observations.columns)
+    if missing:
+        raise ValueError("Weather features are outdated; rebuild origin-weather Silver with all 11 fields.")
     weather = observations.withColumn(
         "weather_hour", F.floor(F.col("observation_utc").cast("long") / 3600)
     ).alias("weather")
@@ -216,7 +215,15 @@ def build_origin_features(
             "flights.*",
             "weather.observation_utc",
             "weather.source_file",
-            *["weather." + name for name in MEASUREMENTS.values()],
+            *["weather." + name for name in FEATURE_COLUMNS],
+            *[
+                F.col("weather." + name).alias(output)
+                for name, output in [
+                    ("LATITUDE", "origin_station_latitude"),
+                    ("LONGITUDE", "origin_station_longitude"),
+                    ("ELEVATION", "origin_station_elevation_raw"),
+                ] if name in observations.columns
+            ],
         )
         .withColumn(
             "rank",
@@ -247,8 +254,10 @@ def build_origin_features(
             "origin_weather_missing", F.col("observation_utc").isNull().cast("int")
         )
     )
-    for measurement, flag in zip(MEASUREMENTS.values(), WEATHER_FLAGS[1:]):
-        selected = selected.withColumn(flag, F.col(measurement).isNull().cast("int"))
+    for flag in MISSING_FLAGS:
+        selected = selected.withColumn(flag, F.coalesce(F.col(flag), F.lit(1)))
+    for flag in INDICATOR_FLAGS:
+        selected = selected.withColumn(flag, F.coalesce(F.col(flag), F.lit(0)))
     unavailable = {
         (entry["station_id"], entry["year"])
         for entry in manifest["files"].values()
@@ -284,7 +293,7 @@ def build_origin_features(
 
 
 def validate_cohort(
-    original, enriched, max_age_minutes=120, publication_lag_minutes=15
+    original, enriched, max_age_minutes=120, publication_lag_minutes=0
 ):
     for frame in (original, enriched):
         stats = frame.agg(
