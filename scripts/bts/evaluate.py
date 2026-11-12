@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from scripts.results import records, update_results
 
 import pandas as pd
 from pyspark.ml import PipelineModel
@@ -12,70 +13,41 @@ from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml.functions import vector_to_array
 from pyspark.sql import functions as F
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 # Configure Hadoop environment for Windows PySpark runtime if needed.
 if os.name == "nt" and "HADOOP_HOME" not in os.environ:
     hadoop_dir = ROOT / "envs" / "hadoop"
     if (hadoop_dir / "bin" / "winutils.exe").exists():
         os.environ["HADOOP_HOME"] = str(hadoop_dir)
-        os.environ["PATH"] = str(hadoop_dir / "bin") + os.pathsep + os.environ.get("PATH", "")
+        os.environ["PATH"] = (
+            str(hadoop_dir / "bin") + os.pathsep + os.environ.get("PATH", "")
+        )
 
 # Ensure PySpark workers use the active Python interpreter.
 os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
-from bts_transform import get_spark_session
+from .build_features import get_spark_session
+from .train import confusion_metrics
 
 TARGET_COL = "ArrDel15"
 
 
-def confusion_metrics(tp: int, fp: int, tn: int, fn: int) -> dict:
-    """Calculate delayed-class metrics from confusion counts, safely handling zero denominators."""
-    total = tp + fp + tn + fn
-    return {
-        "precision": tp / (tp + fp) if tp + fp > 0 else 0.0,
-        "recall": tp / (tp + fn) if tp + fn > 0 else 0.0,
-        "f1": (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0.0,
-        "accuracy": (tp + tn) / total if total > 0 else 0.0,
-        "confusion_matrix": {"tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn)},
-    }
-
-
-def evaluate_predictions(predictions, label_col: str = TARGET_COL, pred_col: str = "prediction", prob_col: str = "p_delayed") -> dict:
-    """Compute standard classification metrics and AUCs for a prediction DataFrame."""
-    label = F.col(label_col)
-    pred = F.col(pred_col)
-
-    counts = predictions.agg(
-        F.count(F.when((label == 1) & (pred == 1), 1)).alias("tp"),
-        F.count(F.when((label == 0) & (pred == 1), 1)).alias("fp"),
-        F.count(F.when((label == 0) & (pred == 0), 1)).alias("tn"),
-        F.count(F.when((label == 1) & (pred == 0), 1)).alias("fn"),
-    ).first().asDict()
-
-    metrics = confusion_metrics(**counts)
-    evaluator = BinaryClassificationEvaluator(labelCol=label_col, rawPredictionCol=prob_col)
-    metrics["pr_auc"] = evaluator.setMetricName("areaUnderPR").evaluate(predictions)
-    metrics["roc_auc"] = evaluator.setMetricName("areaUnderROC").evaluate(predictions)
-    return metrics
-
-
-def compute_subgroup_slice(scores, group_col: str, subgroup_type: str, limit: int = None) -> list:
+def compute_subgroup_slice(
+    scores, group_col: str, subgroup_type: str, limit: int = None
+) -> list:
     """Aggregate slice-based metrics inside Spark to avoid collecting full dataset into driver memory."""
     label = F.col(TARGET_COL)
     pred = F.col("prediction")
 
-    agg_df = (
-        scores.groupBy(group_col)
-        .agg(
-            F.count("*").alias("total_flights"),
-            F.count(F.when(label == 1, 1)).alias("delayed_flights"),
-            F.count(F.when((label == 1) & (pred == 1), 1)).alias("tp"),
-            F.count(F.when((label == 0) & (pred == 1), 1)).alias("fp"),
-            F.count(F.when((label == 0) & (pred == 0), 1)).alias("tn"),
-            F.count(F.when((label == 1) & (pred == 0), 1)).alias("fn"),
-        )
+    agg_df = scores.groupBy(group_col).agg(
+        F.count("*").alias("total_flights"),
+        F.count(F.when(label == 1, 1)).alias("delayed_flights"),
+        F.count(F.when((label == 1) & (pred == 1), 1)).alias("tp"),
+        F.count(F.when((label == 0) & (pred == 1), 1)).alias("fp"),
+        F.count(F.when((label == 0) & (pred == 0), 1)).alias("tn"),
+        F.count(F.when((label == 1) & (pred == 0), 1)).alias("fn"),
     )
 
     if limit is not None:
@@ -93,21 +65,23 @@ def compute_subgroup_slice(scores, group_col: str, subgroup_type: str, limit: in
         tn = int(r["tn"])
         fn = int(r["fn"])
         cm = confusion_metrics(tp, fp, tn, fn)
-        records.append({
-            "subgroup_type": subgroup_type,
-            "subgroup_value": str(r[group_col]),
-            "total_flights": total,
-            "delayed_flights": delayed,
-            "prevalence": delayed / total if total > 0 else 0.0,
-            "tp": tp,
-            "fp": fp,
-            "tn": tn,
-            "fn": fn,
-            "precision": cm["precision"],
-            "recall": cm["recall"],
-            "f1": cm["f1"],
-            "accuracy": cm["accuracy"],
-        })
+        records.append(
+            {
+                "subgroup_type": subgroup_type,
+                "subgroup_value": str(r[group_col]),
+                "total_flights": total,
+                "delayed_flights": delayed,
+                "prevalence": delayed / total if total > 0 else 0.0,
+                "tp": tp,
+                "fp": fp,
+                "tn": tn,
+                "fn": fn,
+                "precision": cm["precision"],
+                "recall": cm["recall"],
+                "f1": cm["f1"],
+                "accuracy": cm["accuracy"],
+            }
+        )
     return records
 
 
@@ -120,11 +94,21 @@ def compute_subgroups(scores) -> pd.DataFrame:
     return pd.DataFrame(all_records)
 
 
+def save_evaluation_results(summary, subgroup_df, results_dir):
+    """Replace BTS test results while preserving other models and stages."""
+    update_results({"bts": {"test": {**summary, "subgroups": records(subgroup_df)}}}, results_dir)
+
+
 def evaluate(spark, gold_dir=None, models_dir=None, results_dir=None) -> dict:
     """Execute test evaluation for the frozen baseline pipeline model and decision threshold."""
-    gold_dir = Path(gold_dir or ROOT / "data/gold/bts")
-    models_dir = Path(models_dir or ROOT / "models/bts")
-    results_dir = Path(results_dir or ROOT / "results/evaluation_bts")
+    results_dir = Path(results_dir or ROOT / "results")
+    results_path = results_dir / "results.json"
+    current = json.loads(results_path.read_text()) if results_path.exists() else {}
+    training = current.get("bts", {}).get("training", {})
+    gold_dir = Path(gold_dir or training.get("gold_dir", ROOT / "data/gold/bts"))
+    models_dir = Path(models_dir or training.get("models_dir", ROOT / "models/bts"))
+    if training.get("models_dir") and models_dir.resolve() != Path(training["models_dir"]).resolve():
+        raise ValueError("Test evaluation must use the model recorded in the current BTS training results.")
 
     model_path = models_dir / "baseline_pipeline"
     threshold_path = models_dir / "threshold.json"
@@ -133,12 +117,14 @@ def evaluate(spark, gold_dir=None, models_dir=None, results_dir=None) -> dict:
     if not model_path.exists():
         raise FileNotFoundError(f"Model pipeline not found at {model_path}")
     if not threshold_path.exists():
-        raise FileNotFoundError(f"Decision threshold file not found at {threshold_path}")
+        raise FileNotFoundError(
+            f"Decision threshold file not found at {threshold_path}"
+        )
     if not test_data_path.exists():
         raise FileNotFoundError(f"Test data partition not found at {test_data_path}")
 
     # Load frozen model pipeline and threshold metadata.
-    print(f"\n--- [Step 1/4] Loading Frozen Pipeline and Threshold ---", flush=True)
+    print("\n--- [Step 1/4] Loading Frozen Pipeline and Threshold ---", flush=True)
     pipeline_model = PipelineModel.load(str(model_path))
     threshold_data = json.loads(threshold_path.read_text(encoding="utf-8"))
     threshold = float(threshold_data["threshold"])
@@ -157,43 +143,57 @@ def evaluate(spark, gold_dir=None, models_dir=None, results_dir=None) -> dict:
 
     try:
         # Compute global confusion counts and metrics in a single aggregation.
-        print(f"\n--- [Step 3/4] Computing Global Evaluation Metrics ---", flush=True)
+        print("\n--- [Step 3/4] Computing Global Evaluation Metrics ---", flush=True)
         label = F.col(TARGET_COL)
         pred = F.col("prediction")
         pred_0_5 = F.col("prediction_0_5")
 
-        counts = scores.agg(
-            F.count("*").alias("total"),
-            F.count(F.when(label == 1, 1)).alias("positive"),
-            F.count(F.when((label == 1) & (pred == 1), 1)).alias("tp"),
-            F.count(F.when((label == 0) & (pred == 1), 1)).alias("fp"),
-            F.count(F.when((label == 0) & (pred == 0), 1)).alias("tn"),
-            F.count(F.when((label == 1) & (pred == 0), 1)).alias("fn"),
-            F.count(F.when((label == 1) & (pred_0_5 == 1), 1)).alias("tp_0_5"),
-            F.count(F.when((label == 0) & (pred_0_5 == 1), 1)).alias("fp_0_5"),
-            F.count(F.when((label == 0) & (pred_0_5 == 0), 1)).alias("tn_0_5"),
-            F.count(F.when((label == 1) & (pred_0_5 == 0), 1)).alias("fn_0_5"),
-        ).first().asDict()
+        counts = (
+            scores.agg(
+                F.count("*").alias("total"),
+                F.count(F.when(label == 1, 1)).alias("positive"),
+                F.count(F.when((label == 1) & (pred == 1), 1)).alias("tp"),
+                F.count(F.when((label == 0) & (pred == 1), 1)).alias("fp"),
+                F.count(F.when((label == 0) & (pred == 0), 1)).alias("tn"),
+                F.count(F.when((label == 1) & (pred == 0), 1)).alias("fn"),
+                F.count(F.when((label == 1) & (pred_0_5 == 1), 1)).alias("tp_0_5"),
+                F.count(F.when((label == 0) & (pred_0_5 == 1), 1)).alias("fp_0_5"),
+                F.count(F.when((label == 0) & (pred_0_5 == 0), 1)).alias("tn_0_5"),
+                F.count(F.when((label == 1) & (pred_0_5 == 0), 1)).alias("fn_0_5"),
+            )
+            .first()
+            .asDict()
+        )
 
         total_records = int(counts["total"])
         positive_records = int(counts["positive"])
-        delayed_prevalence = positive_records / total_records if total_records > 0 else 0.0
+        delayed_prevalence = (
+            positive_records / total_records if total_records > 0 else 0.0
+        )
 
-        evaluator = BinaryClassificationEvaluator(labelCol=TARGET_COL, rawPredictionCol="p_delayed")
+        evaluator = BinaryClassificationEvaluator(
+            labelCol=TARGET_COL, rawPredictionCol="p_delayed"
+        )
         pr_auc = float(evaluator.setMetricName("areaUnderPR").evaluate(scores))
         roc_auc = float(evaluator.setMetricName("areaUnderROC").evaluate(scores))
 
-        selected_metrics = confusion_metrics(counts["tp"], counts["fp"], counts["tn"], counts["fn"])
+        selected_metrics = confusion_metrics(
+            counts["tp"], counts["fp"], counts["tn"], counts["fn"]
+        )
         selected_metrics["pr_auc"] = pr_auc
         selected_metrics["roc_auc"] = roc_auc
 
-        default_metrics = confusion_metrics(counts["tp_0_5"], counts["fp_0_5"], counts["tn_0_5"], counts["fn_0_5"])
+        default_metrics = confusion_metrics(
+            counts["tp_0_5"], counts["fp_0_5"], counts["tn_0_5"], counts["fn_0_5"]
+        )
         default_metrics["pr_auc"] = pr_auc
         default_metrics["roc_auc"] = roc_auc
 
         # Compute reference baselines.
         always_ontime_metrics = {
-            "accuracy": (total_records - positive_records) / total_records if total_records > 0 else 0.0,
+            "accuracy": (total_records - positive_records) / total_records
+            if total_records > 0
+            else 0.0,
             "precision": 0.0,
             "recall": 0.0,
             "f1": 0.0,
@@ -206,14 +206,38 @@ def evaluate(spark, gold_dir=None, models_dir=None, results_dir=None) -> dict:
             "pr_auc": delayed_prevalence,
             "roc_auc": 0.5,
         }
+        always_delayed_metrics = {
+            "accuracy": positive_records / total_records if total_records > 0 else 0.0,
+            "precision": delayed_prevalence,
+            "recall": 1.0,
+            "f1": (2 * delayed_prevalence) / (1.0 + delayed_prevalence)
+            if (1.0 + delayed_prevalence) > 0
+            else 0.0,
+            "confusion_matrix": {
+                "tp": positive_records,
+                "fp": total_records - positive_records,
+                "tn": 0,
+                "fn": 0,
+            },
+            "pr_auc": delayed_prevalence,
+            "roc_auc": 0.5,
+        }
 
         # Subgroup slice analysis.
-        print(f"\n--- [Step 4/4] Performing Subgroup Error Analysis ---", flush=True)
+        print("\n--- [Step 4/4] Performing Subgroup Error Analysis ---", flush=True)
         subgroup_df = compute_subgroups(scores)
 
         # Assemble summary object.
-        rel_data_path = str(test_data_path.relative_to(ROOT)).replace("\\", "/") if test_data_path.is_relative_to(ROOT) else str(test_data_path)
-        rel_model_path = str(model_path.relative_to(ROOT)).replace("\\", "/") if model_path.is_relative_to(ROOT) else str(model_path)
+        rel_data_path = (
+            str(test_data_path.relative_to(ROOT)).replace("\\", "/")
+            if test_data_path.is_relative_to(ROOT)
+            else str(test_data_path)
+        )
+        rel_model_path = (
+            str(model_path.relative_to(ROOT)).replace("\\", "/")
+            if model_path.is_relative_to(ROOT)
+            else str(model_path)
+        )
 
         summary = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -228,13 +252,12 @@ def evaluate(spark, gold_dir=None, models_dir=None, results_dir=None) -> dict:
             "metrics_at_default_0_5": default_metrics,
             "reference_baselines": {
                 "always_ontime": always_ontime_metrics,
+                "always_delayed": always_delayed_metrics,
             },
         }
 
         # Save artifacts.
-        results_dir.mkdir(parents=True, exist_ok=True)
-        (results_dir / "evaluation_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-        subgroup_df.to_csv(results_dir / "subgroup_metrics.csv", index=False)
+        save_evaluation_results(summary, subgroup_df, results_dir)
         print(f"  Saved evaluation artifacts to: {results_dir}", flush=True)
 
         return summary
@@ -252,13 +275,19 @@ def main():
         print("-" * 80)
         print(f"BTS Baseline Test Evaluation Summary (Threshold: {threshold:.2f}):")
         print("-" * 80)
-        print(f"  Test Records:                       {summary['total_records']:,} (Prevalence: {summary['delayed_prevalence']:.2%})")
+        print(
+            f"  Test Records:                       {summary['total_records']:,} (Prevalence: {summary['delayed_prevalence']:.2%})"
+        )
         print(f"  Test PR-AUC:                        {selected['pr_auc']:.4f}")
         print(f"  Test ROC-AUC:                       {selected['roc_auc']:.4f}")
         print(f"  Test Delayed-Class F1:              {selected['f1']:.4f}")
         print(f"  Test Precision:                     {selected['precision']:.4f}")
         print(f"  Test Recall:                        {selected['recall']:.4f}")
         print(f"  Test Accuracy:                      {selected['accuracy']:.4f}")
+        ontime_acc = summary["reference_baselines"]["always_ontime"]["accuracy"]
+        delayed_f1 = summary["reference_baselines"]["always_delayed"]["f1"]
+        print(f"  Reference Baseline (Always-On-Time) Accuracy: {ontime_acc:.4f}")
+        print(f"  Reference Baseline (Always-Delayed) F1:       {delayed_f1:.4f}")
         print(f"  Confusion Matrix (Threshold {threshold:.2f}):")
         print(f"    True Positives (TP):  {cm['tp']:,}")
         print(f"    False Positives (FP): {cm['fp']:,}")

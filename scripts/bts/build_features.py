@@ -5,18 +5,22 @@ import os
 from pathlib import Path
 import sys
 
+from scripts.results import records, update_results
+
 import pandas as pd
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 # Configure Hadoop environment for Windows PySpark runtime if needed.
 if os.name == "nt" and "HADOOP_HOME" not in os.environ:
     hadoop_dir = ROOT / "envs" / "hadoop"
     if (hadoop_dir / "bin" / "winutils.exe").exists():
         os.environ["HADOOP_HOME"] = str(hadoop_dir)
-        os.environ["PATH"] = str(hadoop_dir / "bin") + os.pathsep + os.environ.get("PATH", "")
+        os.environ["PATH"] = (
+            str(hadoop_dir / "bin") + os.pathsep + os.environ.get("PATH", "")
+        )
 
 # Ensure PySpark workers use the active Python interpreter.
 os.environ["PYSPARK_PYTHON"] = sys.executable
@@ -24,6 +28,10 @@ os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
 
 def get_spark_session(app_name="bts_features"):
+    python_path = os.environ.get("PYTHONPATH", "")
+    if str(ROOT) not in python_path.split(os.pathsep):
+        # Workers need the project package when the driver starts elsewhere.
+        os.environ["PYTHONPATH"] = str(ROOT) + (os.pathsep + python_path if python_path else "")
     return (
         SparkSession.builder.master("local[*]")
         .appName(app_name)
@@ -40,11 +48,12 @@ def load_split_config(config_path=None):
     return cfg["splits"]
 
 
-def build_features(spark, silver_dir=None, gold_dir=None, results_dir=None, config_path=None):
+def build_features(
+    spark, silver_dir=None, gold_dir=None, results_dir=None, config_path=None
+):
     silver_dir = Path(silver_dir or ROOT / "data" / "silver" / "bts")
     gold_dir = Path(gold_dir or ROOT / "data" / "gold" / "bts")
-    results_dir = Path(results_dir or ROOT / "results" / "features_bts")
-    results_dir.mkdir(parents=True, exist_ok=True)
+    results_dir = Path(results_dir or ROOT / "results")
     splits = load_split_config(config_path)
 
     # Read all cleaned Silver Parquet partitions.
@@ -102,7 +111,9 @@ def build_features(spark, silver_dir=None, gold_dir=None, results_dir=None, conf
     # Ensure every retained flight receives an assigned split.
     unassigned = feature_df.filter(F.col("split").isNull()).count()
     if unassigned > 0:
-        raise ValueError(f"Found {unassigned} flights outside configured split boundaries")
+        raise ValueError(
+            f"Found {unassigned} flights outside configured split boundaries"
+        )
 
     summary_records = []
     # Save partitioned Parquet datasets directly for each chronological split.
@@ -124,19 +135,20 @@ def build_features(spark, silver_dir=None, gold_dir=None, results_dir=None, conf
         ontime_flights = total_flights - delayed_flights
         delay_rate = delayed_flights / total_flights if total_flights else 0.0
 
-        summary_records.append({
-            "split": split_name,
-            "start_date": str(stats["min_date"]),
-            "end_date": str(stats["max_date"]),
-            "total_flights": total_flights,
-            "on_time_flights": ontime_flights,
-            "delayed_flights": delayed_flights,
-            "delay_rate": round(delay_rate, 4),
-        })
+        summary_records.append(
+            {
+                "split": split_name,
+                "start_date": str(stats["min_date"]),
+                "end_date": str(stats["max_date"]),
+                "total_flights": total_flights,
+                "on_time_flights": ontime_flights,
+                "delayed_flights": delayed_flights,
+                "delay_rate": round(delay_rate, 4),
+            }
+        )
 
     summary_pd = pd.DataFrame(summary_records)
-    summary_path = results_dir / "split_summary.csv"
-    summary_pd.to_csv(summary_path, index=False)
+    update_results({"bts": {"splits": records(summary_pd)}}, results_dir)
 
     return summary_pd
 
@@ -147,7 +159,9 @@ def main():
         summary = build_features(spark)
         total_flights = summary["total_flights"].sum()
         print("-" * 80)
-        print(f"Chronological Splitting Summary (Total Processed Flights: {total_flights:,}):")
+        print(
+            f"Chronological Splitting Summary (Total Processed Flights: {total_flights:,}):"
+        )
         print("-" * 80)
         print(summary.to_string(index=False))
         print("-" * 80)

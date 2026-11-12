@@ -5,18 +5,22 @@ from pathlib import Path
 import shutil
 import sys
 
+from scripts.results import records, update_results
+
 import pandas as pd
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 # Configure Hadoop environment for Windows PySpark runtime if needed.
 if os.name == "nt" and "HADOOP_HOME" not in os.environ:
     hadoop_dir = ROOT / "envs" / "hadoop"
     if (hadoop_dir / "bin" / "winutils.exe").exists():
         os.environ["HADOOP_HOME"] = str(hadoop_dir)
-        os.environ["PATH"] = str(hadoop_dir / "bin") + os.pathsep + os.environ.get("PATH", "")
+        os.environ["PATH"] = (
+            str(hadoop_dir / "bin") + os.pathsep + os.environ.get("PATH", "")
+        )
 
 # Ensure PySpark workers use the active Python interpreter.
 os.environ["PYSPARK_PYTHON"] = sys.executable
@@ -37,16 +41,11 @@ def clean_bts_data(spark=None, bronze_dir=None, silver_dir=None, results_dir=Non
     bronze_dir = Path(bronze_dir or ROOT / "data" / "bronze" / "bts")
     silver_dir = Path(silver_dir or ROOT / "data" / "silver" / "bts")
     quarantine_dir = Path(ROOT / "data" / "quarantine" / "bts")
-    results_dir = Path(results_dir or ROOT / "results" / "cleaning_bts")
-    results_dir.mkdir(parents=True, exist_ok=True)
+    results_dir = Path(results_dir or ROOT / "results")
 
     csv_files = sorted(bronze_dir.glob("*/*/*.csv"))
     if not csv_files:
         raise FileNotFoundError(f"No BTS CSV files found in {bronze_dir}")
-
-    # Remove legacy Hive-style partition directories if present.
-    for legacy_dir in silver_dir.glob("Year=*"):
-        shutil.rmtree(legacy_dir, ignore_errors=True)
 
     summary_records = []
 
@@ -56,7 +55,6 @@ def clean_bts_data(spark=None, bronze_dir=None, silver_dir=None, results_dir=Non
         month_key = f"{year_str}-{month_str}"
 
         raw_df = spark.read.csv(str(csv_path), header=True)
-        raw_count = raw_df.count()
 
         # Clean string identifiers and pad schedule times to 4-character HHMM.
         crs_dep = F.lpad(F.trim(F.col("CRSDepTime")), 4, "0")
@@ -68,7 +66,9 @@ def clean_bts_data(spark=None, bronze_dir=None, silver_dir=None, results_dir=Non
         flight_date = F.to_date(F.col("FlightDate"), "yyyy-MM-dd")
 
         # Deterministic flight ID constructed from complete scheduled key.
-        flight_id = F.concat_ws("_", F.col("FlightDate"), airline, flight_num, origin, dest, crs_dep)
+        flight_id = F.concat_ws(
+            "_", F.col("FlightDate"), airline, flight_num, origin, dest, crs_dep
+        )
 
         cancelled = F.coalesce(F.col("Cancelled").cast("double"), F.lit(1.0))
         diverted = F.coalesce(F.col("Diverted").cast("double"), F.lit(1.0))
@@ -76,20 +76,31 @@ def clean_bts_data(spark=None, bronze_dir=None, silver_dir=None, results_dir=Non
         distance = F.col("Distance").cast("double")
         elapsed_time = F.col("CRSElapsedTime").cast("double")
 
-        # Exclusions according to agreed cleaning rules.
-        canc_count = raw_df.filter(cancelled == 1.0).count()
-        div_count = raw_df.filter((cancelled == 0.0) & (diverted == 1.0)).count()
-
         is_eligible = (cancelled == 0.0) & (diverted == 0.0) & arr_del.isin([0.0, 1.0])
-        eligible_df = raw_df.filter(is_eligible)
+        has_flight_num = flight_num.isNotNull() & (flight_num != "")
+        has_positive_dimensions = (distance > 0.0) & (elapsed_time > 0.0)
 
-        # Exclude missing flight numbers from otherwise eligible flights.
-        missing_fn_count = eligible_df.filter(flight_num.isNull() | (flight_num == "")).count()
-        valid_df = eligible_df.filter(flight_num.isNotNull() & (flight_num != "") & (distance > 0.0) & (elapsed_time > 0.0))
+        # Compute summary metrics and counts in a single pass over raw data.
+        stats = raw_df.agg(
+            F.count("*").alias("raw_count"),
+            F.count(F.when(cancelled == 1.0, 1)).alias("canc_count"),
+            F.count(F.when((cancelled == 0.0) & (diverted == 1.0), 1)).alias("div_count"),
+            F.count(F.when(is_eligible & ~has_flight_num, 1)).alias("missing_fn_count"),
+            F.count(F.when(is_eligible & has_flight_num & ~has_positive_dimensions, 1)).alias("quarantine_count"),
+        ).first()
+
+        raw_count = stats["raw_count"]
+        canc_count = stats["canc_count"]
+        div_count = stats["div_count"]
+        missing_fn_count = stats["missing_fn_count"]
+        quarantine_count = stats["quarantine_count"]
+
+        eligible_df = raw_df.filter(is_eligible)
+        valid_df = eligible_df.filter(has_flight_num & has_positive_dimensions)
 
         # Quarantine records with non-positive distance or duration among eligible flights.
-        quarantine_df = eligible_df.filter(flight_num.isNotNull() & (flight_num != "") & ((distance <= 0.0) | (elapsed_time <= 0.0)))
-        if quarantine_df.count() > 0:
+        if quarantine_count > 0:
+            quarantine_df = eligible_df.filter(has_flight_num & ~has_positive_dimensions)
             dest_quarantine = quarantine_dir / year_str / month_str
             dest_quarantine.mkdir(parents=True, exist_ok=True)
             quarantine_df.write.mode("overwrite").parquet(str(dest_quarantine))
@@ -113,8 +124,9 @@ def clean_bts_data(spark=None, bronze_dir=None, silver_dir=None, results_dir=Non
                 F.lit(csv_path.name).alias("source_file"),
                 F.lit(int(year_str)).alias("Year"),
                 F.lit(int(month_str)).alias("Month"),
-            )
-            .dropDuplicates(["flight_id"])  # Deduplicate exact complete keys if any repeats occur.
+            ).dropDuplicates(
+                ["flight_id"]
+            )  # Deduplicate exact complete keys if any repeats occur.
         )
 
         dest_month_dir = silver_dir / year_str / month_str
@@ -123,19 +135,20 @@ def clean_bts_data(spark=None, bronze_dir=None, silver_dir=None, results_dir=Non
 
         retained_count = silver_df.count()
 
-        summary_records.append({
-            "month": month_key,
-            "raw_records": raw_count,
-            "excluded_cancelled": canc_count,
-            "excluded_diverted": div_count,
-            "missing_target_total": canc_count + div_count,
-            "excluded_missing_flight_num": missing_fn_count,
-            "retained_records": retained_count,
-        })
+        summary_records.append(
+            {
+                "month": month_key,
+                "raw_records": raw_count,
+                "excluded_cancelled": canc_count,
+                "excluded_diverted": div_count,
+                "missing_target_total": canc_count + div_count,
+                "excluded_missing_flight_num": missing_fn_count,
+                "retained_records": retained_count,
+            }
+        )
 
     summary_pd = pd.DataFrame(summary_records)
-    summary_path = results_dir / "cleaning_summary.csv"
-    summary_pd.to_csv(summary_path, index=False)
+    update_results({"bts": {"cleaning": records(summary_pd)}}, results_dir)
 
     return summary_pd
 
@@ -146,7 +159,9 @@ def main():
         summary = clean_bts_data(spark)
         total_retained = summary["retained_records"].sum()
         print("-" * 80)
-        print(f"BTS Cleaning Summary Table (Total Retained Flights: {total_retained:,}):")
+        print(
+            f"BTS Cleaning Summary Table (Total Retained Flights: {total_retained:,}):"
+        )
         print("-" * 80)
         print(summary.to_string(index=False))
         print("-" * 80)

@@ -9,8 +9,8 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import bts_download as bts
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.bts import download as bts
 
 
 class DownloadTests(unittest.TestCase):

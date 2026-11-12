@@ -2,15 +2,16 @@
 
 from pathlib import Path
 import sys
+import json
 import tempfile
 import unittest
 
 from pyspark.sql import functions as F
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT))
 
-from bts_transform import build_features, get_spark_session
+from scripts.bts.build_features import build_features, get_spark_session
 
 
 class TestBuildFeatures(unittest.TestCase):
@@ -69,6 +70,10 @@ class TestBuildFeatures(unittest.TestCase):
                 gold_dir=gold,
                 results_dir=results,
             )
+
+            saved = json.loads((results / "results.json").read_text())["bts"]["splits"]
+            self.assertEqual(len(saved), len(summary))
+            self.assertEqual([p.name for p in results.iterdir()], ["results.json"])
 
             # Check summary dataframe
             self.assertEqual(len(summary), 3)

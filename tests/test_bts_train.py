@@ -11,8 +11,8 @@ from unittest.mock import patch
 from pyspark.ml import PipelineModel
 from pyspark.sql import DataFrameReader, SparkSession
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import bts_train as bts
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.bts import train as bts
 
 
 class TrainingTests(unittest.TestCase):
@@ -121,14 +121,14 @@ class TrainingTests(unittest.TestCase):
             self.assertEqual(summary["validation_rows"], 14)
             self.assertEqual({(r["reg_param"], r["elastic_net_param"]) for r in summary["candidate_comparison"]},
                              {(r, e) for r in bts.REG_PARAMS for e in bts.ELASTIC_NET_PARAMS})
-            self.assertEqual(set(summary["reference_baselines"]), {"always_ontime", "train_prevalence"})
+            self.assertEqual(set(summary["reference_baselines"]), {"always_ontime", "always_delayed", "train_prevalence"})
             self.assertAlmostEqual(summary["reference_baselines"]["train_prevalence"]["training_prevalence"], 1 / 3)
             chosen = max(summary["candidate_comparison"], key=lambda row: row["internal_pr_auc"])
             self.assertEqual(summary["selected_model"]["reg_param"], chosen["reg_param"])
             self.assertEqual(summary["selected_model"]["elastic_net_param"], chosen["elastic_net_param"])
-            self.assertEqual(set(path.name for path in results.iterdir()), {"training_summary.json", "threshold_search.csv"})
+            self.assertEqual(set(path.name for path in results.iterdir()), {"results.json"})
             self.assertEqual(set(path.name for path in models.iterdir()), {"baseline_pipeline", "threshold.json"})
-            self.assertEqual(json.loads((results / "training_summary.json").read_text()), summary)
+            self.assertEqual(json.loads((results / "results.json").read_text())["bts"]["training"], summary)
             saved = PipelineModel.load(str(models / "baseline_pipeline"))
             classifier = saved.stages[-1]
             self.assertEqual(classifier.getRegParam(), chosen["reg_param"])

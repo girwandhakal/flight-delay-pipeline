@@ -11,9 +11,9 @@ from pyspark.ml import PipelineModel
 from pyspark.ml.classification import LogisticRegression
 from pyspark.sql import SparkSession
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import bts_evaluate as bts_eval
-import bts_train as bts_tr
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.bts import evaluate as bts_eval
+from scripts.bts import train as bts_tr
 
 
 class EvaluateTests(unittest.TestCase):
@@ -127,19 +127,20 @@ class EvaluateTests(unittest.TestCase):
             )
 
             # Check that files were persisted
-            self.assertTrue((results_dir / "evaluation_summary.json").exists())
-            self.assertTrue((results_dir / "subgroup_metrics.csv").exists())
+            self.assertEqual([p.name for p in results_dir.iterdir()], ["results.json"])
 
             # Validate summary structure
-            loaded_summary = json.loads((results_dir / "evaluation_summary.json").read_text())
+            loaded_summary = json.loads((results_dir / "results.json").read_text())["bts"]["test"]
             self.assertEqual(loaded_summary["evaluation_split"], "test")
             self.assertEqual(loaded_summary["total_records"], 30)
             self.assertEqual(loaded_summary["selected_threshold"], 0.25)
             self.assertIn("metrics_at_selected_threshold", loaded_summary)
             self.assertIn("metrics_at_default_0_5", loaded_summary)
             self.assertIn("reference_baselines", loaded_summary)
+            self.assertIn("always_ontime", loaded_summary["reference_baselines"])
+            self.assertIn("always_delayed", loaded_summary["reference_baselines"])
             # Validate CSV structure
-            loaded_csv = pd.read_csv(results_dir / "subgroup_metrics.csv")
+            loaded_csv = pd.DataFrame(loaded_summary["subgroups"])
             expected_cols = [
                 "subgroup_type", "subgroup_value", "total_flights", "delayed_flights",
                 "prevalence", "tp", "fp", "tn", "fn", "precision", "recall", "f1", "accuracy"

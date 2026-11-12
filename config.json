@@ -4,6 +4,11 @@
       "start_month": "2024-01",
       "end_month": "2025-01",
       "output_directory": "data/bronze/bts"
+    },
+    "weather": {
+      "product": "lcdv2",
+      "output_directory": "data/bronze/weather",
+      "reference_directory": "data/reference/weather/2024-2025-v1"
     }
   },
   "modeling": {
@@ -39,5 +44,9 @@
     "ArrDel15",
     "Cancelled",
     "Diverted"
-  ]
+  ],
+  "origin_weather": {
+    "max_age_minutes": 120,
+    "publication_lag_minutes": 15
+  }
 }

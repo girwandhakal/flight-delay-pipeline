@@ -2,13 +2,14 @@
 
 from pathlib import Path
 import sys
+import json
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT))
 
-from bts_clean import clean_bts_data, get_spark_session
+from scripts.bts.clean import clean_bts_data, get_spark_session
 
 
 class TestBTSCleaning(unittest.TestCase):
@@ -52,6 +53,10 @@ class TestBTSCleaning(unittest.TestCase):
                 silver_dir=silver,
                 results_dir=results,
             )
+
+            saved = json.loads((results / "results.json").read_text())["bts"]["cleaning"]
+            self.assertEqual(len(saved), len(summary))
+            self.assertEqual([p.name for p in results.iterdir()], ["results.json"])
 
             # Check summary counts
             self.assertEqual(len(summary), 1)
