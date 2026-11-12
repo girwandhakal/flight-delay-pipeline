@@ -9,6 +9,7 @@ import sys
 from scripts.results import records, update_results
 
 import pandas as pd
+from pyspark import StorageLevel
 from pyspark.ml import Pipeline
 from pyspark.ml.classification import LogisticRegression
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
@@ -234,8 +235,9 @@ def train(
     if feature_set == "bts_origin_weather":
         columns += WEATHER_NUMERIC + WEATHER_FLAGS
     metadata = ["flight_id", "FlightDate"] if save_predictions else []
-    train_features = train_data.select("FlightDate", *columns).cache()
-    val_features = val_data.select(*metadata, *columns).cache()
+    # Leave JVM heap for concurrent classifier tasks rather than duplicated training rows.
+    train_features = train_data.select("FlightDate", *columns).persist(StorageLevel.DISK_ONLY)
+    val_features = val_data.select(*metadata, *columns).persist(StorageLevel.DISK_ONLY)
     selected_scores = None
 
     try:
@@ -336,8 +338,16 @@ def train(
             if feature_set == "bts_origin_weather":
                 validate_weather(fold_train, f"fold before {month}")
             preprocessor = build_preprocessor(feature_set).fit(fold_train)
-            encoded_train = preprocessor.transform(fold_train).cache()
-            encoded_val = preprocessor.transform(fold_val).cache()
+            encoded_train = (
+                preprocessor.transform(fold_train)
+                .select("features", TARGET_COL)
+                .persist(StorageLevel.DISK_ONLY)
+            )
+            encoded_val = (
+                preprocessor.transform(fold_val)
+                .select("features", TARGET_COL)
+                .persist(StorageLevel.DISK_ONLY)
+            )
             try:
                 for params, candidate in zip(grid, candidates):
                     model = estimator.fit(encoded_train, params)
@@ -345,8 +355,8 @@ def train(
                         evaluator.evaluate(model.transform(encoded_val))
                     )
             finally:
-                encoded_train.unpersist()
-                encoded_val.unpersist()
+                encoded_train.unpersist(blocking=True)
+                encoded_val.unpersist(blocking=True)
             folds.append(
                 {
                     "train_before": month.isoformat(),
@@ -477,8 +487,8 @@ def train(
     finally:
         if selected_scores is not None:
             selected_scores.unpersist()
-        val_features.unpersist()
-        train_features.unpersist()
+        val_features.unpersist(blocking=True)
+        train_features.unpersist(blocking=True)
 
 
 def main():

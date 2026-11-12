@@ -12,6 +12,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+from tqdm import tqdm
+
 from scripts.results import replace_file
 
 from .measurements import MEASUREMENTS, SOURCE_FIELDS, UNITS
@@ -315,7 +317,9 @@ def download_weather(requests, directory):
     manifest["weather_fields"] = SOURCE_FIELDS
     manifest["complete"] = False
     write_json(manifest_path, manifest)
-    for station_id, year, time_zone in sorted(set(requests)):
+    for station_id, year, time_zone in tqdm(
+        sorted(set(requests)), desc="Weather files", unit="file"
+    ):
         if not re.fullmatch(r"[A-Z0-9]{11}", station_id) or not 1900 <= year <= 2100:
             raise ValueError("Invalid station/year request.")
         name = f"{year}/LCD_{station_id}_{year}.csv"
@@ -325,7 +329,7 @@ def download_weather(requests, directory):
             if not previous or previous["sha256"] != sha256(target):
                 raise ValueError(f"Raw file changed or lacks provenance: {target}")
             previous.update(validate_file(target, station_id, year, time_zone))
-            print(f"Weather {station_id} {year}: reused verified file", flush=True)
+            tqdm.write(f"Weather {station_id} {year}: reused verified file")
             continue
         url = f"{BASE_URL}/access/{year}/LCD_{station_id}_{year}.csv"
         temporary = None
@@ -354,7 +358,7 @@ def download_weather(requests, directory):
         entry["retrieved_utc"] = datetime.now(timezone.utc).isoformat()
         manifest["files"][name] = entry
         write_json(manifest_path, manifest)
-        print(f"Weather {station_id} {year}: {entry['status']}", flush=True)
+        tqdm.write(f"Weather {station_id} {year}: {entry['status']}")
     manifest["complete"] = True
     write_json(manifest_path, manifest)
     return manifest

@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from pyspark import StorageLevel
 from pyspark.ml import PipelineModel
 from pyspark.sql import DataFrameReader, SparkSession
 
@@ -95,6 +96,14 @@ class TrainingTests(unittest.TestCase):
 
             original_fit = bts.Pipeline.fit
             fit_dates = []
+            original_classifier_fit = bts.LogisticRegression.fit
+            fold_fits = []
+
+            def classifier_fit(estimator, dataset, *args, **kwargs):
+                if dataset.columns == ["features", bts.TARGET_COL]:
+                    self.assertEqual(dataset.storageLevel, StorageLevel.DISK_ONLY)
+                    fold_fits.append(1)
+                return original_classifier_fit(estimator, dataset, *args, **kwargs)
 
             def fit(pipeline, dataset, *args, **kwargs):
                 dates = [row.FlightDate for row in dataset.select("FlightDate").collect()]
@@ -105,8 +114,9 @@ class TrainingTests(unittest.TestCase):
                     self.assertEqual(len(model.stages[0].labelsArray[3]), max(dates).month)
                 return model
 
-            with patch.object(DataFrameReader, "parquet", read), patch.object(bts.Pipeline, "fit", fit):
+            with patch.object(DataFrameReader, "parquet", read), patch.object(bts.Pipeline, "fit", fit), patch.object(bts.LogisticRegression, "fit", classifier_fit):
                 summary = bts.train(self.spark, gold, models, results)
+            self.assertEqual(len(fold_fits), 3 * len(bts.REG_PARAMS) * len(bts.ELASTIC_NET_PARAMS))
             self.assertEqual(set(reads), {str(gold / "train"), str(gold / "val")})
             self.assertEqual(summary["tuning"]["method"], "expanding-window chronological cross-validation")
             self.assertEqual(fit_dates, [(date(2024, 1, 1), date(2024, month, 4)) for month in (6, 7, 8, 9)])
