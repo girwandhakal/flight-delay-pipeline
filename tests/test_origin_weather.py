@@ -60,86 +60,45 @@ class WeatherDownloadTests(unittest.TestCase):
                 convert(date(2024, 1, 1), clock, "America/Chicago")[1], "invalid_cutoff"
             )
 
-    def test_validator_verifies_utc_and_local_standard_clocks(self):
+    def test_download_resume_without_content_or_checksum_scans(self):
+        payload = b"CSV content is checked during cleaning"
+        request = [("USW00094846", 2024, "America/Chicago")]
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "weather.csv"
-            rows = [
-                ["USW00003937", "2024-01-01T00:53:00", "FM-15", "METAR KLCH 010053Z", "11.1", "3.6", "16.093"],
-                ["USW00003937", "2024-01-01T01:53:00", "FM-15", "METAR KLCH 010753Z", "11.1", "3.6", "16.093"],
-                ["USW00003937", "2024-01-01T02:53:00", "FM-15", "METAR KLCH 011053Z", "11.1", "3.6", "16.093"],
-            ]
-            path.write_bytes(raw_csv(rows))
-            stats = download.validate_file(path, "USW00003937", 2024, "America/Chicago")
-            self.assertEqual(stats["metar_time_checks"], 2)
-            self.assertEqual(stats["utc_time_checks"], 1)
-            self.assertEqual(stats["local_standard_time_checks"], 1)
-            self.assertEqual(stats["quarantine_time_mismatches"], 1)
-            for bad in (rows[2], rows[2][:3] + [""] + rows[2][4:]):
-                path.write_bytes(raw_csv([bad]))
-                with self.assertRaisesRegex(ValueError, "No verifiable hourly"):
-                    download.validate_file(path, "USW00003937", 2024, "America/Chicago")
-
-    def test_verified_download_resume_and_tamper_detection(self):
-        payload = raw_csv(
-            [
-                [
-                    "USW00094846",
-                    "2024-01-01T00:51:00",
-                    "FM-15",
-                    "METAR KORD 010651Z",
-                    "-1.2",
-                    "0",
-                    "16.093",
-                ]
-            ]
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-
             def response(*args, **kwargs):
                 stream = io.BytesIO(payload)
                 stream.headers = {"Content-Length": str(len(payload))}
                 return stream
 
-            with patch.object(download, "urlopen", side_effect=response) as network:
-                first = download.download_weather(
-                    [("USW00094846", 2024, "America/Chicago")], tmp
-                )
-                second = download.download_weather(
-                    [("USW00094846", 2024, "America/Chicago")], tmp
-                )
-                self.assertEqual(network.call_count, 1)
-            self.assertTrue(first["complete"] and second["complete"])
-            target = Path(tmp) / "2024/LCD_USW00094846_2024.csv"
-            target.write_text("changed")
-            with self.assertRaisesRegex(ValueError, "changed"):
-                download.download_weather(
-                    [("USW00094846", 2024, "America/Chicago")], tmp
-                )
-
-    def test_bad_download_and_unavailable_are_distinct(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(
-                download,
-                "fetch",
-                side_effect=HTTPError("url", 404, "missing", {}, None),
+            with (
+                patch.object(download, "urlopen", side_effect=response) as network,
+                patch.object(download, "sha256", side_effect=AssertionError("Unexpected checksum scan")),
+                patch.object(download.csv, "DictReader", side_effect=AssertionError("Unexpected CSV scan")),
             ):
-                result = download.download_weather(
-                    [("USW00094846", 2024, "America/Chicago")], tmp
-                )
-            self.assertEqual(
-                next(iter(result["files"].values()))["status"], "unavailable"
-            )
-            temporary = Path(tmp) / "bad.part"
-            temporary.write_text("<html>error</html>")
-            with patch.object(download, "fetch", return_value=temporary):
-                with self.assertRaisesRegex(ValueError, "header"):
-                    download.download_weather(
-                        [("USW00094846", 2024, "America/Chicago")], tmp
-                    )
-            self.assertFalse(temporary.exists())
-            self.assertFalse(
-                json.loads((Path(tmp) / "manifest.json").read_text())["complete"]
-            )
+                first = download.download_weather(request, tmp)
+                self.assertEqual(first["files"]["2024/LCD_USW00094846_2024.csv"]["status"], "downloaded")
+                target = Path(tmp) / "2024/LCD_USW00094846_2024.csv"
+                target.write_bytes(b"changed locally")
+                second = download.download_weather(request, tmp)
+                self.assertTrue(first["complete"] and second["complete"])
+                self.assertEqual(target.read_bytes(), b"changed locally")
+                self.assertEqual(network.call_count, 1)
+                # Existing files also work without an older provenance manifest.
+                (Path(tmp) / "manifest.json").unlink()
+                third = download.download_weather(request, tmp)
+                self.assertTrue(third["complete"])
+                self.assertEqual(network.call_count, 1)
+
+    def test_unavailable_and_failed_downloads_are_distinct(self):
+        request = [("USW00094846", 2024, "America/Chicago")]
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(download, "fetch", side_effect=HTTPError("url", 404, "missing", {}, None)):
+                result = download.download_weather(request, tmp)
+            self.assertEqual(next(iter(result["files"].values()))["status"], "unavailable")
+            with patch.object(download, "fetch", side_effect=OSError("transfer failed")):
+                with self.assertRaisesRegex(OSError, "transfer failed"):
+                    download.download_weather(request, tmp)
+            self.assertFalse(json.loads((Path(tmp) / "manifest.json").read_text())["complete"])
+            self.assertFalse((Path(tmp) / "2024/LCD_USW00094846_2024.csv").exists())
             with self.assertRaisesRegex(ValueError, "inside"):
                 download.project_path(Path(tmp), "../escape")
 
@@ -417,10 +376,10 @@ class WeatherSparkTests(unittest.TestCase):
                 *[values[name] for name in SOURCE_FIELDS],
             ]]))
             manifest = {
-                "complete": True, "timestamp_basis": "metar_verified_utc_or_local_standard",
+                "complete": True, "timestamp_basis": "unvalidated",
                 "units": {}, "files": {"fixture": {
                     "station_id": "USW00094846", "year": 2024,
-                    "time_zone": "America/Chicago", "status": "verified",
+                    "time_zone": "America/Chicago", "status": "downloaded",
                 }},
             }
             observations = clean.clean_weather(

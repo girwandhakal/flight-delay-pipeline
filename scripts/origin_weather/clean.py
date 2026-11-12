@@ -1,4 +1,4 @@
-"""Normalize verified LCDv2 reports into UTC observations and retain rejection counts."""
+"""Normalize downloaded LCDv2 reports into UTC observations and retain rejection counts."""
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,16 +22,14 @@ from .measurements import (
 
 
 def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, report_dir):
-    if (
-        not manifest.get("complete")
-        or manifest.get("timestamp_basis") not in {"local_standard", "metar_verified_utc_or_local_standard"}
-    ):
-        raise ValueError("Weather acquisition/time verification is incomplete.")
+    if not manifest.get("complete"):
+        raise ValueError("Weather acquisition is incomplete.")
     entries = [
-        entry for entry in manifest["files"].values() if entry["status"] == "verified"
+        entry for entry in manifest["files"].values()
+        if entry["status"] in {"downloaded", "verified"}
     ]
     if not entries:
-        raise ValueError("No verified weather files available.")
+        raise ValueError("No downloaded weather files available.")
     spark.conf.set("spark.sql.session.timeZone", "UTC")
     paths = [
         str(

@@ -1,4 +1,4 @@
-"""Acquire airport references and verified NOAA LCDv2 station-year files."""
+"""Acquire airport references and NOAA LCDv2 station-year files."""
 
 import csv
 from datetime import date, datetime, timedelta, timezone
@@ -254,50 +254,6 @@ def standard_offset(zone, year):
     )
 
 
-def validate_file(path, station_id, year, time_zone):
-    count, observations, checked_times, time_mismatches, utc_times = 0, 0, 0, 0, 0
-    offset = timedelta(seconds=standard_offset(time_zone, year))
-    with Path(path).open(encoding="utf-8-sig", newline="") as stream:
-        reader = csv.DictReader(stream)
-        required = {"STATION", "DATE", "REPORT_TYPE", "REM", *SOURCE_FIELDS}
-        if not required.issubset(reader.fieldnames or []):
-            raise ValueError(f"Invalid LCDv2 header: {path}")
-        for row in reader:
-            count += 1
-            if row["STATION"] != station_id or not row["DATE"].startswith(
-                str(year) + "-"
-            ):
-                raise ValueError(f"Unexpected station/year: {path}")
-            clock = datetime.fromisoformat(row["DATE"])
-            if clock.tzinfo is not None:
-                raise ValueError("Expected a timezone-naive CSV clock.")
-            if row["REPORT_TYPE"] not in REPORTS:
-                continue
-            observations += 1
-            metar = re.search(
-                r"(?:METAR|SPECI)\s+\w+\s+(\d{2})(\d{2})(\d{2})Z", row["REM"]
-            )
-            if metar:
-                reported_utc = "".join(metar.groups())
-                if clock.strftime("%d%H%M") == reported_utc:
-                    checked_times += 1
-                    utc_times += 1
-                elif (clock - offset).strftime("%d%H%M") == reported_utc:
-                    checked_times += 1
-                else:
-                    time_mismatches += 1
-    if not count or not observations or not checked_times:
-        raise ValueError(f"No verifiable hourly weather in {path}")
-    return {
-        "rows": count,
-        "observations": observations,
-        "metar_time_checks": checked_times,
-        "utc_time_checks": utc_times,
-        "local_standard_time_checks": checked_times - utc_times,
-        "quarantine_time_mismatches": time_mismatches,
-    }
-
-
 def download_weather(requests, directory):
     directory = Path(directory)
     manifest_path = directory / "manifest.json"
@@ -312,7 +268,7 @@ def download_weather(requests, directory):
             "files": {},
         }
     )
-    manifest["timestamp_basis"] = "metar_verified_utc_or_local_standard"
+    manifest["timestamp_basis"] = "unvalidated"
     manifest["units"] = UNITS.copy()
     manifest["weather_fields"] = SOURCE_FIELDS
     manifest["complete"] = False
@@ -324,27 +280,23 @@ def download_weather(requests, directory):
             raise ValueError("Invalid station/year request.")
         name = f"{year}/LCD_{station_id}_{year}.csv"
         target = directory / name
-        previous = manifest["files"].get(name)
-        if target.exists():
-            if not previous or previous["sha256"] != sha256(target):
-                raise ValueError(f"Raw file changed or lacks provenance: {target}")
-            previous.update(validate_file(target, station_id, year, time_zone))
-            tqdm.write(f"Weather {station_id} {year}: reused verified file")
-            continue
         url = f"{BASE_URL}/access/{year}/LCD_{station_id}_{year}.csv"
-        temporary = None
         entry = {
             "station_id": station_id,
             "year": year,
             "time_zone": time_zone,
             "url": url,
         }
+        if target.exists():
+            entry.update(status="downloaded", bytes=target.stat().st_size)
+            manifest["files"][name] = entry
+            tqdm.write(f"Weather {station_id} {year}: reused existing file")
+            continue
+        temporary = None
         try:
             temporary = fetch(url, target)
-            entry.update(validate_file(temporary, station_id, year, time_zone))
             entry.update(
-                status="verified",
-                sha256=sha256(temporary),
+                status="downloaded",
                 bytes=temporary.stat().st_size,
             )
             temporary.replace(target)
