@@ -12,6 +12,7 @@ from pyspark import StorageLevel
 from pyspark.ml import PipelineModel
 from pyspark.sql import DataFrameReader, SparkSession
 
+from tests.conftest import get_test_spark_session
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.bts import train as bts
 
@@ -19,13 +20,7 @@ from scripts.bts import train as bts
 class TrainingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.spark = (SparkSession.builder.master("local[2]").appName("test_bts_train")
-                     .config("spark.sql.shuffle.partitions", "2").getOrCreate())
-        cls.spark.sparkContext.setLogLevel("ERROR")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.spark.stop()
+        cls.spark = get_test_spark_session("test_bts_train")
 
     def flights(self):
         rows = [("AA" if i % 2 else "DL", "ORD", "LAX", i // 4 + 1, i % 7 + 1, i % 24,
@@ -100,6 +95,7 @@ class TrainingTests(unittest.TestCase):
             fold_fits = []
 
             def classifier_fit(estimator, dataset, *args, **kwargs):
+                estimator.setMaxIter(1)
                 if dataset.columns == ["features", bts.TARGET_COL]:
                     self.assertEqual(dataset.storageLevel, StorageLevel.DISK_ONLY)
                     fold_fits.append(1)
@@ -114,9 +110,15 @@ class TrainingTests(unittest.TestCase):
                     self.assertEqual(len(model.stages[0].labelsArray[3]), max(dates).month)
                 return model
 
-            with patch.object(DataFrameReader, "parquet", read), patch.object(bts.Pipeline, "fit", fit), patch.object(bts.LogisticRegression, "fit", classifier_fit):
+            test_reg = [0.01, 0.1]
+            test_elastic = [0.0]
+            with (patch.object(DataFrameReader, "parquet", read),
+                  patch.object(bts.Pipeline, "fit", fit),
+                  patch.object(bts.LogisticRegression, "fit", classifier_fit),
+                  patch.object(bts, "REG_PARAMS", test_reg),
+                  patch.object(bts, "ELASTIC_NET_PARAMS", test_elastic)):
                 summary = bts.train(self.spark, gold, models, results)
-            self.assertEqual(len(fold_fits), 3 * len(bts.REG_PARAMS) * len(bts.ELASTIC_NET_PARAMS))
+            self.assertEqual(len(fold_fits), 3 * len(test_reg) * len(test_elastic))
             self.assertEqual(set(reads), {str(gold / "train"), str(gold / "val")})
             self.assertEqual(summary["tuning"]["method"], "expanding-window chronological cross-validation")
             self.assertEqual(fit_dates, [(date(2024, 1, 1), date(2024, month, 4)) for month in (6, 7, 8, 9)])
@@ -130,7 +132,7 @@ class TrainingTests(unittest.TestCase):
             self.assertEqual(summary["training_rows"], 36)
             self.assertEqual(summary["validation_rows"], 14)
             self.assertEqual({(r["reg_param"], r["elastic_net_param"]) for r in summary["candidate_comparison"]},
-                             {(r, e) for r in bts.REG_PARAMS for e in bts.ELASTIC_NET_PARAMS})
+                             {(r, e) for r in test_reg for e in test_elastic})
             self.assertEqual(set(summary["reference_baselines"]), {"always_ontime", "always_delayed", "train_prevalence"})
             self.assertAlmostEqual(summary["reference_baselines"]["train_prevalence"]["training_prevalence"], 1 / 3)
             chosen = max(summary["candidate_comparison"], key=lambda row: row["internal_pr_auc"])

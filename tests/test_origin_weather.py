@@ -11,7 +11,9 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from pyspark.ml import PipelineModel
-from pyspark.sql import SparkSession, functions as F
+from pyspark.sql import functions as F
+
+from tests.conftest import get_test_spark_session
 
 from scripts.bts import train
 from scripts.origin_weather import build_features as features, clean, download
@@ -150,19 +152,7 @@ class WeatherDownloadTests(unittest.TestCase):
 class WeatherSparkTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.spark = (
-            SparkSession.builder.master("local[2]")
-            .appName("test_origin_weather")
-            .config("spark.sql.shuffle.partitions", "2")
-            .getOrCreate()
-        )
-        cls.spark.sparkContext.setLogLevel("ERROR")
-        cls.spark.conf.set("spark.sql.shuffle.partitions", "2")
-        cls.spark.conf.set("spark.sql.session.timeZone", "UTC")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.spark.stop()
+        cls.spark = get_test_spark_session("test_origin_weather")
 
     def references(self):
         return (

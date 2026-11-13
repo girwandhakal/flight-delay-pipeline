@@ -16,20 +16,13 @@ from scripts.bts import evaluate as bts_eval
 from scripts.bts import train as bts_tr
 
 
+from tests.conftest import get_test_spark_session
+
+
 class EvaluateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.spark = (
-            SparkSession.builder.master("local[2]")
-            .appName("test_bts_evaluate")
-            .config("spark.sql.shuffle.partitions", "2")
-            .getOrCreate()
-        )
-        cls.spark.sparkContext.setLogLevel("ERROR")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.spark.stop()
+        cls.spark = get_test_spark_session("test_bts_evaluate")
 
     def synthetic_flights(self, count=40):
         rows = [
@@ -113,7 +106,7 @@ class EvaluateTests(unittest.TestCase):
 
             # Create mock pipeline model and threshold.json
             preprocessor = bts_tr.build_preprocessor().fit(data)
-            lr = LogisticRegression(labelCol=bts_eval.TARGET_COL, regParam=0.1).fit(preprocessor.transform(data))
+            lr = LogisticRegression(labelCol=bts_eval.TARGET_COL, regParam=0.1, maxIter=1).fit(preprocessor.transform(data))
             model = PipelineModel(stages=preprocessor.stages + [lr])
             pipeline_dir = models_dir / "baseline_pipeline"
             model.write().save(str(pipeline_dir))
