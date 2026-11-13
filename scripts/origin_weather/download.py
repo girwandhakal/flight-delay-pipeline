@@ -10,7 +10,7 @@ import re
 import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tqdm import tqdm
 
@@ -79,8 +79,18 @@ def fetch(url, path):
                 temporary.open("wb") as stream,
             ):
                 expected = response.headers.get("Content-Length")
-                while block := response.read(1024 * 1024):
-                    stream.write(block)
+                with tqdm.wrapattr(
+                    stream,
+                    "write",
+                    total=int(expected) if expected else None,
+                    desc=path.name,
+                    unit="B",
+                    unit_scale=True,
+                    miniters=1,
+                    leave=False,
+                ) as progress:
+                    while block := response.read(1024 * 1024):
+                        progress.write(block)
             if not temporary.stat().st_size or (
                 expected and temporary.stat().st_size != int(expected)
             ):
@@ -101,7 +111,9 @@ def fetch(url, path):
             time.sleep(2**attempt)
 
 
-def prepare_references(origins, directory, start_date, end_date):
+def prepare_references(origins, directory, start_date, end_date, prefix="origin"):
+    if prefix not in ("origin", "destination"):
+        raise ValueError("Weather role must be origin or destination.")
     directory = Path(directory)
     if (directory / "sources.json").exists():
         evidence = json.loads((directory / "sources.json").read_text())
@@ -121,14 +133,10 @@ def prepare_references(origins, directory, start_date, end_date):
         temporary = fetch(url, target)
         temporary.replace(target)
         evidence[name] = {"url": url, "sha256": sha256(target)}
-    airports = list(
-        csv.reader((directory / "airports.dat").open(encoding="utf-8", newline=""))
-    )
-    history = list(
-        csv.DictReader(
-            (directory / "isd_history.csv").open(encoding="utf-8", newline="")
-        )
-    )
+    with (directory / "airports.dat").open(encoding="utf-8", newline="") as stream:
+        airports = list(csv.reader(stream))
+    with (directory / "isd_history.csv").open(encoding="utf-8", newline="") as stream:
+        history = list(csv.DictReader(stream))
     stations = {
         line[:11]: line
         for line in (directory / "lcd_stations.txt").read_text().splitlines()
@@ -145,7 +153,12 @@ def prepare_references(origins, directory, start_date, end_date):
         airport_name, airport_icao = airport[1], airport[5]
         airport_lat, airport_lon = float(airport[6]), float(airport[7])
         airport_tz = airport[11]
-        ZoneInfo(airport_tz)
+        try:
+            ZoneInfo(airport_tz)
+        except (ZoneInfoNotFoundError, ValueError):
+            if prefix == "destination":
+                continue
+            raise
         airport_rows.append(
             [
                 origin,
@@ -268,16 +281,23 @@ def download_weather(requests, directory):
             "files": {},
         }
     )
+    requests = sorted(set(requests))
+    zones = {(entry["station_id"], entry["year"]): entry["time_zone"] for entry in manifest["files"].values()}
+    for station, year, zone in requests:
+        if not re.fullmatch(r"[A-Z0-9]{11}", station) or not 1900 <= year <= 2100:
+            raise ValueError("Invalid station/year request.")
+        ZoneInfo(zone)
+        previous = zones.setdefault((station, year), zone)
+        if previous != zone:
+            raise ValueError(f"Conflicting station time zones: {station}/{year}")
     manifest["timestamp_basis"] = "unvalidated"
     manifest["units"] = UNITS.copy()
     manifest["weather_fields"] = SOURCE_FIELDS
     manifest["complete"] = False
     write_json(manifest_path, manifest)
     for station_id, year, time_zone in tqdm(
-        sorted(set(requests)), desc="Weather files", unit="file"
+        requests, desc="Weather files", unit="file"
     ):
-        if not re.fullmatch(r"[A-Z0-9]{11}", station_id) or not 1900 <= year <= 2100:
-            raise ValueError("Invalid station/year request.")
         name = f"{year}/LCD_{station_id}_{year}.csv"
         target = directory / name
         url = f"{BASE_URL}/access/{year}/LCD_{station_id}_{year}.csv"

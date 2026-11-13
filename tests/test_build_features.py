@@ -5,23 +5,22 @@ import sys
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from pyspark.sql import functions as F
+from pyspark.sql import DataFrame, functions as F
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.bts.build_features import build_features, get_spark_session
+from tests.conftest import get_test_spark_session
+from scripts.bts.build_features import build_features
+from scripts.bts import build_features as features
 
 
 class TestBuildFeatures(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.spark = get_spark_session("test_build_features")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.spark.stop()
+        cls.spark = get_test_spark_session("test_build_features")
 
     def test_feature_derivation_and_splitting(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -115,6 +114,21 @@ class TestBuildFeatures(unittest.TestCase):
             self.assertEqual(dl["DepHour"], 0)
             self.assertEqual(dl["ArrHour"], 1)
             self.assertEqual(dl["ArrDel15"], 1)
+
+            original_agg = DataFrame.agg
+            aggregates = []
+
+            def aggregate(frame, *expressions):
+                aggregates.extend(str(expression) for expression in expressions)
+                return original_agg(frame, *expressions)
+
+            with patch.object(DataFrame, "agg", aggregate), patch.object(features, "update_results") as publish:
+                quiet = build_features(self.spark, silver_dir=silver, gold_dir=tmp_path / "quiet_gold", results_dir=tmp_path / "quiet_results", publish_results=False)
+                publish.assert_not_called()
+            self.assertEqual(quiet["total_flights"].tolist(), [2, 1, 1])
+            self.assertNotIn("delayed_flights", quiet.columns)
+            self.assertTrue(all("ArrDel15" not in expression for expression in aggregates))
+            self.assertFalse((tmp_path / "quiet_results").exists())
 
 
 if __name__ == "__main__":

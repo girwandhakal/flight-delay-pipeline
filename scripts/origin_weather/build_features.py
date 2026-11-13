@@ -17,7 +17,8 @@ WEATHER_NUMERIC = [*NUMERIC_FEATURES, "origin_weather_age_minutes"]
 WEATHER_FLAGS = ["origin_weather_missing", *MISSING_FLAGS, *INDICATOR_FLAGS]
 
 
-def load_references(directory):
+def load_references(directory, prefix="origin"):
+    validate_prefix(prefix)
     directory = Path(directory)
     with (directory / "airports.csv").open(encoding="utf-8", newline="") as stream:
         airports = list(csv.DictReader(stream))
@@ -34,21 +35,23 @@ def load_references(directory):
         ordered = sorted(rows, key=lambda r: (r["Origin"], r["valid_from"]))
         for previous, current in zip(ordered, ordered[1:]):
             if (
-                previous["Origin"] == current["Origin"]
+                prefix == "origin"
+                and previous["Origin"] == current["Origin"]
                 and previous["valid_to"] > current["valid_from"]
             ):
                 raise ValueError(
                     f"Overlapping reference intervals: {current['Origin']}"
                 )
-    for row in airports:
-        ZoneInfo(row["time_zone"])
+    if prefix == "origin":
+        for row in airports:
+            ZoneInfo(row["time_zone"])
     for row in mappings:
-        if not row["station_id"] or not any(
+        if prefix == "origin" and (not row["station_id"] or not any(
             a["Origin"] == row["Origin"]
             and a["valid_from"] <= row["valid_from"]
             and a["valid_to"] >= row["valid_to"]
             for a in airports
-        ):
+        )):
             raise ValueError("Station mapping lacks a valid airport interval.")
     return airports, mappings
 
@@ -130,7 +133,13 @@ def build_flight_cutoffs(spark, flights, references):
     )
 
 
-def required_station_years(cutoffs, max_age_minutes):
+def required_station_years(cutoffs, max_age_minutes, prefix="origin"):
+    validate_prefix(prefix)
+    cutoffs = cutoffs.select(
+        "scheduled_departure_utc",
+        F.col(f"{prefix}_station_id").alias("origin_station_id"),
+        F.col(f"{prefix}_time_zone").alias("origin_time_zone"),
+    )
     bounds = (
         cutoffs.filter(
             "scheduled_departure_utc is not null and origin_station_id is not null"
@@ -157,14 +166,39 @@ def required_station_years(cutoffs, max_age_minutes):
                 <= max(end, end + offset).year
             ):
                 requests.append((row.origin_station_id, year, row.origin_time_zone))
-    if not requests:
+    if not requests and prefix == "origin":
         raise ValueError("No mapped origin cutoffs; cannot train a weather model.")
     return requests
 
 
-def build_origin_features(
-    cutoffs, observations, manifest, max_age_minutes=120, publication_lag_minutes=0
+def validate_prefix(prefix):
+    if prefix not in ("origin", "destination"):
+        raise ValueError("Weather role must be origin or destination.")
+
+
+def bts_fingerprints():
+    """Return provenance fingerprints (relative path, size, mtime) for all BTS Gold parquet files."""
+    return [
+        {
+            "path": str(path.relative_to(ROOT)),
+            "bytes": path.stat().st_size,
+            "modified_ns": path.stat().st_mtime_ns,
+        }
+        for path in sorted((ROOT / "data/gold/bts").rglob("*.parquet"))
+    ]
+
+
+def build_origin_features(cutoffs, observations, manifest, max_age_minutes=120, publication_lag_minutes=0):
+    """Enrich flight cutoffs with origin weather observations matching the configured time policy."""
+    return build_weather_features(cutoffs, observations, manifest, max_age_minutes, publication_lag_minutes)
+
+
+def build_weather_features(
+    cutoffs, observations, manifest, max_age_minutes=120, publication_lag_minutes=0, prefix="origin"
 ):
+    validate_prefix(prefix)
+    observation = "observation_utc" if prefix == "origin" else "destination_observation_utc"
+    source = "source_file" if prefix == "origin" else "destination_source_file"
     if not 0 <= publication_lag_minutes <= max_age_minutes or max_age_minutes <= 0:
         raise ValueError("Invalid weather age/lag.")
     missing = set(FEATURE_COLUMNS) - set(observations.columns)
@@ -196,7 +230,7 @@ def build_origin_features(
         ),
     ).alias("flights")
     condition = (
-        (F.col("flights.origin_station_id") == F.col("weather.station_id"))
+        (F.col(f"flights.{prefix}_station_id") == F.col("weather.station_id"))
         & (F.col("match_hour") == F.col("weather_hour"))
         & (
             F.col("weather.observation_utc")
@@ -213,11 +247,14 @@ def build_origin_features(
         flights.join(weather, condition, "left")
         .select(
             "flights.*",
-            "weather.observation_utc",
-            "weather.source_file",
-            *["weather." + name for name in FEATURE_COLUMNS],
+            F.col("weather.observation_utc").alias(observation),
+            F.col("weather.source_file").alias(source),
+            *[F.col("weather." + name).alias(name.replace("origin_", prefix + "_", 1)) for name in FEATURE_COLUMNS],
+            *[F.col("weather." + name).alias(prefix + "_" + name)
+              for name in observations.columns
+              if prefix == "destination" and name not in {*FEATURE_COLUMNS, "station_id", "observation_utc", "source_file", "year", "month"}],
             *[
-                F.col("weather." + name).alias(output)
+                F.col("weather." + name).alias(output.replace("origin_", prefix + "_", 1))
                 for name, output in [
                     ("LATITUDE", "origin_station_latitude"),
                     ("LONGITUDE", "origin_station_longitude"),
@@ -229,8 +266,8 @@ def build_origin_features(
             "rank",
             F.row_number().over(
                 Window.partitionBy("flight_id").orderBy(
-                    F.col("observation_utc").desc_nulls_last(),
-                    F.col("source_file").asc_nulls_last(),
+                    F.col(observation).desc_nulls_last(),
+                    F.col(source).asc_nulls_last(),
                 )
             ),
         )
@@ -238,25 +275,27 @@ def build_origin_features(
     selected = selected.filter("rank = 1").drop("rank", "match_hour")
     selected = (
         selected.withColumn(
-            "origin_weather_age_minutes",
+            f"{prefix}_weather_age_minutes",
             (
                 F.col("scheduled_departure_utc").cast("long")
-                - F.col("observation_utc").cast("long")
+                - F.col(observation).cast("long")
             )
             / 60,
         )
         .withColumn(
-            "origin_available_utc",
-            F.col("observation_utc")
+            f"{prefix}_available_utc",
+            F.col(observation)
             + F.expr(f"INTERVAL {publication_lag_minutes} MINUTES"),
         )
         .withColumn(
-            "origin_weather_missing", F.col("observation_utc").isNull().cast("int")
+            f"{prefix}_weather_missing", F.col(observation).isNull().cast("int")
         )
     )
     for flag in MISSING_FLAGS:
+        flag = flag.replace("origin_", prefix + "_", 1)
         selected = selected.withColumn(flag, F.coalesce(F.col(flag), F.lit(1)))
     for flag in INDICATOR_FLAGS:
+        flag = flag.replace("origin_", prefix + "_", 1)
         selected = selected.withColumn(flag, F.coalesce(F.col(flag), F.lit(0)))
     unavailable = {
         (entry["station_id"], entry["year"])
@@ -275,15 +314,15 @@ def build_origin_features(
 
     has_missing_source = F.udf(source_missing, T.BooleanType())
     selected = selected.withColumn(
-        "origin_weather_match_status",
-        F.when(F.col("observation_utc").isNotNull(), "matched")
+        f"{prefix}_weather_match_status",
+        F.when(F.col(observation).isNotNull(), "matched")
         .when(F.col("scheduled_departure_utc").isNull(), "invalid_cutoff")
-        .when(F.col("origin_station_id").isNull(), "unmapped_airport")
+        .when(F.col(f"{prefix}_station_id").isNull(), "unmapped_airport")
         .when(
             has_missing_source(
-                "origin_station_id",
+                f"{prefix}_station_id",
                 F.date_format("scheduled_departure_utc", "yyyy-MM-dd'T'HH:mm:ss"),
-                "origin_time_zone",
+                f"{prefix}_time_zone",
             ),
             "source_unavailable",
         )
@@ -295,24 +334,30 @@ def build_origin_features(
 def validate_cohort(
     original, enriched, max_age_minutes=120, publication_lag_minutes=0
 ):
+    """Verify that weather enrichment preserved flight identities, count, and predictor values."""
     for frame in (original, enriched):
         stats = frame.agg(
             F.count("*").alias("rows"), F.countDistinct("flight_id").alias("ids")
         ).first()
         if stats.rows != stats.ids:
             raise ValueError("Flight IDs must be nonnull and unique.")
+
     columns = original.columns
     if (
         original.select(columns).exceptAll(enriched.select(columns)).limit(1).count()
         or enriched.select(columns).exceptAll(original.select(columns)).limit(1).count()
     ):
         raise ValueError("Weather enrichment changed the BTS cohort or predictors.")
+
+    # Guard against future observations leaking into features before departure.
     if (
         enriched.filter("origin_available_utc > scheduled_departure_utc")
         .limit(1)
         .count()
     ):
         raise ValueError("Future weather selected.")
+
+    # Confirm weather observation age falls strictly within configured policy bounds.
     if (
         enriched.filter(
             (F.col("origin_weather_age_minutes") > max_age_minutes)
@@ -324,7 +369,7 @@ def validate_cohort(
         raise ValueError("Selected weather violates age/lag bounds.")
 
 
-def main():
+def main(publish_results=True):
     from scripts.bts.build_features import get_spark_session
     from .clean import clean_weather
     from .download import download_weather, prepare_references
@@ -383,21 +428,17 @@ def main():
                 "dataset_id": build_id,
                 "gold_dir": str(gold),
                 "policy": policy,
+                "splits": config["splits"],
+                "weather_columns": WEATHER_NUMERIC + WEATHER_FLAGS,
                 "reference_sources": json.loads(
                     (settings["reference_directory"] / "sources.json").read_text()
                 ),
                 "source_manifest": manifest,
-                "bts_input_files": [
-                    {
-                        "path": str(path.relative_to(ROOT)),
-                        "bytes": path.stat().st_size,
-                        "modified_ns": path.stat().st_mtime_ns,
-                    }
-                    for path in sorted((ROOT / "data/gold/bts").rglob("*.parquet"))
-                ],
+                "bts_input_files": bts_fingerprints(),
             },
         )
-        update_results({"bts_origin_weather": {"data": json.loads((gold / "_metadata.json").read_text())}})
+        if publish_results:
+            update_results({"bts_origin_weather": {"data": json.loads((gold / "_metadata.json").read_text())}})
         return gold, gold
     finally:
         spark.catalog.clearCache()

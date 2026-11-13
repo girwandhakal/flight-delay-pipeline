@@ -15,19 +15,6 @@ from pyspark.sql import functions as F
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# Configure Hadoop environment for Windows PySpark runtime if needed.
-if os.name == "nt" and "HADOOP_HOME" not in os.environ:
-    hadoop_dir = ROOT / "envs" / "hadoop"
-    if (hadoop_dir / "bin" / "winutils.exe").exists():
-        os.environ["HADOOP_HOME"] = str(hadoop_dir)
-        os.environ["PATH"] = (
-            str(hadoop_dir / "bin") + os.pathsep + os.environ.get("PATH", "")
-        )
-
-# Ensure PySpark workers use the active Python interpreter.
-os.environ["PYSPARK_PYTHON"] = sys.executable
-os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
-
 from .build_features import get_spark_session
 from .train import confusion_metrics
 
@@ -56,7 +43,7 @@ def compute_subgroup_slice(
         agg_df = agg_df.orderBy(F.col(group_col).asc())
 
     rows = agg_df.collect()
-    records = []
+    subgroup_records = []
     for r in rows:
         total = int(r["total_flights"])
         delayed = int(r["delayed_flights"])
@@ -65,7 +52,7 @@ def compute_subgroup_slice(
         tn = int(r["tn"])
         fn = int(r["fn"])
         cm = confusion_metrics(tp, fp, tn, fn)
-        records.append(
+        subgroup_records.append(
             {
                 "subgroup_type": subgroup_type,
                 "subgroup_value": str(r[group_col]),
@@ -82,7 +69,7 @@ def compute_subgroup_slice(
                 "accuracy": cm["accuracy"],
             }
         )
-    return records
+    return subgroup_records
 
 
 def compute_subgroups(scores) -> pd.DataFrame:
@@ -103,7 +90,7 @@ def evaluate(spark, gold_dir=None, models_dir=None, results_dir=None) -> dict:
     """Execute test evaluation for the frozen baseline pipeline model and decision threshold."""
     results_dir = Path(results_dir or ROOT / "results")
     results_path = results_dir / "results.json"
-    current = json.loads(results_path.read_text()) if results_path.exists() else {}
+    current = json.loads(results_path.read_text(encoding="utf-8")) if results_path.exists() else {}
     training = current.get("bts", {}).get("training", {})
     gold_dir = Path(gold_dir or training.get("gold_dir", ROOT / "data/gold/bts"))
     models_dir = Path(models_dir or training.get("models_dir", ROOT / "models/bts"))
@@ -189,36 +176,24 @@ def evaluate(spark, gold_dir=None, models_dir=None, results_dir=None) -> dict:
         default_metrics["pr_auc"] = pr_auc
         default_metrics["roc_auc"] = roc_auc
 
-        # Compute reference baselines.
+        # Compute reference baselines using shared confusion matrix calculations.
         always_ontime_metrics = {
-            "accuracy": (total_records - positive_records) / total_records
-            if total_records > 0
-            else 0.0,
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1": 0.0,
-            "confusion_matrix": {
-                "tp": 0,
-                "fp": 0,
-                "tn": total_records - positive_records,
-                "fn": positive_records,
-            },
+            **confusion_metrics(
+                tp=0,
+                fp=0,
+                tn=total_records - positive_records,
+                fn=positive_records,
+            ),
             "pr_auc": delayed_prevalence,
             "roc_auc": 0.5,
         }
         always_delayed_metrics = {
-            "accuracy": positive_records / total_records if total_records > 0 else 0.0,
-            "precision": delayed_prevalence,
-            "recall": 1.0,
-            "f1": (2 * delayed_prevalence) / (1.0 + delayed_prevalence)
-            if (1.0 + delayed_prevalence) > 0
-            else 0.0,
-            "confusion_matrix": {
-                "tp": positive_records,
-                "fp": total_records - positive_records,
-                "tn": 0,
-                "fn": 0,
-            },
+            **confusion_metrics(
+                tp=positive_records,
+                fp=total_records - positive_records,
+                tn=0,
+                fn=0,
+            ),
             "pr_auc": delayed_prevalence,
             "roc_auc": 0.5,
         }

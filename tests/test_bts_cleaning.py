@@ -5,21 +5,20 @@ import sys
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.bts.clean import clean_bts_data, get_spark_session
+from tests.conftest import get_test_spark_session
+from scripts.bts.clean import clean_bts_data
+from scripts.bts import clean as cleaning
 
 
 class TestBTSCleaning(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.spark = get_spark_session("test_bts_cleaning")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.spark.stop()
+        cls.spark = get_test_spark_session("test_bts_cleaning")
 
     def test_cleaning_rules(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -81,6 +80,12 @@ class TestBTSCleaning(unittest.TestCase):
             self.assertEqual(records["AA"]["CRSDepTime"], "0600")
             self.assertEqual(records["AA"]["ArrDel15"], 0)
             self.assertEqual(records["DL"]["ArrDel15"], 1)
+
+            with patch.object(cleaning, "ROOT", tmp_path), patch.object(cleaning, "update_results") as publish:
+                quiet = clean_bts_data(self.spark, bronze_dir=tmp_path / "bronze", silver_dir=tmp_path / "quiet_silver", results_dir=tmp_path / "quiet_results", publish_results=False)
+                publish.assert_not_called()
+            self.assertEqual(quiet.iloc[0]["retained_records"], 2)
+            self.assertFalse((tmp_path / "quiet_results").exists())
 
 
 if __name__ == "__main__":

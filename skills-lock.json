@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "skills": {
+    "create-implementation-plan": {
+      "source": "github/awesome-copilot",
+      "sourceType": "github",
+      "skillPath": "skills/create-implementation-plan/SKILL.md",
+      "computedHash": "c84cea419c511dc4f1959c3c097d1aa9a0690269c1d1c05f3e1ece5d8b483710"
+    }
+  }
+}

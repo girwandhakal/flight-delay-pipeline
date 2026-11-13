@@ -13,21 +13,25 @@ from pyspark.sql import functions as F
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# Configure Hadoop environment for Windows PySpark runtime if needed.
-if os.name == "nt" and "HADOOP_HOME" not in os.environ:
-    hadoop_dir = ROOT / "envs" / "hadoop"
-    if (hadoop_dir / "bin" / "winutils.exe").exists():
-        os.environ["HADOOP_HOME"] = str(hadoop_dir)
-        os.environ["PATH"] = (
-            str(hadoop_dir / "bin") + os.pathsep + os.environ.get("PATH", "")
-        )
+def configure_spark_env():
+    """Configure Hadoop binaries on Windows and ensure PySpark workers use the active interpreter."""
+    if os.name == "nt" and "HADOOP_HOME" not in os.environ:
+        hadoop_dir = ROOT / "envs" / "hadoop"
+        if (hadoop_dir / "bin" / "winutils.exe").exists():
+            os.environ["HADOOP_HOME"] = str(hadoop_dir)
+            os.environ["PATH"] = (
+                str(hadoop_dir / "bin") + os.pathsep + os.environ.get("PATH", "")
+            )
+    os.environ["PYSPARK_PYTHON"] = sys.executable
+    os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
-# Ensure PySpark workers use the active Python interpreter.
-os.environ["PYSPARK_PYTHON"] = sys.executable
-os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
+# Apply runtime environment configuration on module load.
+configure_spark_env()
 
 
 def get_spark_session(app_name="bts_features"):
+    configure_spark_env()
     python_path = os.environ.get("PYTHONPATH", "")
     if str(ROOT) not in python_path.split(os.pathsep):
         # Workers need the project package when the driver starts elsewhere.
@@ -49,7 +53,8 @@ def load_split_config(config_path=None):
 
 
 def build_features(
-    spark, silver_dir=None, gold_dir=None, results_dir=None, config_path=None
+    spark, silver_dir=None, gold_dir=None, results_dir=None, config_path=None,
+    publish_results=True,
 ):
     silver_dir = Path(silver_dir or ROOT / "data" / "silver" / "bts")
     gold_dir = Path(gold_dir or ROOT / "data" / "gold" / "bts")
@@ -124,39 +129,42 @@ def build_features(
         split_df.write.mode("overwrite").parquet(str(dest_split_dir))
 
         # Calculate the split summary in one pass.
-        stats = split_df.agg(
+        aggregates = [
             F.count("*").alias("total_flights"),
-            F.count(F.when(F.col("ArrDel15") == 1, 1)).alias("delayed_flights"),
             F.min("FlightDate").alias("min_date"),
             F.max("FlightDate").alias("max_date"),
-        ).first()
+        ]
+        # Validation-only orchestration prepares test schedules without label statistics.
+        if publish_results:
+            aggregates.append(F.count(F.when(F.col("ArrDel15") == 1, 1)).alias("delayed_flights"))
+        stats = split_df.agg(*aggregates).first()
         total_flights = stats["total_flights"]
-        delayed_flights = stats["delayed_flights"]
-        ontime_flights = total_flights - delayed_flights
-        delay_rate = delayed_flights / total_flights if total_flights else 0.0
-
-        summary_records.append(
-            {
-                "split": split_name,
-                "start_date": str(stats["min_date"]),
-                "end_date": str(stats["max_date"]),
-                "total_flights": total_flights,
-                "on_time_flights": ontime_flights,
+        record = {
+            "split": split_name,
+            "start_date": str(stats["min_date"]),
+            "end_date": str(stats["max_date"]),
+            "total_flights": total_flights,
+        }
+        if publish_results:
+            delayed_flights = stats["delayed_flights"]
+            record.update({
+                "on_time_flights": total_flights - delayed_flights,
                 "delayed_flights": delayed_flights,
-                "delay_rate": round(delay_rate, 4),
-            }
-        )
+                "delay_rate": round(delayed_flights / total_flights, 4) if total_flights else 0.0,
+            })
+        summary_records.append(record)
 
     summary_pd = pd.DataFrame(summary_records)
-    update_results({"bts": {"splits": records(summary_pd)}}, results_dir)
+    if publish_results:
+        update_results({"bts": {"splits": records(summary_pd)}}, results_dir)
 
     return summary_pd
 
 
-def main():
+def main(publish_results=True):
     spark = get_spark_session()
     try:
-        summary = build_features(spark)
+        summary = build_features(spark, publish_results=publish_results)
         total_flights = summary["total_flights"].sum()
         print("-" * 80)
         print(

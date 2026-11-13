@@ -103,16 +103,16 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
             | F.col("observation_utc").isNull()
             | F.coalesce(inconsistent, F.lit(True))
         )
+        is_report_excluded = (
+            ~F.col("REPORT_TYPE").isin(REPORTS) | F.col("REPORT_TYPE").isNull()
+        )
+        # Compute quality statistics in a single pass over decoded observations.
         stats = (
             parsed.agg(
                 F.count("*").alias("input_rows"),
                 F.sum(invalid.cast("int")).alias("invalid_rows"),
-                F.sum(
-                    (
-                        ~F.col("REPORT_TYPE").isin(REPORTS)
-                        | F.col("REPORT_TYPE").isNull()
-                    ).cast("int")
-                ).alias("excluded_reports"),
+                # Non-standard report types among structurally valid records (avoids double-counting with invalid_rows).
+                F.sum((~invalid & is_report_excluded).cast("int")).alias("excluded_reports"),
             )
             .first()
             .asDict()
@@ -154,10 +154,6 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
         stats["retained_observations"] = clean.count()
         eligible = parsed.filter(~invalid & F.col("REPORT_TYPE").isin(REPORTS)).count()
         stats["duplicate_observations"] = eligible - stats["retained_observations"]
-        stats["excluded_reports"] = parsed.filter(
-            ~invalid
-            & (~F.col("REPORT_TYPE").isin(REPORTS) | F.col("REPORT_TYPE").isNull())
-        ).count()
         if stats["input_rows"] != sum(
             stats[key]
             for key in (
@@ -216,7 +212,6 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
 
 def main():
     from scripts.bts.build_features import get_spark_session
-    import json
 
     settings, _, _ = load_config()
     manifest = json.loads((settings["output_directory"] / "manifest.json").read_text())

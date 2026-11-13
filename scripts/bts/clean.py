@@ -2,45 +2,33 @@
 
 import os
 from pathlib import Path
-import shutil
 import sys
 
 from scripts.results import records, update_results
 
 import pandas as pd
-from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+
+from .build_features import get_spark_session as _get_spark_session
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# Configure Hadoop environment for Windows PySpark runtime if needed.
-if os.name == "nt" and "HADOOP_HOME" not in os.environ:
-    hadoop_dir = ROOT / "envs" / "hadoop"
-    if (hadoop_dir / "bin" / "winutils.exe").exists():
-        os.environ["HADOOP_HOME"] = str(hadoop_dir)
-        os.environ["PATH"] = (
-            str(hadoop_dir / "bin") + os.pathsep + os.environ.get("PATH", "")
-        )
-
-# Ensure PySpark workers use the active Python interpreter.
-os.environ["PYSPARK_PYTHON"] = sys.executable
-os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
-
 
 def get_spark_session(app_name="bts_cleaning"):
-    return (
-        SparkSession.builder.master("local[*]")
-        .appName(app_name)
-        .config("spark.driver.memory", "6g")
-        .config("spark.sql.shuffle.partitions", "8")
-        .getOrCreate()
-    )
+    return _get_spark_session(app_name=app_name)
 
 
-def clean_bts_data(spark=None, bronze_dir=None, silver_dir=None, results_dir=None):
+def clean_bts_data(
+    spark=None,
+    bronze_dir=None,
+    silver_dir=None,
+    results_dir=None,
+    quarantine_dir=None,
+    publish_results=True,
+):
     bronze_dir = Path(bronze_dir or ROOT / "data" / "bronze" / "bts")
     silver_dir = Path(silver_dir or ROOT / "data" / "silver" / "bts")
-    quarantine_dir = Path(ROOT / "data" / "quarantine" / "bts")
+    quarantine_dir = Path(quarantine_dir or ROOT / "data" / "quarantine" / "bts")
     results_dir = Path(results_dir or ROOT / "results")
 
     csv_files = sorted(bronze_dir.glob("*/*/*.csv"))
@@ -70,12 +58,14 @@ def clean_bts_data(spark=None, bronze_dir=None, silver_dir=None, results_dir=Non
             "_", F.col("FlightDate"), airline, flight_num, origin, dest, crs_dep
         )
 
+        # Default missing Cancelled/Diverted to 1.0 so unconfirmed flights are safely excluded.
         cancelled = F.coalesce(F.col("Cancelled").cast("double"), F.lit(1.0))
         diverted = F.coalesce(F.col("Diverted").cast("double"), F.lit(1.0))
         arr_del = F.col("ArrDel15").cast("double")
         distance = F.col("Distance").cast("double")
         elapsed_time = F.col("CRSElapsedTime").cast("double")
 
+        # Retain only non-cancelled, non-diverted flights with a confirmed binary arrival delay label.
         is_eligible = (cancelled == 0.0) & (diverted == 0.0) & arr_del.isin([0.0, 1.0])
         has_flight_num = flight_num.isNotNull() & (flight_num != "")
         has_positive_dimensions = (distance > 0.0) & (elapsed_time > 0.0)
@@ -148,15 +138,16 @@ def clean_bts_data(spark=None, bronze_dir=None, silver_dir=None, results_dir=Non
         )
 
     summary_pd = pd.DataFrame(summary_records)
-    update_results({"bts": {"cleaning": records(summary_pd)}}, results_dir)
+    if publish_results:
+        update_results({"bts": {"cleaning": records(summary_pd)}}, results_dir)
 
     return summary_pd
 
 
-def main():
+def main(publish_results=True):
     spark = get_spark_session()
     try:
-        summary = clean_bts_data(spark)
+        summary = clean_bts_data(spark, publish_results=publish_results)
         total_retained = summary["retained_records"].sum()
         print("-" * 80)
         print(

@@ -27,3 +27,4 @@ metastore_db/
 derby.log
 /envs/hadoop/
 output.txt
+.agents/

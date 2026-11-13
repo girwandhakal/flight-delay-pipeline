@@ -48,5 +48,8 @@
   "origin_weather": {
     "max_age_minutes": 120,
     "publication_lag_minutes": 0
+  },
+  "destination_weather": {
+    "reference_directory": "data/reference/weather/2024-2025-destination-v1"
   }
 }

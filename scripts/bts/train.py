@@ -1,4 +1,4 @@
-"""Train BTS-only or BTS plus origin weather with the same chronological search."""
+"""Train BTS and weather variants with the same chronological search."""
 
 from datetime import datetime, timezone
 import json
@@ -20,21 +20,20 @@ from pyspark.sql import functions as F
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# Configure Hadoop environment for Windows PySpark runtime if needed.
-if os.name == "nt" and "HADOOP_HOME" not in os.environ:
-    hadoop_dir = ROOT / "envs" / "hadoop"
-    if (hadoop_dir / "bin" / "winutils.exe").exists():
-        os.environ["HADOOP_HOME"] = str(hadoop_dir)
-        os.environ["PATH"] = (
-            str(hadoop_dir / "bin") + os.pathsep + os.environ.get("PATH", "")
-        )
-
-# Ensure PySpark workers use the active Python interpreter.
-os.environ["PYSPARK_PYTHON"] = sys.executable
-os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
-
 from .build_features import get_spark_session, load_split_config
 from scripts.origin_weather.build_features import WEATHER_NUMERIC, WEATHER_FLAGS
+from scripts.destination_weather.build_features import DESTINATION_WEATHER_NUMERIC, DESTINATION_WEATHER_FLAGS
+
+FEATURE_SETS = ("bts", "bts_origin_weather", "bts_origin_destination_weather")
+
+
+def weather_columns(feature_set):
+    numeric, flags = WEATHER_NUMERIC.copy(), WEATHER_FLAGS.copy()
+    if feature_set == "bts_origin_destination_weather":
+        numeric += DESTINATION_WEATHER_NUMERIC
+        flags += DESTINATION_WEATHER_FLAGS
+    return numeric, flags
+
 
 CATEGORICAL_FEATURES = [
     "Reporting_Airline",
@@ -53,7 +52,7 @@ THRESHOLDS = [round(i * 0.05, 2) for i in range(1, 20)]
 
 
 def build_preprocessor(feature_set="bts") -> Pipeline:
-    if feature_set not in ("bts", "bts_origin_weather"):
+    if feature_set not in FEATURE_SETS:
         raise ValueError(f"Unknown feature set: {feature_set}")
     indices = [name + "_idx" for name in CATEGORICAL_FEATURES]
     vectors = [name + "_vec" for name in CATEGORICAL_FEATURES]
@@ -66,12 +65,14 @@ def build_preprocessor(feature_set="bts") -> Pipeline:
         ),
     ]
     numeric = NUMERIC_FEATURES.copy()
-    if feature_set == "bts_origin_weather":
-        imputed = [name + "_imputed" for name in WEATHER_NUMERIC]
-        stages.append(
-            Imputer(inputCols=WEATHER_NUMERIC, outputCols=imputed, strategy="mean")
-        )
-        numeric += imputed + WEATHER_FLAGS
+    if feature_set != "bts":
+        weather_numeric, _ = weather_columns(feature_set)
+        imputed = [name + "_imputed" for name in weather_numeric]
+        stages.append(Imputer(inputCols=weather_numeric, outputCols=imputed, strategy="mean"))
+        # Preserve exact vector ordering: origin numeric + flags, then destination numeric + flags.
+        numeric += [name + "_imputed" for name in WEATHER_NUMERIC] + WEATHER_FLAGS
+        if feature_set == "bts_origin_destination_weather":
+            numeric += [name + "_imputed" for name in DESTINATION_WEATHER_NUMERIC] + DESTINATION_WEATHER_FLAGS
     stages.append(
         VectorAssembler(
             inputCols=vectors + numeric, outputCol="features", handleInvalid="error"
@@ -80,20 +81,21 @@ def build_preprocessor(feature_set="bts") -> Pipeline:
     return Pipeline(stages=stages)
 
 
-def validate_weather(data, context):
+def validate_weather(data, context, feature_set="bts_origin_weather", require_values=True):
+    numeric, flags = weather_columns(feature_set)
     counts = data.agg(
         *[
             F.count(F.when(F.col(name).isNotNull() & ~F.isnan(name), 1)).alias(name)
-            for name in WEATHER_NUMERIC
+            for name in numeric
         ]
     ).first()
-    for name in WEATHER_NUMERIC:
-        if not counts[name]:
+    for name in numeric:
+        if require_values and not counts[name]:
             raise ValueError(f"No valid training values for {name} in {context}")
     invalid = F.lit(False)
-    for name in WEATHER_NUMERIC:
-        invalid = invalid | (F.abs(F.col(name)) == float("inf"))
-    for name in WEATHER_FLAGS:
+    for name in numeric:
+        invalid = invalid | F.isnan(name) | (F.abs(F.col(name)) == float("inf"))
+    for name in flags:
         invalid = invalid | F.col(name).isNull() | ~F.col(name).isin(0, 1)
     if data.filter(invalid).limit(1).count():
         raise ValueError(f"Invalid weather values or flags in {context}")
@@ -215,9 +217,9 @@ def train(
     save_predictions=False,
     publish_results=True,
 ):
-    if feature_set not in ("bts", "bts_origin_weather"):
+    if feature_set not in FEATURE_SETS:
         raise ValueError(f"Unknown feature set: {feature_set}")
-    if feature_set == "bts_origin_weather" and any(
+    if feature_set != "bts" and any(
         path is None for path in (gold_dir, models_dir)
     ):
         raise ValueError(
@@ -232,8 +234,9 @@ def train(
 
     print("\n--- [Step 1/4] Preparing Training and Validation Flights ---", flush=True)
     columns = CATEGORICAL_FEATURES + NUMERIC_FEATURES + [TARGET_COL]
-    if feature_set == "bts_origin_weather":
-        columns += WEATHER_NUMERIC + WEATHER_FLAGS
+    if feature_set != "bts":
+        numeric, flags = weather_columns(feature_set)
+        columns += numeric + flags
     metadata = ["flight_id", "FlightDate"] if save_predictions else []
     # Leave JVM heap for concurrent classifier tasks rather than duplicated training rows.
     train_features = train_data.select("FlightDate", *columns).persist(StorageLevel.DISK_ONLY)
@@ -245,6 +248,8 @@ def train(
             F.count("*").alias("rows"),
             F.avg(TARGET_COL).alias("prevalence"),
         ).first()
+        if feature_set != "bts":
+            validate_weather(val_features, "validation", feature_set, require_values=False)
         val_count = val_features.count()
         prevalence = training_stats["prevalence"]
         print(
@@ -335,8 +340,8 @@ def train(
                 F.trunc("FlightDate", "month") == F.lit(month)
             )
             # Fit once per fold: preprocessing does not depend on classifier parameters.
-            if feature_set == "bts_origin_weather":
-                validate_weather(fold_train, f"fold before {month}")
+            if feature_set != "bts":
+                validate_weather(fold_train, f"fold before {month}", feature_set)
             preprocessor = build_preprocessor(feature_set).fit(fold_train)
             encoded_train = (
                 preprocessor.transform(fold_train)
@@ -368,10 +373,11 @@ def train(
                 flush=True,
             )
         for candidate in candidates:
-            candidate["internal_pr_auc"] = sum(candidate["fold_pr_auc"]) / len(folds)
+            n_folds = len(candidate["fold_pr_auc"])
+            candidate["internal_pr_auc"] = sum(candidate["fold_pr_auc"]) / n_folds if n_folds else 0.0
         best = max(range(len(grid)), key=lambda i: candidates[i]["internal_pr_auc"])
-        if feature_set == "bts_origin_weather":
-            validate_weather(train_features, "full training")
+        if feature_set != "bts":
+            validate_weather(train_features, "full training", feature_set)
         selected_model = Pipeline(
             stages=build_preprocessor(feature_set).getStages() + [estimator]
         ).fit(train_features, grid[best])

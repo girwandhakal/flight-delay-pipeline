@@ -32,6 +32,14 @@ CONDITIONS = {
     "unknown_precipitation": {"UP"},
     "other": {"VA", "PY", "SQ", "FC", "LIGHTNING", "RECENT"},
 }
+ALLOWED_PHENOMENA = set().union(
+    *CONDITIONS.values(),
+    {"VC", "MI", "PR", "BC", "DR", "BL", "SH", "VA", "PY", "SQ", "FC"},
+)
+CLOUD_COVER_RANGES = {
+    "CLR": {0}, "FEW": {1, 2}, "SCT": {3, 4}, "BKN": {5, 6, 7},
+    "OVC": {8}, "VV": {9}, "10": {10},
+}
 # Numeric AW and MW codes have different meanings; never decode them across groups.
 AW_CODES = {
     code: set(phenomena.split())
@@ -91,6 +99,7 @@ UNITS = {
 
 
 def number(token):
+    """Parse numeric token, returning None for non-numeric, flagged, or infinite values."""
     text = (token or "").strip()
     if not re.fullmatch(r"[+-]?(\d+(\.\d*)?|\.\d+)", text):
         return None
@@ -101,9 +110,9 @@ def number(token):
 def weather_conditions(token):
     """Decode AU contractions and source-specific AW/MW codes, preserving uncertainty."""
     found, unknown = set(), False
-    allowed = set().union(*CONDITIONS.values(), {"VC", "MI", "PR", "BC", "DR", "BL", "SH", "VA", "PY", "SQ", "FC"})
     for group, tokens in enumerate((token or "").strip().split("|")):
         for item in tokens.split():
+            # Match AU contraction (group 1), optional AW/MW code (group 2), or standalone numeric code (group 3).
             match = re.fullmatch(r"[+-]?([A-Z]+(?:\+[A-Z]+)*)(?::(\d{1,2}))?|(\d{1,2})", item)
             if not match or group > 2:
                 unknown = True
@@ -111,7 +120,7 @@ def weather_conditions(token):
             if match[1]:
                 spelling = match[1].replace("HAIL", "GR").replace("+", "")
                 parts = set(re.findall(r"..", spelling))
-                if len(spelling) % 2 or not parts <= allowed:
+                if len(spelling) % 2 or not parts <= ALLOWED_PHENOMENA:
                     unknown = True
                     continue
                 found.update(parts)
@@ -124,6 +133,7 @@ def weather_conditions(token):
                     found.update(decoded)
             elif match[3]:
                 unknown = True
+    # Mark condition as fully known only if phenomena were found without any unparseable tokens.
     known = bool(found) and not unknown
     return {
         "origin_weather_" + name: 1.0 if codes & found else (0.0 if known else None)
@@ -132,12 +142,12 @@ def weather_conditions(token):
 
 
 def cloud_conditions(token):
+    """Decode cloud layers into oktas cover, lowest ceiling height, and obscurity indicators."""
     text = (token or "").strip()
     pattern = r"(CLR|FEW|SCT|BKN|OVC|VV|10):(\d{2})(?:\s+([+]?(?:\d+(?:\.\d*)?|\.\d+)))?"
     layers = list(re.finditer(pattern, text))
     valid = bool(layers) and not re.sub(pattern, "", text).strip()
-    ranges = {"CLR": {0}, "FEW": {1, 2}, "SCT": {3, 4}, "BKN": {5, 6, 7}, "OVC": {8}, "VV": {9}, "10": {10}}
-    valid = valid and all(int(layer[2]) in ranges[layer[1]] for layer in layers)
+    valid = valid and all(int(layer[2]) in CLOUD_COVER_RANGES[layer[1]] for layer in layers)
     if not valid:
         return None, None, 1, 1, 0, 0
     obscured = any(layer[1] in {"VV", "10"} for layer in layers)
@@ -155,6 +165,7 @@ def cloud_conditions(token):
 def decode_weather(values):
     """Return training values and flags from one report, never mixing timestamps."""
     result = {}
+    # Iterate through continuous measurements; missing values default to flag=1.
     for (source, output), flag in zip(NUMERIC_MEASUREMENTS.items(), MISSING_FLAGS):
         value = number(values.get(source))
         if source not in {"HourlyDryBulbTemperature", "HourlyDewPointTemperature"}:
@@ -173,6 +184,7 @@ def decode_weather(values):
         result["origin_precipitation_mm"] = 0.0
         result["origin_precipitation_missing"] = 0
 
+    # Decompose wind direction into vector components, handling calm and variable reports.
     direction = result.pop("origin_wind_direction_degrees")
     variable = (values.get("HourlyWindDirection") or "").strip() == "VRB"
     calm = result["origin_wind_speed_ms"] == 0
@@ -188,7 +200,13 @@ def decode_weather(values):
     conditions, missing = weather_conditions(values.get("HourlyPresentWeatherType"))
     result.update(conditions)
     result["origin_weather_type_missing"] = missing
-    (result["origin_cloud_cover_oktas"], result["origin_cloud_ceiling_m"],
-     result["origin_sky_conditions_missing"], result["origin_cloud_ceiling_missing"],
-     result["origin_cloud_no_ceiling"], result["origin_cloud_obscured"]) = cloud_conditions(values.get("HourlySkyConditions"))
+
+    (
+        result["origin_cloud_cover_oktas"],
+        result["origin_cloud_ceiling_m"],
+        result["origin_sky_conditions_missing"],
+        result["origin_cloud_ceiling_missing"],
+        result["origin_cloud_no_ceiling"],
+        result["origin_cloud_obscured"],
+    ) = cloud_conditions(values.get("HourlySkyConditions"))
     return result
