@@ -43,6 +43,14 @@ def sha256(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def reference_matches(path, checksum):
+    # Git checkouts and GitHub ZIPs can use different CSV line endings.
+    content = Path(path).read_bytes()
+    lf = content.replace(b"\r\n", b"\n")
+    return any(hashlib.sha256(value).hexdigest() == checksum
+               for value in (content, lf, lf.replace(b"\n", b"\r\n")))
+
+
 def project_path(root, name):
     path = Path(name)
     resolved = (root / path).resolve()
@@ -123,7 +131,7 @@ def prepare_references(origins, directory, start_date, end_date, prefix="origin"
         ]:
             raise ValueError("Reference scope changed; use a new reference_directory.")
         for name, checksum in evidence["files"].items():
-            if sha256(directory / name) != checksum:
+            if not reference_matches(directory / name, checksum):
                 raise ValueError(f"Reference changed: {name}")
         return
     directory.mkdir(parents=True, exist_ok=True)

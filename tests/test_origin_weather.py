@@ -33,6 +33,29 @@ def raw_csv(rows):
 
 
 class WeatherDownloadTests(unittest.TestCase):
+    def test_reference_line_endings_preserve_checksums_but_content_changes_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            target = directory / "airports.csv"
+            for original, converted in ((b"Origin\r\nORD\r\n", b"Origin\nORD\n"),
+                                        (b"Origin\nORD\n", b"Origin\r\nORD\r\n")):
+                with self.subTest(original=original):
+                    target.write_bytes(original)
+                    checksum = download.sha256(target)
+                    download.write_json(directory / "sources.json", {
+                        "origins": ["ORD"], "scope": ["2024-01-01", "2025-01-31"],
+                        "files": {"airports.csv": checksum},
+                    })
+                    with patch.object(download, "fetch") as network:
+                        for payload in (original, converted):
+                            target.write_bytes(payload)
+                            download.prepare_references(["ORD"], directory, "2024-01-01", "2025-01-31")
+                            self.assertEqual(target.read_bytes(), payload)
+                        target.write_bytes(converted.replace(b"ORD", b"LAX"))
+                        with self.assertRaisesRegex(ValueError, "Reference changed: airports.csv"):
+                            download.prepare_references(["ORD"], directory, "2024-01-01", "2025-01-31")
+                        network.assert_not_called()
+
     def test_dst_clocks_and_invalid_times(self):
         convert = features.local_cutoff
         self.assertEqual(

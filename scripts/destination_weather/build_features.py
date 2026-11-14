@@ -12,7 +12,7 @@ from scripts.origin_weather import build_features as origin
 from scripts.origin_weather.clean import clean_weather
 from scripts.origin_weather.download import (
     ROOT, load_config, prepare_references, project_path, download_weather,
-    sha256, write_json,
+    reference_matches, sha256, write_json,
 )
 from scripts.results import records
 
@@ -39,7 +39,7 @@ def validate_parent(directory, settings, policy, config):
     if sources != current:
         raise ValueError("Origin reference identity changed.")
     for name, checksum in sources["files"].items():
-        if sha256(settings["reference_directory"] / name) != checksum:
+        if not reference_matches(settings["reference_directory"] / name, checksum):
             raise ValueError(f"Origin reference changed: {name}")
     return metadata
 

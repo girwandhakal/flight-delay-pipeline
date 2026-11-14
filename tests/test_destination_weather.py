@@ -20,6 +20,33 @@ from scripts.results import update_results
 
 
 class DestinationTests(unittest.TestCase):
+    def test_parent_reference_accepts_zip_line_endings_and_rejects_content_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            parent = root / "data/gold/bts_origin_weather/fixture"
+            for split in ("train", "val", "test"):
+                (parent / split).mkdir(parents=True)
+                (parent / split / "_SUCCESS").touch()
+            reference = root / "references"
+            reference.mkdir()
+            target = reference / "airports.csv"
+            target.write_bytes(b"Origin\r\nORD\r\n")
+            sources = {"files": {"airports.csv": download.sha256(target)}}
+            download.write_json(reference / "sources.json", sources)
+            metadata = {
+                "policy": {}, "splits": dict.fromkeys(("train", "val", "test")),
+                "weather_columns": origin.WEATHER_NUMERIC + origin.WEATHER_FLAGS,
+                "bts_input_files": [], "reference_sources": sources,
+                "source_contract": {"timestamp_basis": "metar_verified_utc_or_local_standard"},
+            }
+            download.write_json(parent / "_metadata.json", metadata)
+            target.write_bytes(b"Origin\nORD\n")
+            with patch.object(destination, "ROOT", root), patch.object(destination, "bts_fingerprints", return_value=[]):
+                self.assertEqual(destination.validate_parent(parent, {"reference_directory": reference}, {}, metadata), metadata)
+                target.write_bytes(b"Origin\nLAX\n")
+                with self.assertRaisesRegex(ValueError, "Origin reference changed: airports.csv"):
+                    destination.validate_parent(parent, {"reference_directory": reference}, {}, metadata)
+
     def test_default_driver_runs_destination_workflow(self):
         with patch.object(pipeline, "run_destination_weather", return_value=0) as run, patch.object(pipeline, "run_stage") as legacy:
             self.assertEqual(pipeline.main([]), 0)
