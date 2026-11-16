@@ -13,12 +13,14 @@ import time
 # Find the project scripts even when this file is run from another directory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.results import update_results
+from scripts.progress import stage as progress_stage
 from scripts.bts import clean as bts_clean, download as bts_download
 from scripts.bts import (
     evaluate as bts_evaluate,
     train as bts_train,
     build_features as bts_transform,
 )
+from scripts.bts.recent_delays import features_current
 from scripts.origin_weather import build_features as weather_features
 from scripts.destination_weather import build_features as destination_features
 from scripts.origin_weather.download import ROOT, load_config, sha256, write_json
@@ -175,8 +177,10 @@ def data_fingerprints(directory):
 
 def run_destination_weather():
     start = time.monotonic()
+    print("Starting pipeline: BTS + origin + destination weather (validation)", flush=True)
     settings, policy, config = load_config()
-    if not all((ROOT / "data/gold/bts" / split / "_SUCCESS").exists() for split in config["splits"]):
+    print("Checking whether BTS features can be reused...", flush=True)
+    if not features_current(ROOT, config):
         for step, title, stage in (
             ("Preparing BTS 1/3", "BTS Data Acquisition", bts_download.main),
             ("Preparing BTS 2/3", "BTS Data Cleaning", lambda: bts_clean.main(publish_results=False)),
@@ -185,19 +189,26 @@ def run_destination_weather():
             status = run_stage(step, title, stage)
             if status:
                 return status
+    else:
+        print("Reusing BTS features because they match the current inputs and policy.", flush=True)
     current_path = ROOT / "results/results.json"
     current = json.loads(current_path.read_text()) if current_path.exists() else {}
-    try:
-        parent = Path(current["bts_origin_weather"]["data"]["gold_dir"])
-        destination_features.validate_parent(parent, settings, policy, config)
-        schema_spark = bts_transform.get_spark_session("destination_parent_schema")
+    with progress_stage("Stage: Prepare origin-weather features (validate cached data or rebuild)"):
         try:
-            destination_features.validate_parent_data(schema_spark, parent, config)
-        finally:
-            schema_spark.stop()
-    except (KeyError, OSError, ValueError, AnalysisException):
-        parent, _ = weather_features.main(publish_results=False)
-    gold, _ = destination_features.main(parent)
+            parent = Path(current["bts_origin_weather"]["data"]["gold_dir"])
+            destination_features.validate_parent(parent, settings, policy, config)
+            print(f"Checking cached origin-weather features: {parent}", flush=True)
+            schema_spark = bts_transform.get_spark_session("destination_parent_schema")
+            try:
+                destination_features.validate_parent_data(schema_spark, parent, config)
+            finally:
+                schema_spark.stop()
+            print(f"Reusing origin-weather features from {parent} because validation passed.", flush=True)
+        except (KeyError, OSError, ValueError, AnalysisException) as error:
+            print(f"Rebuilding origin-weather features because cached data could not be reused: {error}", flush=True)
+            parent, _ = weather_features.main(publish_results=False)
+    with progress_stage("Stage: Prepare destination-weather features"):
+        gold, _ = destination_features.main(parent)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "_" + uuid4().hex[:8]
     models = ROOT / "models/destination_weather_comparison" / run_id
     models.mkdir(parents=True)
@@ -207,39 +218,42 @@ def run_destination_weather():
         summaries, timings = {}, {}
         for variant, directory in data_dirs.items():
             started = time.monotonic()
-            summaries[variant] = bts_train.train(spark, directory, models / variant,
-                feature_set=variant, save_predictions=True, publish_results=False)
+            with progress_stage(f"Training {variant}: fixed settings and validation"):
+                summaries[variant] = bts_train.train(spark, directory, models / variant,
+                    feature_set=variant, save_predictions=True, publish_results=False)
             timings[variant] = time.monotonic() - started
         prevalence = {variant: summary["reference_baselines"]["train_prevalence"]["training_prevalence"] for variant, summary in summaries.items()}
-        updates = compare_predictions(spark, models,
-            context=spark.read.parquet(str(gold / "val")), variants=bts_train.FEATURE_SETS, training_prevalence=prevalence)
-        metadata = json.loads((gold / "_metadata.json").read_text())
-        run = {
-            "run_id": run_id, "models_dir": str(models),
-            "data_dirs": {variant: str(path) for variant, path in data_dirs.items()},
-            "splits": config["splits"], "policy": policy, "training_prevalence": prevalence,
-            "feature_columns": {variant: summary["input_columns"] for variant, summary in summaries.items()},
-            "thresholds": {variant: summary["selected_model"]["best_threshold"] for variant, summary in summaries.items()},
-            "data_metadata_sha256": {variant: sha256(path / "_metadata.json") for variant, path in data_dirs.items() if variant != "bts"},
-            "data_fingerprints": {variant: data_fingerprints(path) for variant, path in data_dirs.items()},
-            "inference_sha256": inference_hashes(models),
-            "source_identity": metadata,
-            "code_sha256": {str(path.relative_to(ROOT)): sha256(path)
-                            for folder in (ROOT / "scripts", ROOT / "pipeline") for path in folder.rglob("*.py")},
-            "python": platform.python_version(), "spark": spark.version,
-            "training_seconds": timings, "elapsed_seconds": time.monotonic() - start,
-            "bytes": sum(path.stat().st_size for folder in (models, gold) for path in folder.rglob("*") if path.is_file()),
-            "holdout_status": "Potentially inspected development benchmark. No test metrics used in validation comparison.",
-        }
-        write_json(models / "run.json", run)
-        for variant, summary in summaries.items():
-            updates[variant].update(training=summary, run_id=run_id)
-        updates["bts_origin_weather"]["data"] = json.loads((parent / "_metadata.json").read_text())
-        updates["bts_origin_destination_weather"].update(data=metadata, cleaning={key: metadata[key] for key in ("quality", "station_quality", "source_contract")})
-        updates["bts_origin_weather"]["cleaning"] = updates["bts_origin_destination_weather"]["cleaning"]
-        update_results(updates)
-        (models / "_SUCCESS").touch()
-        print(f"Destination-weather validation comparison completed: {models}")
+        with progress_stage("Stage: Compare all three models on validation"):
+            updates = compare_predictions(spark, models,
+                context=spark.read.parquet(str(gold / "val")), variants=bts_train.FEATURE_SETS, training_prevalence=prevalence)
+        with progress_stage("Stage: Save comparison manifest and publish results"):
+            metadata = json.loads((gold / "_metadata.json").read_text())
+            run = {
+                "run_id": run_id, "models_dir": str(models),
+                "data_dirs": {variant: str(path) for variant, path in data_dirs.items()},
+                "splits": config["splits"], "policy": policy, "training_prevalence": prevalence,
+                "feature_columns": {variant: summary["input_columns"] for variant, summary in summaries.items()},
+                "thresholds": {variant: summary["selected_model"]["best_threshold"] for variant, summary in summaries.items()},
+                "data_metadata_sha256": {variant: sha256(path / "_metadata.json") for variant, path in data_dirs.items() if variant != "bts"},
+                "data_fingerprints": {variant: data_fingerprints(path) for variant, path in data_dirs.items()},
+                "inference_sha256": inference_hashes(models),
+                "source_identity": metadata,
+                "code_sha256": {str(path.relative_to(ROOT)): sha256(path)
+                                for folder in (ROOT / "scripts", ROOT / "pipeline") for path in folder.rglob("*.py")},
+                "python": platform.python_version(), "spark": spark.version,
+                "training_seconds": timings, "elapsed_seconds": time.monotonic() - start,
+                "bytes": sum(path.stat().st_size for folder in (models, gold) for path in folder.rglob("*") if path.is_file()),
+                "holdout_status": "Potentially inspected development benchmark. No test metrics used in validation comparison.",
+            }
+            write_json(models / "run.json", run)
+            for variant, summary in summaries.items():
+                updates[variant].update(training=summary, run_id=run_id)
+            updates["bts_origin_weather"]["data"] = json.loads((parent / "_metadata.json").read_text())
+            updates["bts_origin_destination_weather"].update(data=metadata, cleaning={key: metadata[key] for key in ("quality", "station_quality", "source_contract")})
+            updates["bts_origin_weather"]["cleaning"] = updates["bts_origin_destination_weather"]["cleaning"]
+            update_results(updates)
+            (models / "_SUCCESS").touch()
+        print(f"Pipeline completed in {time.monotonic() - start:.1f}s. Results: {models}", flush=True)
         return 0
     finally:
         spark.stop()
@@ -297,14 +311,17 @@ def evaluate_destination_weather(run_id):
 
 def run_origin_weather():
     start = time.monotonic()
-    if not all(
-        (ROOT / "data/gold/bts" / split / "_SUCCESS").exists()
-        for split in ("train", "val", "test")
-    ):
+    print("Starting pipeline: BTS + origin weather (validation)", flush=True)
+    _, _, config = load_config()
+    print("Checking whether BTS features can be reused...", flush=True)
+    if not features_current(ROOT, config):
         for step, title, stage in STAGES[:3]:
             if run_stage(step, title, stage):
                 return 1
-    gold, data_report = weather_features.main()
+    else:
+        print("Reusing BTS features because they match the current inputs and policy.", flush=True)
+    with progress_stage("Stage: Prepare origin-weather features"):
+        gold, data_report = weather_features.main()
     run_id = (
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "_" + uuid4().hex[:8]
     )
@@ -319,54 +336,57 @@ def run_origin_weather():
             ("bts_origin_weather", gold),
         ):
             started = time.monotonic()
-            summaries[variant] = bts_train.train(
-                spark,
-                data,
-                models / variant,
-                feature_set=variant,
-                save_predictions=True,
-                publish_results=False,
-            )
+            with progress_stage(f"Training {variant}: fixed settings and validation"):
+                summaries[variant] = bts_train.train(
+                    spark,
+                    data,
+                    models / variant,
+                    feature_set=variant,
+                    save_predictions=True,
+                    publish_results=False,
+                )
             timings[variant] = time.monotonic() - started
-        updates = compare_predictions(
-            spark, results, context=spark.read.parquet(str(gold / "val"))
-        )
-        _, policy, _ = load_config()
-        write_json(
-            results / "run.json",
-            {
-                "run_id": run_id,
-                "gold_dir": str(gold),
-                "bts_gold_dir": str(ROOT / "data/gold/bts"),
-                "models_dir": str(models),
-                "data_report": str(data_report),
-                "dataset_manifest_sha256": sha256(
-                    data_report / "_metadata.json"
-                ),
-                "policy": policy,
-                "python": platform.python_version(),
-                "spark": spark.version,
-                "code_sha256": {
-                    str(path.relative_to(ROOT)): sha256(path)
-                    for folder in (ROOT / "scripts", ROOT / "pipeline")
-                    for path in folder.rglob("*.py")
+        with progress_stage("Stage: Compare both models on validation"):
+            updates = compare_predictions(
+                spark, results, context=spark.read.parquet(str(gold / "val"))
+            )
+        with progress_stage("Stage: Save comparison manifest and publish results"):
+            _, policy, _ = load_config()
+            write_json(
+                results / "run.json",
+                {
+                    "run_id": run_id,
+                    "gold_dir": str(gold),
+                    "bts_gold_dir": str(ROOT / "data/gold/bts"),
+                    "models_dir": str(models),
+                    "data_report": str(data_report),
+                    "dataset_manifest_sha256": sha256(
+                        data_report / "_metadata.json"
+                    ),
+                    "policy": policy,
+                    "python": platform.python_version(),
+                    "spark": spark.version,
+                    "code_sha256": {
+                        str(path.relative_to(ROOT)): sha256(path)
+                        for folder in (ROOT / "scripts", ROOT / "pipeline")
+                        for path in folder.rglob("*.py")
+                    },
+                    "elapsed_seconds": time.monotonic() - start,
+                    "training_seconds": timings,
+                    "bytes": sum(
+                        p.stat().st_size
+                        for folder in (models, gold)
+                        for p in folder.rglob("*")
+                        if p.is_file()
+                    ),
+                    "holdout_status": "Potentially inspected by prior BTS pipeline; no test metrics used in this comparison.",
                 },
-                "elapsed_seconds": time.monotonic() - start,
-                "training_seconds": timings,
-                "bytes": sum(
-                    p.stat().st_size
-                    for folder in (models, gold)
-                    for p in folder.rglob("*")
-                    if p.is_file()
-                ),
-                "holdout_status": "Potentially inspected by prior BTS pipeline; no test metrics used in this comparison.",
-            },
-        )
-        for variant, summary in summaries.items():
-            updates[variant].update({"training": summary, "run_id": run_id})
-        update_results(updates)
-        (results / "_SUCCESS").touch()
-        print(f"Origin-weather comparison completed: {results}")
+            )
+            for variant, summary in summaries.items():
+                updates[variant].update({"training": summary, "run_id": run_id})
+            update_results(updates)
+            (results / "_SUCCESS").touch()
+        print(f"Pipeline completed in {time.monotonic() - start:.1f}s. Results: {results}", flush=True)
         return 0
     finally:
         spark.stop()
@@ -432,14 +452,14 @@ def run_stage(step: str, title: str, func) -> int:
     bar = "=" * 80
     subbar = "-" * 80
     print(f"\n{bar}")
-    print(f"[{step}] START: {title}")
+    print(f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] [{step}] START: {title}")
     print(f"{bar}\n", flush=True)
 
-    start_time = time.time()
+    start_time = time.monotonic()
     try:
         ret = func()
     except Exception as exc:
-        elapsed = time.time() - start_time
+        elapsed = time.monotonic() - start_time
         print(f"\n{'!' * 80}")
         print(
             f"[{step}] ERROR: {title} encountered an unhandled exception after {elapsed:.1f}s:"
@@ -448,7 +468,7 @@ def run_stage(step: str, title: str, func) -> int:
         print(f"{'!' * 80}\n", flush=True)
         raise
 
-    elapsed = time.time() - start_time
+    elapsed = time.monotonic() - start_time
     if ret != 0:
         print(f"\n{'!' * 80}")
         print(f"[{step}] FAILED: {title} (exit code: {ret}) after {elapsed:.1f}s")
@@ -456,7 +476,7 @@ def run_stage(step: str, title: str, func) -> int:
         return ret
 
     print(f"\n{subbar}")
-    print(f"[{step}] STOP: {title} finished successfully in {elapsed:.1f}s")
+    print(f"[{step}] DONE: {title} finished successfully in {elapsed:.1f}s")
     print(f"{bar}\n", flush=True)
     return 0
 
@@ -488,7 +508,7 @@ def main(argv=None):
         return evaluate_origin_weather(args.evaluate_origin_weather)
     if not args.bts_only:
         return run_destination_weather()
-    total_start = time.time()
+    total_start = time.monotonic()
     banner = "=" * 80
     print(f"\n{banner}")
     print("STARTING COMPLETE BTS END-TO-END WORKFLOW PIPELINE")
@@ -501,7 +521,7 @@ def main(argv=None):
             print(f"{banner}\n")
             return 1
 
-    total_elapsed = time.time() - total_start
+    total_elapsed = time.monotonic() - total_start
     print(banner)
     print(
         f"ALL 5 PIPELINE STAGES COMPLETED SUCCESSFULLY in {str(timedelta(seconds=int(total_elapsed)))}"

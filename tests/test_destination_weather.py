@@ -2,13 +2,14 @@
 
 from datetime import date, datetime, timedelta, timezone
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
 from pyspark.ml import PipelineModel
-from pyspark.sql import SparkSession, functions as F
+from pyspark.sql import functions as F
 
 from tests.conftest import get_test_spark_session
 from pipeline import main as pipeline
@@ -20,6 +21,22 @@ from scripts.results import update_results
 
 
 class DestinationTests(unittest.TestCase):
+    def test_inference_hashes_include_tree_challenger_models_and_thresholds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "bts/gbt/baseline_pipeline/model"
+            model.parent.mkdir(parents=True)
+            model.write_text("tree")
+            threshold = root / "bts/gbt/threshold.json"
+            threshold.write_text('{"threshold": 0.3}')
+            original = pipeline.inference_hashes(root)
+            self.assertEqual(set(original), {str(model.relative_to(root)), str(threshold.relative_to(root))})
+            model.write_text("changed tree")
+            self.assertNotEqual(original, pipeline.inference_hashes(root))
+            threshold.write_text('{"threshold": 0.4}')
+            self.assertNotEqual(original[str(threshold.relative_to(root))],
+                                pipeline.inference_hashes(root)[str(threshold.relative_to(root))])
+
     def test_parent_reference_accepts_zip_line_endings_and_rejects_content_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -116,6 +133,7 @@ class DestinationTests(unittest.TestCase):
             current.write_text(json.dumps({"bts_origin_weather": {"data": {"gold_dir": str(parent)}}}))
             before = current.read_bytes()
             with (patch.object(pipeline, "ROOT", root),
+                  patch.object(pipeline, "features_current", return_value=True),
                   patch.object(destination, "validate_parent"),
                   patch.object(destination, "validate_parent_data"),
                   patch.object(destination, "main", return_value=(root / "combined", root / "combined")),
@@ -259,6 +277,10 @@ class DestinationSparkTests(unittest.TestCase):
         for lag in (0, 15):
             enriched = destination.build_destination_features(cutoffs, observations, {"files": {}}, publication_lag_minutes=lag).cache()
             try:
+                plan = enriched._jdf.queryExecution().executedPlan().toString()
+                self.assertIn("SortMergeJoin", plan)
+                self.assertNotIn("BroadcastHashJoin", plan)
+                self.assertNotIn("BroadcastNestedLoopJoin", plan)
                 rows = {row.flight_id: row for row in enriched.collect()}
                 for age in ages:
                     row = rows[f"ok_{age}"]
@@ -278,6 +300,15 @@ class DestinationSparkTests(unittest.TestCase):
                 self.assertEqual(rows["null_destination"].destination_weather_match_status, "unmapped_airport")
                 if lag == 15:
                     destination.validate_destination_cohort(flights, enriched, publication_lag_minutes=15)
+                    for changed in (
+                        enriched.filter("flight_id != 'invalid'"),
+                        enriched.withColumn("flight_id", F.concat(F.lit("other_"), F.col("flight_id"))),
+                        enriched.withColumn("source_file", F.lit(None).cast("string")),
+                    ):
+                        with self.subTest(change=changed.columns), self.assertRaisesRegex(ValueError, "parent columns"):
+                            destination.validate_destination_cohort(flights, changed, publication_lag_minutes=15)
+                    with self.assertRaisesRegex(ValueError, "nonnull and unique"):
+                        destination.validate_destination_cohort(flights, enriched.unionByName(enriched))
                     with self.assertRaisesRegex(ValueError, "parent columns"):
                         destination.validate_destination_cohort(flights, enriched.withColumn("origin_temperature_c", F.lit(999.0)))
                     with self.assertRaisesRegex(ValueError, "observation"):
@@ -288,8 +319,8 @@ class DestinationSparkTests(unittest.TestCase):
                 enriched.unpersist()
 
     def test_combined_vector_prefix_means_and_reload(self):
-        columns = train.CATEGORICAL_FEATURES + train.NUMERIC_FEATURES
-        fitting = self.spark.createDataFrame([("AA", "ORD", "LAX", 1, 1, 12, 15, 120.0, 800.0)], columns)
+        columns = train.INPUT_FEATURES
+        fitting = self.spark.createDataFrame([("AA", "ORD", "LAX", 1, 1, 12, 15, 120.0, 800.0, 0.25, 8.0, 4.0, 0.5, 10.0, 6.0, 0, 0, 0)], columns)
         for name in origin.WEATHER_NUMERIC:
             fitting = fitting.withColumn(name, F.lit(10.0))
         for name in destination.DESTINATION_WEATHER_NUMERIC:
@@ -300,12 +331,25 @@ class DestinationSparkTests(unittest.TestCase):
         origin_model = train.build_preprocessor("bts_origin_weather").fit(fitting)
         model = train.build_preprocessor("bts_origin_destination_weather").fit(fitting)
         validation = fitting.withColumn("destination_temperature_c", F.lit(None).cast("double")).withColumn("Reporting_Airline", F.lit("UNSEEN"))
-        vector = model.transform(validation).first().features.toArray().tolist()
+        validation = validation.withColumn("origin_temperature_c", F.lit(None).cast("double")).withColumn("Month", F.lit(12))
+        for name in train.ROLLING_FEATURES:
+            validation = validation.withColumn(name, F.lit(None).cast("double"))
+        row = model.transform(validation).first()
+        vector = row.features.toArray().tolist()
+        self.assertEqual(row.Reporting_Airline_idx, len(model.stages[0].labelsArray[0]))
+        self.assertNotIn("Month", model.stages[0].getInputCols())
+        self.assertAlmostEqual(row.MonthSin, -0.5)
+        self.assertAlmostEqual(row.MonthCos, math.sqrt(3) / 2)
+        self.assertTrue(all(row[name + "_filled"] == 0 for name in train.ROLLING_FEATURES))
         prefix = origin_model.transform(validation).first().features.toArray().tolist()
         self.assertEqual(vector[:-45], prefix)
         self.assertEqual(vector[-45:-18], [20.0] * 27)
         self.assertEqual(model.stages[2].surrogateDF.first().destination_temperature_c, 20)
+        self.assertEqual(row.origin_temperature_c_imputed, 10)
+        self.assertEqual(row.destination_temperature_c_imputed, 20)
         with self.assertRaisesRegex(ValueError, "destination_temperature_c.*fixture fold"):
+            train.validate_weather(fitting.withColumn("destination_temperature_c", F.lit(None).cast("double")), "fixture fold", "bts_origin_destination_weather")
+        with self.assertRaisesRegex(ValueError, "origin_temperature_c.*fixture fold"):
             train.validate_weather(validation, "fixture fold", "bts_origin_destination_weather")
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "pipeline")
@@ -332,72 +376,3 @@ class DestinationSparkTests(unittest.TestCase):
             scores.withColumn("ArrDel15", F.lit(0)).write.mode("overwrite").parquet(str(root / "bts_origin_destination_weather/validation_predictions"))
             with self.assertRaisesRegex(ValueError, "cohorts differ"):
                 pipeline.compare_predictions(self.spark, root, variants=train.FEATURE_SETS)
-
-    def test_same_airport_selects_same_report_and_destination_year_boundaries(self):
-        flights = self.spark.createDataFrame([("same", date(2024, 1, 1), "LAX", "LAX", "1200")],
-            "flight_id string, FlightDate date, Origin string, Dest string, CRSDepTime string")
-        origin_cutoffs = origin.build_flight_cutoffs(self.spark, flights, self.references())
-        instant = datetime(2024, 1, 1, 20, tzinfo=timezone.utc)
-        observations = self.observations([(instant, "same physical report")])
-        parent = origin.build_origin_features(origin_cutoffs, observations, {"files": {}}).cache()
-        try:
-            cutoffs = destination.build_destination_cutoffs(self.spark, parent, self.references())
-            enriched = destination.build_destination_features(cutoffs, observations, {"files": {}}).cache()
-            try:
-                row = enriched.first()
-                self.assertEqual(row.observation_utc, row.destination_observation_utc)
-                self.assertEqual(row.source_file, row.destination_source_file)
-                self.assertEqual(row.origin_temperature_c, row.destination_temperature_c)
-                destination.validate_destination_cohort(parent, enriched)
-            finally:
-                enriched.unpersist()
-        finally:
-            parent.unpersist()
-        boundary = self.spark.createDataFrame([("USW00023174", "America/Los_Angeles", datetime(2025, 1, 1, 0, 30, tzinfo=timezone.utc))],
-            "destination_station_id string, destination_time_zone string, scheduled_departure_utc timestamp")
-        self.assertEqual(origin.required_station_years(boundary, 120, "destination"), [("USW00023174", 2024, "America/Los_Angeles"), ("USW00023174", 2025, "America/Los_Angeles")])
-
-    def test_combined_training_saves_identical_predictions_without_test_reads(self):
-        from pyspark.sql import DataFrameReader
-
-        rows = [("AA" if i % 2 else "DL", "ORD", "LAX", i // 4 + 1,
-                 i % 7 + 1, i % 24, (i + 3) % 24, 120.0 + i, 800.0 + i,
-                 int(i % 3 == 0), date(2024, i // 4 + 1, i % 4 + 1), str(i)) for i in range(36)]
-        data = self.spark.createDataFrame(rows, train.CATEGORICAL_FEATURES + train.NUMERIC_FEATURES + ["ArrDel15", "FlightDate", "flight_id"])
-        for name in origin.WEATHER_NUMERIC + destination.DESTINATION_WEATHER_NUMERIC:
-            data = data.withColumn(name, F.lit(10.0))
-        for name in origin.WEATHER_FLAGS + destination.DESTINATION_WEATHER_FLAGS:
-            data = data.withColumn(name, F.lit(0))
-        missing_fold = data.withColumn("destination_temperature_c", F.when(F.col("Month") > 6, F.lit(10.0)))
-        with patch.object(DataFrameReader, "parquet", return_value=missing_fold):
-            with self.assertRaisesRegex(ValueError, "destination_temperature_c in fold before 2024-07-01"):
-                train.train(self.spark, "unused-gold", "unused-models", feature_set="bts_origin_destination_weather", publish_results=False)
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            data.write.parquet(str(root / "gold/train"))
-            data.write.parquet(str(root / "gold/val"))
-            original = DataFrameReader.parquet
-            reads = []
-
-            def read(reader, *paths, **options):
-                reads.extend(paths)
-                return original(reader, *paths, **options)
-
-            original_lr = train.LogisticRegression
-            with (patch.object(DataFrameReader, "parquet", read),
-                  patch.object(train, "update_results") as publish,
-                  patch.object(train, "REG_PARAMS", [0.1]),
-                  patch.object(train, "ELASTIC_NET_PARAMS", [0.0]),
-                  patch.object(train, "LogisticRegression", lambda **kw: original_lr(**{**kw, "maxIter": 1}))):
-                summary = train.train(self.spark, root / "gold", root / "models", feature_set="bts_origin_destination_weather", save_predictions=True, publish_results=False)
-                publish.assert_not_called()
-            self.assertTrue(all(Path(path).name != "test" for path in reads))
-            self.assertEqual(summary["tuning"]["combinations"], 1)
-            self.assertEqual(len(summary["imputation_means"]), 54)
-            self.assertEqual(len(summary["candidate_comparison"][0]["fold_pr_auc"]), 3)
-            restored = PipelineModel.load(str(root / "models/baseline_pipeline"))
-            threshold = summary["selected_model"]["best_threshold"]
-            predicted = train.predict(restored, data, threshold).select("flight_id", "p_delayed", "prediction")
-            saved = self.spark.read.parquet(str(root / "models/validation_predictions")).select(predicted.columns)
-            self.assertEqual(predicted.exceptAll(saved).count(), 0)
-            self.assertEqual(saved.exceptAll(predicted).count(), 0)

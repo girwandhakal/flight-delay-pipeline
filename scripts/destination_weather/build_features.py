@@ -115,8 +115,11 @@ def validate_destination_cohort(original, enriched, max_age_minutes=120, publica
         stats = frame.agg(F.count("*").alias("rows"), F.countDistinct("flight_id").alias("ids")).first()
         if stats.rows != stats.ids:
             raise ValueError("Flight IDs must be nonnull and unique.")
-    if (original.exceptAll(enriched.select(original.columns)).limit(1).count()
-            or enriched.select(original.columns).exceptAll(original).limit(1).count()):
+    # Unique IDs allow one exact comparison without grouping wide rows twice.
+    parent_rows = original.select("flight_id", F.struct(*original.columns).alias("_parent"))
+    enriched_rows = enriched.select("flight_id", F.struct(*original.columns).alias("_enriched"))
+    changed = parent_rows.hint("merge").join(enriched_rows, "flight_id", "full")
+    if changed.filter(~F.col("_parent").eqNullSafe(F.col("_enriched"))).limit(1).count():
         raise ValueError("Destination enrichment changed parent columns or cohort.")
     invalid = F.lit(False)
     for name in DESTINATION_WEATHER_FLAGS:
@@ -148,6 +151,7 @@ def validate_destination_cohort(original, enriched, max_age_minutes=120, publica
 
 
 def main(origin_gold_dir):
+    from scripts.progress import stage as progress_stage
     from scripts.bts.build_features import get_spark_session
 
     settings, policy, config = load_config()
@@ -157,104 +161,109 @@ def main(origin_gold_dir):
         raise ValueError("Destination references must have a separate scope.")
     spark = get_spark_session("destination_weather_features")
     try:
-        flights = spark.read.parquet(*[str(Path(origin_gold_dir) / split) for split in config["splits"]])
-        expected = set(origin.WEATHER_NUMERIC + origin.WEATHER_FLAGS + ["scheduled_departure_utc"])
-        if not expected.issubset(flights.columns):
-            raise ValueError("Parent Gold lacks the current origin feature schema.")
-        bts = spark.read.parquet(*[str(ROOT / "data/gold/bts" / split) for split in config["splits"]])
-        origin.validate_cohort(bts, flights, **policy)
-        dates = flights.agg(
-            F.date_format(F.min("scheduled_departure_utc"), "yyyy-MM-dd").alias("start"),
-            F.date_format(F.max("scheduled_departure_utc"), "yyyy-MM-dd").alias("end"),
-        ).first()
-        # A one-day envelope includes every destination civil date, including date-line crossings.
-        if dates.start is None or dates.end is None:
-            raise ValueError("No valid departure instants in the parent cohort.")
-        start = min(
-            date.fromisoformat(config["splits"]["train"]["start_date"]),
-            date.fromisoformat(dates.start) - timedelta(days=1),
-        )
-        end = max(
-            date.fromisoformat(config["splits"]["test"]["end_date"]),
-            date.fromisoformat(dates.end) + timedelta(days=1),
-        )
-        destinations = [
-            row.Dest
-            for row in flights.select("Dest").where(F.col("Dest").isNotNull()).distinct().collect()
-        ]
-        prepare_references(
-            destinations, reference, start.isoformat(), end.isoformat(), prefix="destination"
-        )
-        cutoffs = build_destination_cutoffs(
-            spark, flights, origin.load_references(reference, prefix="destination")
-        )
-        requests = origin.required_station_years(cutoffs, policy["max_age_minutes"], "destination")
-        # Combine destination requests with origin requests to ensure unified cache coverage in single fetch pass.
-        requests += origin.required_station_years(flights, policy["max_age_minutes"])
-        manifest = download_weather(requests, settings["output_directory"])
+        with progress_stage("Destination weather: validate the origin-weather parent cohort"):
+            flights = spark.read.parquet(*[str(Path(origin_gold_dir) / split) for split in config["splits"]])
+            expected = set(origin.WEATHER_NUMERIC + origin.WEATHER_FLAGS + ["scheduled_departure_utc"])
+            if not expected.issubset(flights.columns):
+                raise ValueError("Parent Gold lacks the current origin feature schema.")
+            bts = spark.read.parquet(*[str(ROOT / "data/gold/bts" / split) for split in config["splits"]])
+            origin.validate_cohort(bts, flights, **policy)
+        with progress_stage("Destination weather: prepare airport references and acquire files"):
+            dates = flights.agg(
+                F.date_format(F.min("scheduled_departure_utc"), "yyyy-MM-dd").alias("start"),
+                F.date_format(F.max("scheduled_departure_utc"), "yyyy-MM-dd").alias("end"),
+            ).first()
+            # A one-day envelope includes every destination civil date, including date-line crossings.
+            if dates.start is None or dates.end is None:
+                raise ValueError("No valid departure instants in the parent cohort.")
+            start = min(
+                date.fromisoformat(config["splits"]["train"]["start_date"]),
+                date.fromisoformat(dates.start) - timedelta(days=1),
+            )
+            end = max(
+                date.fromisoformat(config["splits"]["test"]["end_date"]),
+                date.fromisoformat(dates.end) + timedelta(days=1),
+            )
+            destinations = [
+                row.Dest
+                for row in flights.select("Dest").where(F.col("Dest").isNotNull()).distinct().collect()
+            ]
+            prepare_references(
+                destinations, reference, start.isoformat(), end.isoformat(), prefix="destination"
+            )
+            cutoffs = build_destination_cutoffs(
+                spark, flights, origin.load_references(reference, prefix="destination")
+            )
+            requests = origin.required_station_years(cutoffs, policy["max_age_minutes"], "destination")
+            # Combine destination requests with origin requests to ensure unified cache coverage in single fetch pass.
+            requests += origin.required_station_years(flights, policy["max_age_minutes"])
+            manifest = download_weather(requests, settings["output_directory"])
         build_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         gold = ROOT / "data/gold/bts_origin_destination_weather" / build_id
         silver = ROOT / "data/silver/weather" / build_id
-        observations = clean_weather(
-            spark,
-            settings["output_directory"],
-            silver,
-            ROOT / "data/quarantine/weather" / build_id,
-            manifest,
-            silver,
-        )
-        enriched = build_destination_features(cutoffs, observations, manifest, **policy).persist(
-            StorageLevel.DISK_ONLY
-        )
-        validate_destination_cohort(flights, enriched, **policy)
-        coverage = {}
-        for role, airport in (("origin", "Origin"), ("destination", "Dest")):
-            flags = origin.WEATHER_FLAGS if role == "origin" else DESTINATION_WEATHER_FLAGS
-            coverage_df = enriched.groupBy(
-                "split",
-                airport,
-                F.trunc("FlightDate", "month").alias("month"),
-                f"{role}_weather_match_status",
-            ).agg(
-                F.count("*").alias("flights"),
-                F.avg(f"{role}_weather_age_minutes").alias("mean_age_minutes"),
-                *[F.sum(name).alias(name) for name in flags],
+        with progress_stage("Destination weather: clean observations and check source clocks"):
+            observations = clean_weather(
+                spark,
+                settings["output_directory"],
+                silver,
+                ROOT / "data/quarantine/weather" / build_id,
+                manifest,
+                silver,
             )
-            coverage[role] = records(coverage_df.toPandas())
-        for split in config["splits"]:
-            count = enriched.filter(F.col("split") == split).count()
-            if any(sum(row["flights"] for row in rows if row["split"] == split) != count for rows in coverage.values()):
-                raise ValueError(f"Coverage does not reconcile: {split}")
-            enriched.filter(F.col("split") == split).write.parquet(str(gold / split))
-        metadata = {
-            **json.loads((silver / "_metadata.json").read_text()),
-            "dataset_id": build_id,
-            "gold_dir": str(gold),
-            "parent_gold_dir": str(origin_gold_dir),
-            "parent_metadata_sha256": sha256(Path(origin_gold_dir) / "_metadata.json"),
-            "policy": policy,
-            "splits": config["splits"],
-            "coverage": coverage,
-            "origin_reference_sources": parent["reference_sources"],
-            "destination_reference_sources": json.loads((reference / "sources.json").read_text()),
-            "reference_legacy_keys": "Origin and sources.origins identify destination airports in the destination reference version.",
-            "source_manifest": manifest,
-            "bts_input_files": parent["bts_input_files"],
-            "weather_columns": (
-                origin.WEATHER_NUMERIC
-                + origin.WEATHER_FLAGS
-                + DESTINATION_WEATHER_NUMERIC
-                + DESTINATION_WEATHER_FLAGS
-            ),
-            "schema": enriched.schema.jsonValue(),
-            "availability_assumption": "Observation time plus lag; historical publication and metadata availability unverified. Conditions at departure, not an arrival forecast.",
-            "raw_integrity": "Cached CSVs reused without content scans or checksums; cleaning checks records, not historical immutability.",
-            "source_files": [
-                {"path": str(path.relative_to(ROOT)), "bytes": path.stat().st_size}
-                for path in sorted(settings["output_directory"].rglob("*.csv"))
-            ],
-        }
-        write_json(gold / "_metadata.json", metadata)
+        with progress_stage("Destination weather: match observations and validate the flight cohort"):
+            enriched = build_destination_features(cutoffs, observations, manifest, **policy).persist(
+                StorageLevel.DISK_ONLY
+            )
+            validate_destination_cohort(flights, enriched, **policy)
+        with progress_stage("Destination weather: write splits, coverage and metadata"):
+            coverage = {}
+            for role, airport in (("origin", "Origin"), ("destination", "Dest")):
+                flags = origin.WEATHER_FLAGS if role == "origin" else DESTINATION_WEATHER_FLAGS
+                coverage_df = enriched.groupBy(
+                    "split",
+                    airport,
+                    F.trunc("FlightDate", "month").alias("month"),
+                    f"{role}_weather_match_status",
+                ).agg(
+                    F.count("*").alias("flights"),
+                    F.avg(f"{role}_weather_age_minutes").alias("mean_age_minutes"),
+                    *[F.sum(name).alias(name) for name in flags],
+                )
+                coverage[role] = records(coverage_df.toPandas())
+            for split in config["splits"]:
+                count = enriched.filter(F.col("split") == split).count()
+                if any(sum(row["flights"] for row in rows if row["split"] == split) != count for rows in coverage.values()):
+                    raise ValueError(f"Coverage does not reconcile: {split}")
+                enriched.filter(F.col("split") == split).write.parquet(str(gold / split))
+            metadata = {
+                **json.loads((silver / "_metadata.json").read_text()),
+                "dataset_id": build_id,
+                "gold_dir": str(gold),
+                "parent_gold_dir": str(origin_gold_dir),
+                "parent_metadata_sha256": sha256(Path(origin_gold_dir) / "_metadata.json"),
+                "policy": policy,
+                "splits": config["splits"],
+                "coverage": coverage,
+                "origin_reference_sources": parent["reference_sources"],
+                "destination_reference_sources": json.loads((reference / "sources.json").read_text()),
+                "reference_legacy_keys": "Origin and sources.origins identify destination airports in the destination reference version.",
+                "source_manifest": manifest,
+                "bts_input_files": parent["bts_input_files"],
+                "weather_columns": (
+                    origin.WEATHER_NUMERIC
+                    + origin.WEATHER_FLAGS
+                    + DESTINATION_WEATHER_NUMERIC
+                    + DESTINATION_WEATHER_FLAGS
+                ),
+                "schema": enriched.schema.jsonValue(),
+                "availability_assumption": "Observation time plus lag; historical publication and metadata availability unverified. Conditions at departure, not an arrival forecast.",
+                "raw_integrity": "Cached CSVs reused without content scans or checksums; cleaning checks records, not historical immutability.",
+                "source_files": [
+                    {"path": str(path.relative_to(ROOT)), "bytes": path.stat().st_size}
+                    for path in sorted(settings["output_directory"].rglob("*.csv"))
+                ],
+            }
+            write_json(gold / "_metadata.json", metadata)
         return gold, gold
     finally:
         spark.catalog.clearCache()

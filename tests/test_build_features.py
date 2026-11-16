@@ -63,9 +63,29 @@ class TestBuildFeatures(unittest.TestCase):
             silver_month.mkdir(parents=True, exist_ok=True)
             raw_df.write.mode("overwrite").parquet(str(silver_month))
 
+            bronze = tmp_path / "bronze"
+            raw_month = bronze / "2024/01"
+            raw_month.mkdir(parents=True)
+            raw_events = raw_df
+            for name in ("DepTime", "DepDelay", "ArrTime", "ArrDelay"):
+                raw_events = raw_events.withColumn(name, F.lit(None).cast("string"))
+            earlier = (raw_events.filter("Flight_Number_Reporting_Airline = '101'")
+                .withColumn("Flight_Number_Reporting_Airline", F.lit("999"))
+                .withColumn("CRSDepTime", F.lit("0430"))
+                .withColumn("DepTime", F.lit("0500"))
+                .withColumn("DepDelay", F.lit("30"))
+                .withColumn("ArrTime", F.lit("0730"))
+                .withColumn("ArrDelay", F.lit("30"))
+                .withColumn("ArrDel15", F.lit(None).cast("int")))
+            raw_events = raw_events.unionByName(earlier)
+            raw_events.coalesce(1).write.option("header", True).csv(str(raw_month / "events"))
+            event_csv = next((raw_month / "events").glob("*.csv"))
+            event_csv.rename(raw_month / "events.csv")
+
             summary = build_features(
                 spark=self.spark,
                 silver_dir=silver,
+                bronze_dir=bronze,
                 gold_dir=gold,
                 results_dir=results,
             )
@@ -107,6 +127,12 @@ class TestBuildFeatures(unittest.TestCase):
             self.assertEqual(aa["DepHour"], 6)
             self.assertEqual(aa["ArrHour"], 9)
             self.assertEqual(aa["ArrDel15"], 0)
+            self.assertEqual(aa["is_federal_holiday"], 1)
+            self.assertEqual(aa["origin_departure_count_2h"], 1)
+            self.assertEqual(aa["origin_departure_delay_rate_2h"], 1.0)
+            self.assertEqual(aa["origin_departure_mean_delay_minutes_2h"], 30.0)
+            self.assertIsNone(aa["destination_arrival_delay_rate_2h"])
+            self.assertTrue((gold / "_features.json").exists())
 
             # DL flight: 2024-01-07 (Sunday -> DayOfWeek=7), dep 2400 -> hour 0, arr 0115 -> hour 1
             dl = train_records["2024-01-07_DL_202_ATL_ORD_2400"]
@@ -123,7 +149,7 @@ class TestBuildFeatures(unittest.TestCase):
                 return original_agg(frame, *expressions)
 
             with patch.object(DataFrame, "agg", aggregate), patch.object(features, "update_results") as publish:
-                quiet = build_features(self.spark, silver_dir=silver, gold_dir=tmp_path / "quiet_gold", results_dir=tmp_path / "quiet_results", publish_results=False)
+                quiet = build_features(self.spark, silver_dir=silver, bronze_dir=bronze, gold_dir=tmp_path / "quiet_gold", results_dir=tmp_path / "quiet_results", publish_results=False)
                 publish.assert_not_called()
             self.assertEqual(quiet["total_flights"].tolist(), [2, 1, 1])
             self.assertNotIn("delayed_flights", quiet.columns)

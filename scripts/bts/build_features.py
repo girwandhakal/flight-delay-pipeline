@@ -8,8 +8,14 @@ import sys
 from scripts.results import records, update_results
 
 import pandas as pd
+from pyspark import StorageLevel
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+
+from .recent_delays import (
+    add_cutoffs, add_holidays, add_recent_delays, build_events, feature_manifest, load_airports,
+)
+from scripts.origin_weather.download import project_path, write_json
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -37,10 +43,15 @@ def get_spark_session(app_name="bts_features"):
         # Workers need the project package when the driver starts elsewhere.
         os.environ["PYTHONPATH"] = str(ROOT) + (os.pathsep + python_path if python_path else "")
     return (
-        SparkSession.builder.master("local[*]")
+        # Bound simultaneous Python workers and JVM task working sets on a laptop.
+        SparkSession.builder.master("local[2]")
         .appName(app_name)
         .config("spark.driver.memory", "6g")
-        .config("spark.sql.shuffle.partitions", "8")
+        .config("spark.sql.shuffle.partitions", "64")
+        .config("spark.sql.files.maxPartitionBytes", "32m")
+        .config("spark.sql.parquet.columnarReaderBatchSize", "1024")
+        .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "16m")
+        .config("spark.sql.adaptive.coalescePartitions.parallelismFirst", "false")
         .getOrCreate()
     )
 
@@ -54,12 +65,19 @@ def load_split_config(config_path=None):
 
 def build_features(
     spark, silver_dir=None, gold_dir=None, results_dir=None, config_path=None,
-    publish_results=True,
+    publish_results=True, bronze_dir=None,
 ):
     silver_dir = Path(silver_dir or ROOT / "data" / "silver" / "bts")
     gold_dir = Path(gold_dir or ROOT / "data" / "gold" / "bts")
     results_dir = Path(results_dir or ROOT / "results")
     splits = load_split_config(config_path)
+    config = json.loads(Path(config_path or ROOT / "config.json").read_text(encoding="utf-8"))
+    manifest = feature_manifest(ROOT, config, bronze_dir, silver_dir)
+    bronze = Path(bronze_dir or project_path(ROOT, config["datasets"]["bts"]["output_directory"]))
+    csv_files = sorted(bronze.glob("*/*/*.csv"))
+    if not csv_files:
+        raise FileNotFoundError(f"No BTS CSV files found in {bronze}")
+    airports = load_airports(project_path(ROOT, config["datasets"]["weather"]["reference_directory"]))
 
     # Read all cleaned Silver Parquet partitions.
     silver_df = spark.read.parquet(str(silver_dir / "*/*"))
@@ -120,45 +138,59 @@ def build_features(
             f"Found {unassigned} flights outside configured split boundaries"
         )
 
-    summary_records = []
-    # Save partitioned Parquet datasets directly for each chronological split.
-    for split_name in ["train", "val", "test"]:
-        split_df = feature_df.filter(F.col("split") == split_name)
-        dest_split_dir = gold_dir / split_name
-        dest_split_dir.mkdir(parents=True, exist_ok=True)
-        split_df.write.mode("overwrite").parquet(str(dest_split_dir))
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    events = build_events(spark.read.csv([str(p) for p in csv_files], header=True), airports)
+    events = events.persist(StorageLevel.DISK_ONLY)
+    try:
+        feature_df = add_recent_delays(add_cutoffs(feature_df, airports), events,
+                                       manifest["rolling_window_minutes"])
+        feature_df = add_holidays(feature_df, splits["train"]["start_date"], splits["test"]["end_date"])
+        feature_df = feature_df.persist(StorageLevel.DISK_ONLY)
 
-        # Calculate the split summary in one pass.
-        aggregates = [
-            F.count("*").alias("total_flights"),
-            F.min("FlightDate").alias("min_date"),
-            F.max("FlightDate").alias("max_date"),
-        ]
-        # Validation-only orchestration prepares test schedules without label statistics.
+        (gold_dir / "_features.json").unlink(missing_ok=True)
+        summary_records = []
+        # Save partitioned Parquet datasets directly for each chronological split.
+        for split_name in ["train", "val", "test"]:
+            split_df = feature_df.filter(F.col("split") == split_name)
+            dest_split_dir = gold_dir / split_name
+            dest_split_dir.mkdir(parents=True, exist_ok=True)
+            split_df.write.mode("overwrite").parquet(str(dest_split_dir))
+
+            # Calculate the split summary in one pass.
+            aggregates = [
+                F.count("*").alias("total_flights"),
+                F.min("FlightDate").alias("min_date"),
+                F.max("FlightDate").alias("max_date"),
+            ]
+            # Validation-only orchestration prepares test schedules without label statistics.
+            if publish_results:
+                aggregates.append(F.count(F.when(F.col("ArrDel15") == 1, 1)).alias("delayed_flights"))
+            stats = split_df.agg(*aggregates).first()
+            total_flights = stats["total_flights"]
+            record = {
+                "split": split_name,
+                "start_date": str(stats["min_date"]),
+                "end_date": str(stats["max_date"]),
+                "total_flights": total_flights,
+            }
+            if publish_results:
+                delayed_flights = stats["delayed_flights"]
+                record.update({
+                    "on_time_flights": total_flights - delayed_flights,
+                    "delayed_flights": delayed_flights,
+                    "delay_rate": round(delayed_flights / total_flights, 4) if total_flights else 0.0,
+                })
+            summary_records.append(record)
+
+        write_json(gold_dir / "_features.json", manifest)
+        summary_pd = pd.DataFrame(summary_records)
         if publish_results:
-            aggregates.append(F.count(F.when(F.col("ArrDel15") == 1, 1)).alias("delayed_flights"))
-        stats = split_df.agg(*aggregates).first()
-        total_flights = stats["total_flights"]
-        record = {
-            "split": split_name,
-            "start_date": str(stats["min_date"]),
-            "end_date": str(stats["max_date"]),
-            "total_flights": total_flights,
-        }
-        if publish_results:
-            delayed_flights = stats["delayed_flights"]
-            record.update({
-                "on_time_flights": total_flights - delayed_flights,
-                "delayed_flights": delayed_flights,
-                "delay_rate": round(delayed_flights / total_flights, 4) if total_flights else 0.0,
-            })
-        summary_records.append(record)
+            update_results({"bts": {"splits": records(summary_pd)}}, results_dir)
 
-    summary_pd = pd.DataFrame(summary_records)
-    if publish_results:
-        update_results({"bts": {"splits": records(summary_pd)}}, results_dir)
-
-    return summary_pd
+        return summary_pd
+    finally:
+        feature_df.unpersist(blocking=True)
+        events.unpersist(blocking=True)
 
 
 def main(publish_results=True):

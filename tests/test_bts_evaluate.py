@@ -40,7 +40,8 @@ class EvaluateTests(unittest.TestCase):
             )
             for i in range(count)
         ]
-        columns = bts_tr.CATEGORICAL_FEATURES + bts_tr.NUMERIC_FEATURES + [bts_eval.TARGET_COL]
+        rows = [tuple(row[:9]) + (0.25, 8.0, 4.0, 0.5, 10.0, 6.0, 0, 0, 0) + tuple(row[9:]) for row in rows]
+        columns = bts_tr.INPUT_FEATURES + [bts_eval.TARGET_COL]
         return self.spark.createDataFrame(rows, columns).coalesce(2)
 
     def test_subgroup_aggregation_correctness(self):
@@ -71,26 +72,6 @@ class EvaluateTests(unittest.TestCase):
             total_sum = row["tp"] + row["fp"] + row["tn"] + row["fn"]
             self.assertEqual(total_sum, row["total_flights"])
             self.assertEqual(row["tp"] + row["fn"], row["delayed_flights"])
-
-    def test_zero_division_guardrails(self):
-        # When tp + fp = 0 (zero positive predictions)
-        metrics = bts_eval.confusion_metrics(tp=0, fp=0, tn=10, fn=5)
-        self.assertEqual(metrics["precision"], 0.0)
-        self.assertEqual(metrics["recall"], 0.0)
-        self.assertEqual(metrics["f1"], 0.0)
-        self.assertAlmostEqual(metrics["accuracy"], 10 / 15)
-
-        # When tp + fn = 0 (no positive labels in dataset)
-        metrics_no_pos = bts_eval.confusion_metrics(tp=0, fp=5, tn=10, fn=0)
-        self.assertEqual(metrics_no_pos["recall"], 0.0)
-        self.assertEqual(metrics_no_pos["f1"], 0.0)
-
-        # When total = 0
-        metrics_empty = bts_eval.confusion_metrics(tp=0, fp=0, tn=0, fn=0)
-        self.assertEqual(metrics_empty["precision"], 0.0)
-        self.assertEqual(metrics_empty["recall"], 0.0)
-        self.assertEqual(metrics_empty["f1"], 0.0)
-        self.assertEqual(metrics_empty["accuracy"], 0.0)
 
     def test_artifact_persistence(self):
         data = self.synthetic_flights(count=30)

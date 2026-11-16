@@ -161,13 +161,19 @@ def main():
 
             if csv_path.exists():
                 skipped += 1
-                print(f"  Skipped {period}: CSV already exists.", flush=True)
+                print(f"  Reusing BTS file {csv_path} because it already exists.", flush=True)
                 continue
 
+            started = time.monotonic()
+            if zip_path.exists():
+                print(f"  Reusing BTS archive {zip_path} because it already exists.", flush=True)
+            else:
+                print(f"  Downloading BTS archive {zip_path} from {url}", flush=True)
             download_file(url, zip_path)
+            print(f"  Extracting BTS file {csv_path}", flush=True)
             extract_csv(zip_path, csv_path)
             completed += 1
-            print(f"  Completed {period}", flush=True)
+            print(f"  Prepared BTS file {csv_path} in {time.monotonic() - started:.1f}s.", flush=True)
 
         except (
             OSError,
@@ -181,7 +187,7 @@ def main():
 
     print("-" * 80)
     print(
-        f"BTS Acquisition Summary: Completed: {completed}; Skipped: {skipped}; Failed: {len(failed)}"
+        f"BTS Acquisition Summary: Prepared: {completed}; Reused: {skipped}; Failed: {len(failed)}"
     )
     if failed:
         print("  Failed months: " + ", ".join(failed))

@@ -114,6 +114,8 @@ class ComparisonPublicationTests(unittest.TestCase):
                                      "bts_origin_weather": {"test": {"old": True}}}, root / "results")
             publish = lambda updates: update_results(updates, root / "results")
             with (patch.object(pipeline, "ROOT", root),
+                  patch.object(pipeline, "features_current", return_value=True),
+                  patch.object(pipeline, "run_stage", side_effect=AssertionError("Unexpected real preparation stage")),
                   patch.object(pipeline.weather_features, "main", return_value=(gold, gold)),
                   patch.object(pipeline.bts_transform, "get_spark_session", return_value=MagicMock(version="fixture")),
                   patch.object(pipeline, "load_config", return_value=({}, {}, {})),

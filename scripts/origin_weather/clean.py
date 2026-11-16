@@ -252,7 +252,7 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
         )
         return clean
     finally:
-        parsed.unpersist()
+        parsed.unpersist(blocking=True)
 
 
 def main():

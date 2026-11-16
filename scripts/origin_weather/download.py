@@ -318,9 +318,11 @@ def download_weather(requests, directory):
         if target.exists():
             entry.update(status="downloaded", bytes=target.stat().st_size)
             manifest["files"][name] = entry
-            tqdm.write(f"Weather {station_id} {year}: reused existing file")
+            tqdm.write(f"Reusing weather file {target} because it already exists.")
             continue
         temporary = None
+        started = time.monotonic()
+        tqdm.write(f"Downloading weather file {target} from {url}")
         try:
             temporary = fetch(url, target)
             entry.update(
@@ -338,7 +340,11 @@ def download_weather(requests, directory):
         entry["retrieved_utc"] = datetime.now(timezone.utc).isoformat()
         manifest["files"][name] = entry
         write_json(manifest_path, manifest)
-        tqdm.write(f"Weather {station_id} {year}: {entry['status']}")
+        elapsed = time.monotonic() - started
+        if entry["status"] == "unavailable":
+            tqdm.write(f"Weather file {target} is unavailable from NOAA (HTTP 404; {elapsed:.1f}s).")
+        else:
+            tqdm.write(f"Downloaded weather file {target} in {elapsed:.1f}s.")
     manifest["complete"] = True
     write_json(manifest_path, manifest)
     return manifest

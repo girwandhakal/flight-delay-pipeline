@@ -1,4 +1,4 @@
-"""Train BTS and weather variants with the same chronological search."""
+"""Train BTS and weather variants once per algorithm with fixed hyperparameters."""
 
 from datetime import datetime, timezone
 import json
@@ -11,11 +11,10 @@ from scripts.results import records, update_results
 import pandas as pd
 from pyspark import StorageLevel
 from pyspark.ml import Pipeline
-from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.classification import GBTClassifier, LogisticRegression
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
-from pyspark.ml.feature import Imputer, OneHotEncoder, StringIndexer, VectorAssembler
+from pyspark.ml.feature import Imputer, OneHotEncoder, SQLTransformer, StringIndexer, VectorAssembler
 from pyspark.ml.functions import vector_to_array
-from pyspark.ml.tuning import ParamGridBuilder
 from pyspark.sql import functions as F
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -23,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 from .build_features import get_spark_session, load_split_config
 from scripts.origin_weather.build_features import WEATHER_NUMERIC, WEATHER_FLAGS
 from scripts.destination_weather.build_features import DESTINATION_WEATHER_NUMERIC, DESTINATION_WEATHER_FLAGS
+from .recent_delays import FEATURES as RECENT_CALENDAR_FEATURES, ROLLING_FEATURES, HOLIDAY_FEATURES
 
 FEATURE_SETS = ("bts", "bts_origin_weather", "bts_origin_destination_weather")
 
@@ -39,15 +39,15 @@ CATEGORICAL_FEATURES = [
     "Reporting_Airline",
     "Origin",
     "Dest",
-    "Month",
     "DayOfWeek",
     "DepHour",
     "ArrHour",
 ]
 NUMERIC_FEATURES = ["CRSElapsedTime", "Distance"]
+INPUT_FEATURES = CATEGORICAL_FEATURES[:3] + ["Month"] + CATEGORICAL_FEATURES[3:] + NUMERIC_FEATURES + RECENT_CALENDAR_FEATURES
 TARGET_COL = "ArrDel15"
-REG_PARAMS = [0.001, 0.01, 0.1, 1.0]
-ELASTIC_NET_PARAMS = [0.0, 0.5, 1.0]
+LOGISTIC_PARAMS = {"regParam": 0.01, "elasticNetParam": 0.0, "maxIter": 100, "tol": 1e-6}
+GBT_PARAMS = {"maxDepth": 3, "maxIter": 50, "stepSize": 0.05, "seed": 42}
 THRESHOLDS = [round(i * 0.05, 2) for i in range(1, 20)]
 
 
@@ -64,7 +64,7 @@ def build_preprocessor(feature_set="bts") -> Pipeline:
             inputCols=indices, outputCols=vectors, handleInvalid="keep", dropLast=False
         ),
     ]
-    numeric = NUMERIC_FEATURES.copy()
+    numeric = NUMERIC_FEATURES + ["MonthSin", "MonthCos"] + [name + "_filled" for name in ROLLING_FEATURES] + HOLIDAY_FEATURES
     if feature_set != "bts":
         weather_numeric, _ = weather_columns(feature_set)
         imputed = [name + "_imputed" for name in weather_numeric]
@@ -73,6 +73,13 @@ def build_preprocessor(feature_set="bts") -> Pipeline:
         numeric += [name + "_imputed" for name in WEATHER_NUMERIC] + WEATHER_FLAGS
         if feature_set == "bts_origin_destination_weather":
             numeric += [name + "_imputed" for name in DESTINATION_WEATHER_NUMERIC] + DESTINATION_WEATHER_FLAGS
+    # Calendar values must remain defined in months absent from the training vocabulary.
+    stages.append(SQLTransformer(statement=(
+        "SELECT *, SIN(2 * PI() * (Month - 1) / 12) AS MonthSin, "
+        "COS(2 * PI() * (Month - 1) / 12) AS MonthCos, "
+        + ", ".join(f"COALESCE({name}, 0D) AS {name}_filled" for name in ROLLING_FEATURES)
+        + " FROM __THIS__"
+    )))
     stages.append(
         VectorAssembler(
             inputCols=vectors + numeric, outputCol="features", handleInvalid="error"
@@ -232,8 +239,8 @@ def train(
     train_data = spark.read.parquet(str(gold_dir / "train"))
     val_data = spark.read.parquet(str(gold_dir / "val"))
 
-    print("\n--- [Step 1/4] Preparing Training and Validation Flights ---", flush=True)
-    columns = CATEGORICAL_FEATURES + NUMERIC_FEATURES + [TARGET_COL]
+    print("\n--- [Step 1/3] Preparing Training and Validation Flights ---", flush=True)
+    columns = INPUT_FEATURES + [TARGET_COL]
     if feature_set != "bts":
         numeric, flags = weather_columns(feature_set)
         columns += numeric + flags
@@ -260,7 +267,7 @@ def train(
 
         # Reference baseline evaluations.
         print(
-            "\n--- [Step 2/4] Evaluating Reference Baselines on Validation Data ---",
+            "\n--- [Step 2/3] Evaluating Reference Baselines on Validation Data ---",
             flush=True,
         )
         references = {}
@@ -289,204 +296,108 @@ def train(
             flush=True,
         )
 
-        print("\n--- [Step 3/4] Automatic Hyperparameter Search ---", flush=True)
-        estimator = LogisticRegression(
-            featuresCol="features",
-            labelCol=TARGET_COL,
-            family="binomial",
-            standardization=True,
-            maxIter=100,
-            tol=1e-6,
-        )
-        grid = (
-            ParamGridBuilder()
-            .addGrid(estimator.regParam, REG_PARAMS)
-            .addGrid(estimator.elasticNetParam, ELASTIC_NET_PARAMS)
-            .build()
-        )
-        evaluator = BinaryClassificationEvaluator(
-            labelCol=TARGET_COL,
-            metricName="areaUnderPR",
-        )
-        months = [
-            row.month
-            for row in train_features.select(
-                F.trunc("FlightDate", "month").alias("month")
-            )
-            .distinct()
-            .orderBy("month")
-            .collect()
-        ]
-        if None in months or len(months) < 4:
-            raise ValueError(
-                "Chronological cross-validation requires valid FlightDate values and at least four training months"
-            )
-        candidates = [
-            {
-                "reg_param": params[estimator.regParam],
-                "elastic_net_param": params[estimator.elasticNetParam],
-                "fold_pr_auc": [],
-            }
-            for params in grid
-        ]
-        folds = []
-        print(
-            f"  Searching {len(grid)} combinations across 3 chronological folds...",
-            flush=True,
-        )
-        for month in months[-3:]:
-            fold_train = train_features.filter(F.col("FlightDate") < F.lit(month))
-            fold_val = train_features.filter(
-                F.trunc("FlightDate", "month") == F.lit(month)
-            )
-            # Fit once per fold: preprocessing does not depend on classifier parameters.
-            if feature_set != "bts":
-                validate_weather(fold_train, f"fold before {month}", feature_set)
-            preprocessor = build_preprocessor(feature_set).fit(fold_train)
-            encoded_train = (
-                preprocessor.transform(fold_train)
-                .select("features", TARGET_COL)
-                .persist(StorageLevel.DISK_ONLY)
-            )
-            encoded_val = (
-                preprocessor.transform(fold_val)
-                .select("features", TARGET_COL)
-                .persist(StorageLevel.DISK_ONLY)
-            )
-            try:
-                for params, candidate in zip(grid, candidates):
-                    model = estimator.fit(encoded_train, params)
-                    candidate["fold_pr_auc"].append(
-                        evaluator.evaluate(model.transform(encoded_val))
-                    )
-            finally:
-                encoded_train.unpersist(blocking=True)
-                encoded_val.unpersist(blocking=True)
-            folds.append(
-                {
-                    "train_before": month.isoformat(),
-                    "validation_month": month.strftime("%Y-%m"),
-                }
-            )
-            print(
-                f"  Finished fold: train before {month}, validate {month:%Y-%m}",
-                flush=True,
-            )
-        for candidate in candidates:
-            n_folds = len(candidate["fold_pr_auc"])
-            candidate["internal_pr_auc"] = sum(candidate["fold_pr_auc"]) / n_folds if n_folds else 0.0
-        best = max(range(len(grid)), key=lambda i: candidates[i]["internal_pr_auc"])
         if feature_set != "bts":
             validate_weather(train_features, "full training", feature_set)
-        selected_model = Pipeline(
-            stages=build_preprocessor(feature_set).getStages() + [estimator]
-        ).fit(train_features, grid[best])
-        classifier = selected_model.stages[-1]
-        selected_reg = classifier.getRegParam()
-        selected_elastic_net = classifier.getElasticNetParam()
-        print(
-            f"  Selected regParam={selected_reg}, elasticNetParam={selected_elastic_net}",
-            flush=True,
-        )
+        print("\n--- [Step 3/3] Fit Fixed Models and Select Validation Thresholds ---", flush=True)
+        estimators = [
+            ("logistic_regression", LogisticRegression(
+                featuresCol="features", labelCol=TARGET_COL, family="binomial",
+                standardization=True, **LOGISTIC_PARAMS)),
+            ("gradient_boosted_trees", GBTClassifier(
+                featuresCol="features", labelCol=TARGET_COL, **GBT_PARAMS)),
+        ]
+        algorithms = {}
+        for name, estimator in estimators:
+            print(f"  Fitting {name} on all training flights with fixed settings: "
+                  f"{LOGISTIC_PARAMS if name == 'logistic_regression' else GBT_PARAMS}", flush=True)
+            selected_model = Pipeline(
+                stages=build_preprocessor(feature_set).getStages() + [estimator]
+            ).fit(train_features)
+            selected_scores = (
+                predict(selected_model, val_features)
+                .select(*metadata, TARGET_COL, "p_delayed", "prediction")
+                .cache()
+            )
+            selected_default = evaluate_predictions(selected_scores)
+            threshold, search_df = tune_threshold(selected_scores)
+            best_row = search_df.loc[search_df["threshold"] == threshold].iloc[0]
+            selected_metrics = confusion_metrics(
+                **{key: int(best_row[key]) for key in ("tp", "fp", "tn", "fn")}
+            )
+            selected_metrics.update({key: selected_default[key] for key in ("pr_auc", "roc_auc")})
+            # Keep a common logistic reference across weather variants; trees are a separate challenger.
+            directory = models_dir if name == "logistic_regression" else models_dir / "gbt"
+            directory.mkdir(parents=True, exist_ok=True)
+            selected_model.write().overwrite().save(str(directory / "baseline_pipeline"))
+            (directory / "threshold.json").write_text(json.dumps({
+                "threshold": threshold, "positive_class": 1,
+                "decision_rule": "p_delayed >= threshold",
+            }, indent=2) + "\n", encoding="utf-8")
+            if save_predictions:
+                (selected_scores.withColumn("prediction", (F.col("p_delayed") >= threshold).cast("int"))
+                 .withColumn("threshold", F.lit(threshold))
+                 .write.parquet(str(directory / "validation_predictions")))
+            algorithms[name] = {
+                "algorithm": name,
+                **({"reg_param": estimator.getRegParam(),
+                    "elastic_net_param": estimator.getElasticNetParam(),
+                    "max_iter": estimator.getMaxIter(), "tol": estimator.getTol()}
+                   if name == "logistic_regression" else
+                   {"max_depth": estimator.getMaxDepth(), "max_iter": estimator.getMaxIter(),
+                    "step_size": estimator.getStepSize(), "seed": estimator.getSeed()}),
+                "models_dir": str(directory),
+                "best_threshold": threshold,
+                "threshold_search": records(search_df),
+                "validation_metrics_at_selected_threshold": selected_metrics,
+                "validation_metrics_at_default_0_5": selected_default,
+            }
+            if name == "logistic_regression":
+                vector_dimension = selected_model.transform(val_features.limit(1)).first()["features"].size
+                imputation_means = next((stage.surrogateDF.first().asDict()
+                                         for stage in selected_model.stages
+                                         if hasattr(stage, "surrogateDF")), {})
+            print(f"  {name}: validation PR-AUC={selected_default['pr_auc']}, "
+                  f"F1={selected_metrics['f1']:.4f}, threshold={threshold:.2f}", flush=True)
+            selected_scores.unpersist(blocking=True)
+            selected_scores = None
 
-        print("\n--- [Step 4/4] Validation and Threshold Selection ---", flush=True)
-        selected_scores = (
-            predict(selected_model, val_features)
-            .select(*metadata, TARGET_COL, "p_delayed", "prediction")
-            .cache()
-        )
-        selected_default = evaluate_predictions(selected_scores)
-        threshold, search_df = tune_threshold(selected_scores)
-
-        best_row = search_df.loc[search_df["threshold"] == threshold].iloc[0]
-        selected_metrics = confusion_metrics(
-            tp=int(best_row["tp"]),
-            fp=int(best_row["fp"]),
-            tn=int(best_row["tn"]),
-            fn=int(best_row["fn"]),
-        )
-        selected_metrics["pr_auc"] = selected_default["pr_auc"]
-        selected_metrics["roc_auc"] = selected_default["roc_auc"]
-
-        print(
-            f"  Default threshold (0.50): F1 = {selected_default['f1']:.4f}, Precision = {selected_default['precision']:.4f}, Recall = {selected_default['recall']:.4f}",
-            flush=True,
-        )
-        print(
-            f"  Optimal threshold ({threshold:.2f}): F1 = {selected_metrics['f1']:.4f}, Precision = {selected_metrics['precision']:.4f}, Recall = {selected_metrics['recall']:.4f}",
-            flush=True,
-        )
+        baseline = algorithms["logistic_regression"]
 
         summary = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "feature_set": feature_set,
             "models_dir": str(models_dir),
             "splits": load_split_config(),
-            "threshold_search": records(search_df),
+            "threshold_search": baseline["threshold_search"],
             "input_columns": columns,
             "gold_dir": str(gold_dir),
-            "vector_dimension": selected_model.transform(val_features.limit(1))
-            .first()["features"]
-            .size,
-            "imputation_means": next(
-                (
-                    stage.surrogateDF.first().asDict()
-                    for stage in selected_model.stages
-                    if hasattr(stage, "surrogateDF")
-                ),
-                {},
-            ),
+            "vector_dimension": vector_dimension,
+            "imputation_means": imputation_means,
+            "seasonal_encoding": "MonthSin=sin(2*pi*(Month-1)/12), MonthCos=cos(2*pi*(Month-1)/12)",
             "training_rows": training_stats["rows"],
             "validation_rows": val_count,
             "selected_model": {
-                "reg_param": selected_reg,
-                "elastic_net_param": selected_elastic_net,
-                "best_threshold": threshold,
-                "validation_metrics_at_selected_threshold": selected_metrics,
-                "validation_metrics_at_default_0_5": selected_default,
+                key: baseline[key] for key in (
+                    "algorithm", "reg_param", "elastic_net_param", "best_threshold",
+                    "validation_metrics_at_selected_threshold", "validation_metrics_at_default_0_5",
+                )
             },
+            "algorithm_comparison": algorithms,
             "tuning": {
-                "method": "expanding-window chronological cross-validation",
-                "metric": "areaUnderPR",
-                "folds": folds,
-                "combinations": len(grid),
-                "aggregation": "mean PR-AUC across folds",
-                "scope": "last three training months scored separately using only earlier flights; winner refitted on all training rows",
+                "method": "fixed hyperparameters",
+                "search_performed": False,
+                "scope": "Each algorithm fitted once on all training rows; F1 thresholds selected on validation only; logistic regression remains the reference",
             },
-            "candidate_comparison": candidates,
             "reference_baselines": references,
         }
-
-        # Predictions and frozen inference settings belong beside the fitted model.
-        models_dir.mkdir(parents=True, exist_ok=True)
-
-        selected_model.write().overwrite().save(str(models_dir / "baseline_pipeline"))
-
-        threshold_info = {
-            "threshold": threshold,
-            "positive_class": 1,
-            "decision_rule": "p_delayed >= threshold",
-        }
-        (models_dir / "threshold.json").write_text(
-            json.dumps(threshold_info, indent=2) + "\n", encoding="utf-8"
-        )
-
-        if save_predictions:
-            (
-                selected_scores.withColumn(
-                    "prediction", (F.col("p_delayed") >= threshold).cast("int")
-                )
-                .withColumn("threshold", F.lit(threshold))
-                .write.parquet(str(models_dir / "validation_predictions"))
-            )
 
         if publish_results:
             update_results({feature_set: {
                 "training": summary,
                 "validation": {
-                    "selected": selected_metrics,
-                    "default_0_5": selected_default,
-                    "threshold": threshold,
+                    "selected": baseline["validation_metrics_at_selected_threshold"],
+                    "default_0_5": baseline["validation_metrics_at_default_0_5"],
+                    "threshold": baseline["best_threshold"],
                 },
             }}, results_dir)
         return summary
@@ -507,8 +418,8 @@ def main():
         print("-" * 80)
         print("Selected BTS Baseline Model Summary:")
         print("-" * 80)
-        print(f"  Selected Regularization (regParam): {selected['reg_param']}")
-        print(f"  Selected Elastic Net:              {selected['elastic_net_param']}")
+        print(f"  Fixed Regularization (regParam): {selected['reg_param']}")
+        print(f"  Fixed Elastic Net:              {selected['elastic_net_param']}")
         print(f"  Optimized Decision Threshold:       {selected['best_threshold']:.2f}")
         print(f"  Validation PR-AUC:                  {val_metrics['pr_auc']:.4f}")
         print(f"  Validation ROC-AUC:                 {val_metrics['roc_auc']:.4f}")

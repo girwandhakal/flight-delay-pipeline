@@ -208,7 +208,9 @@ def build_weather_features(
         "weather_hour", F.floor(F.col("observation_utc").cast("long") / 3600)
     ).alias("weather")
     # Hour buckets bound candidate expansion before the exact timestamp checks.
-    flights = cutoffs.withColumn(
+    flights = cutoffs.select(
+        "flight_id", f"{prefix}_station_id", "scheduled_departure_utc"
+    ).withColumn(
         "match_hour",
         F.explode_outer(
             F.sequence(
@@ -243,10 +245,11 @@ def build_weather_features(
             - F.expr(f"INTERVAL {publication_lag_minutes} MINUTES")
         )
     )
+    # Keep cohort-scale matches partitioned rather than broadcasting them on the driver.
     selected = (
-        flights.join(weather, condition, "left")
+        flights.hint("merge").join(weather, condition, "inner")
         .select(
-            "flights.*",
+            "flights.flight_id",
             F.col("weather.observation_utc").alias(observation),
             F.col("weather.source_file").alias(source),
             *[F.col("weather." + name).alias(name.replace("origin_", prefix + "_", 1)) for name in FEATURE_COLUMNS],
@@ -272,7 +275,11 @@ def build_weather_features(
             ),
         )
     )
-    selected = selected.filter("rank = 1").drop("rank", "match_hour")
+    selected = selected.filter("rank = 1").drop("rank")
+    # Attach the wide parent only after ranking actual matches, avoiding repeated payloads.
+    selected = cutoffs.hint("merge").join(selected, "flight_id", "left").select(
+        *cutoffs.columns, *[name for name in selected.columns if name != "flight_id"]
+    )
     selected = (
         selected.withColumn(
             f"{prefix}_weather_age_minutes",
@@ -370,6 +377,7 @@ def validate_cohort(
 
 
 def main(publish_results=True):
+    from scripts.progress import stage as progress_stage
     from scripts.bts.build_features import get_spark_session
     from .clean import clean_weather
     from .download import download_weather, prepare_references
@@ -380,65 +388,69 @@ def main(publish_results=True):
         flights = spark.read.parquet(
             *[str(ROOT / "data/gold/bts" / name) for name in config["splits"]]
         )
-        origins = [row.Origin for row in flights.select("Origin").distinct().collect()]
-        prepare_references(
-            origins,
-            settings["reference_directory"],
-            config["splits"]["train"]["start_date"],
-            config["splits"]["test"]["end_date"],
-        )
-        refs = load_references(settings["reference_directory"])
-        cutoffs = build_flight_cutoffs(spark, flights, refs).cache()
-        manifest = download_weather(
-            required_station_years(cutoffs, policy["max_age_minutes"]),
-            settings["output_directory"],
-        )
+        with progress_stage("Origin weather: prepare airport references and acquire files"):
+            origins = [row.Origin for row in flights.select("Origin").distinct().collect()]
+            prepare_references(
+                origins,
+                settings["reference_directory"],
+                config["splits"]["train"]["start_date"],
+                config["splits"]["test"]["end_date"],
+            )
+            refs = load_references(settings["reference_directory"])
+            cutoffs = build_flight_cutoffs(spark, flights, refs).cache()
+            manifest = download_weather(
+                required_station_years(cutoffs, policy["max_age_minutes"]),
+                settings["output_directory"],
+            )
         build_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         gold = ROOT / "data/gold/bts_origin_weather" / build_id
         report = ROOT / "data/silver/weather" / build_id
-        observations = clean_weather(
-            spark,
-            settings["output_directory"],
-            ROOT / "data/silver/weather" / build_id,
-            ROOT / "data/quarantine/weather" / build_id,
-            manifest,
-            report,
-        )
-        enriched = build_origin_features(
-            cutoffs, observations, manifest, **policy
-        ).cache()
-        validate_cohort(flights, enriched, **policy)
-        coverage = enriched.groupBy(
-            "split",
-            "Origin",
-            F.trunc("FlightDate", "month").alias("month"),
-            "origin_weather_match_status",
-        ).agg(
-            F.count("*").alias("flights"),
-            F.avg("origin_weather_age_minutes").alias("mean_age_minutes"),
-            *[F.sum(name).alias(name) for name in WEATHER_FLAGS],
-        )
-        for split in config["splits"]:
-            enriched.filter(F.col("split") == split).write.parquet(str(gold / split))
-        write_json(
-            gold / "_metadata.json",
-            {
-                **json.loads((report / "_metadata.json").read_text()),
-                "coverage": records(coverage.toPandas()),
-                "dataset_id": build_id,
-                "gold_dir": str(gold),
-                "policy": policy,
-                "splits": config["splits"],
-                "weather_columns": WEATHER_NUMERIC + WEATHER_FLAGS,
-                "reference_sources": json.loads(
-                    (settings["reference_directory"] / "sources.json").read_text()
-                ),
-                "source_manifest": manifest,
-                "bts_input_files": bts_fingerprints(),
-            },
-        )
-        if publish_results:
-            update_results({"bts_origin_weather": {"data": json.loads((gold / "_metadata.json").read_text())}})
+        with progress_stage("Origin weather: clean observations and check source clocks"):
+            observations = clean_weather(
+                spark,
+                settings["output_directory"],
+                ROOT / "data/silver/weather" / build_id,
+                ROOT / "data/quarantine/weather" / build_id,
+                manifest,
+                report,
+            )
+        with progress_stage("Origin weather: match observations and validate the flight cohort"):
+            enriched = build_origin_features(
+                cutoffs, observations, manifest, **policy
+            ).cache()
+            validate_cohort(flights, enriched, **policy)
+        with progress_stage("Origin weather: write splits, coverage and metadata"):
+            coverage = enriched.groupBy(
+                "split",
+                "Origin",
+                F.trunc("FlightDate", "month").alias("month"),
+                "origin_weather_match_status",
+            ).agg(
+                F.count("*").alias("flights"),
+                F.avg("origin_weather_age_minutes").alias("mean_age_minutes"),
+                *[F.sum(name).alias(name) for name in WEATHER_FLAGS],
+            )
+            for split in config["splits"]:
+                enriched.filter(F.col("split") == split).write.parquet(str(gold / split))
+            write_json(
+                gold / "_metadata.json",
+                {
+                    **json.loads((report / "_metadata.json").read_text()),
+                    "coverage": records(coverage.toPandas()),
+                    "dataset_id": build_id,
+                    "gold_dir": str(gold),
+                    "policy": policy,
+                    "splits": config["splits"],
+                    "weather_columns": WEATHER_NUMERIC + WEATHER_FLAGS,
+                    "reference_sources": json.loads(
+                        (settings["reference_directory"] / "sources.json").read_text()
+                    ),
+                    "source_manifest": manifest,
+                    "bts_input_files": bts_fingerprints(),
+                },
+            )
+            if publish_results:
+                update_results({"bts_origin_weather": {"data": json.loads((gold / "_metadata.json").read_text())}})
         return gold, gold
     finally:
         spark.catalog.clearCache()

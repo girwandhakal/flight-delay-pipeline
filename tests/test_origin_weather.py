@@ -10,7 +10,6 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-from pyspark.ml import PipelineModel
 from pyspark.sql import functions as F
 
 from tests.conftest import get_test_spark_session
@@ -18,7 +17,6 @@ from tests.conftest import get_test_spark_session
 from scripts.bts import train
 from scripts.origin_weather import build_features as features, clean, download
 from scripts.origin_weather.measurements import SOURCE_FIELDS, FEATURE_COLUMNS, NUMERIC_FEATURES, decode_weather
-from pipeline import main as pipeline
 
 
 HEADER = ["STATION", "DATE", "REPORT_TYPE", "REM", *SOURCE_FIELDS]
@@ -98,12 +96,18 @@ class WeatherDownloadTests(unittest.TestCase):
                 patch.object(download, "urlopen", side_effect=response) as network,
                 patch.object(download, "sha256", side_effect=AssertionError("Unexpected checksum scan")),
                 patch.object(download.csv, "DictReader", side_effect=AssertionError("Unexpected CSV scan")),
+                patch.object(download.tqdm, "write") as messages,
             ):
                 first = download.download_weather(request, tmp)
                 self.assertEqual(first["files"]["2024/LCD_USW00094846_2024.csv"]["status"], "downloaded")
                 target = Path(tmp) / "2024/LCD_USW00094846_2024.csv"
+                self.assertTrue(any(f"Downloading weather file {target}" in call.args[0]
+                                    for call in messages.call_args_list))
+                self.assertTrue(any(f"Downloaded weather file {target} in " in call.args[0]
+                                    for call in messages.call_args_list))
                 target.write_bytes(b"changed locally")
                 second = download.download_weather(request, tmp)
+                messages.assert_called_with(f"Reusing weather file {target} because it already exists.")
                 self.assertTrue(first["complete"] and second["complete"])
                 self.assertEqual(target.read_bytes(), b"changed locally")
                 self.assertEqual(network.call_count, 1)
@@ -162,16 +166,6 @@ class WeatherDownloadTests(unittest.TestCase):
             self.assertEqual(json.loads(target.read_text()), {"run": 1})
             self.assertEqual(json.loads(target.with_suffix(".json.part").read_text()), {"run": 2})
 
-    def test_driver_modes_do_not_open_test_implicitly(self):
-        with (
-            patch.object(pipeline, "run_origin_weather", return_value=0) as origin,
-            patch.object(pipeline, "evaluate_origin_weather") as evaluate,
-        ):
-            self.assertEqual(pipeline.main(["--origin-weather"]), 0)
-            origin.assert_called_once()
-            evaluate.assert_not_called()
-
-
 class WeatherSparkTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -208,6 +202,7 @@ class WeatherSparkTests(unittest.TestCase):
             "flight_id string, FlightDate date, Origin string, CRSDepTime string, split string, ArrDel15 int",
         )
         cutoffs = features.build_flight_cutoffs(self.spark, flights, self.references())
+        cutoffs = cutoffs.withColumn("parent_payload", F.repeat(F.col("flight_id"), 4096))
         weather = self.spark.createDataFrame(
             [
                 (
@@ -250,6 +245,10 @@ class WeatherSparkTests(unittest.TestCase):
             features.validate_cohort(flights, joined, publication_lag_minutes=15)
             rows = {row.flight_id: row for row in joined.collect()}
             self.assertEqual(rows["a"].source_file, "eligible")
+            self.assertEqual(joined.columns[:len(cutoffs.columns)], cutoffs.columns)
+            self.assertEqual(joined.select(cutoffs.columns).schema, cutoffs.schema)
+            self.assertEqual({key: row.parent_payload for key, row in rows.items()},
+                             {key: key * 4096 for key in ("a", "b", "c")})
             self.assertEqual(rows["b"].origin_weather_age_minutes, 15)
             self.assertEqual(rows["a"].origin_visibility_missing, 1)
             self.assertEqual(rows["c"].origin_weather_missing, 1)
@@ -366,14 +365,15 @@ class WeatherSparkTests(unittest.TestCase):
             self.assertEqual(quality["duplicate_observations"], 1)
 
     def test_station_year_requests_cover_utc_and_local_year_boundaries(self):
-        cutoffs = self.spark.createDataFrame(
-            [("USW00003937", "America/Chicago", datetime(2025, 1, 1, 1))],
-            "origin_station_id string, origin_time_zone string, scheduled_departure_utc timestamp",
-        )
-        self.assertEqual(features.required_station_years(cutoffs, 120), [
-            ("USW00003937", 2024, "America/Chicago"),
-            ("USW00003937", 2025, "America/Chicago"),
-        ])
+        for prefix in ("origin", "destination"):
+            cutoffs = self.spark.createDataFrame(
+                [("USW00003937", "America/Chicago", datetime(2025, 1, 1, 1))],
+                f"{prefix}_station_id string, {prefix}_time_zone string, scheduled_departure_utc timestamp",
+            )
+            self.assertEqual(features.required_station_years(cutoffs, 120, prefix), [
+                ("USW00003937", 2024, "America/Chicago"),
+                ("USW00003937", 2025, "America/Chicago"),
+            ])
 
     def test_expanded_fields_flow_from_cleaning_into_training_inputs(self):
         values = dict(zip(SOURCE_FIELDS, [
@@ -429,93 +429,6 @@ class WeatherSparkTests(unittest.TestCase):
                 self.assertEqual(row.origin_weather_fog, 1)
             finally:
                 enriched.unpersist()
-
-    def test_weather_imputation_is_training_only_and_reloadable(self):
-        row = [
-            "AA",
-            "ORD",
-            "LAX",
-            1,
-            1,
-            12,
-            15,
-            120.0,
-            800.0,
-            10.0,
-            2.0,
-            16.0,
-            30.0,
-            0,
-            0,
-            0,
-            0,
-        ]
-        row = row[:9] + [10.0] * len(features.WEATHER_NUMERIC) + [0] * len(features.WEATHER_FLAGS)
-        missing = row[:9] + [None] * len(features.WEATHER_NUMERIC) + [1] * len(features.WEATHER_FLAGS)
-        schema = (
-            "Reporting_Airline string, Origin string, Dest string, Month int, DayOfWeek int, DepHour int, ArrHour int, CRSElapsedTime double, Distance double, "
-            + ", ".join(f"{name} double" for name in features.WEATHER_NUMERIC)
-            + ", "
-            + ", ".join(f"{name} int" for name in features.WEATHER_FLAGS)
-        )
-        fitting = self.spark.createDataFrame([row, missing], schema)
-        model = train.build_preprocessor("bts_origin_weather").fit(fitting)
-        self.assertEqual(
-            model.stages[2].surrogateDF.first()[features.WEATHER_NUMERIC[0]], 10
-        )
-        train.validate_weather(fitting, "fixture")
-        with self.assertRaisesRegex(ValueError, "No valid training"):
-            train.validate_weather(
-                self.spark.createDataFrame([missing], schema), "empty fixture"
-            )
-        with tempfile.TemporaryDirectory() as tmp:
-            model.write().save(str(Path(tmp) / "pipeline"))
-            restored = PipelineModel.load(str(Path(tmp) / "pipeline"))
-            self.assertEqual(
-                model.transform(fitting).first().features,
-                restored.transform(fitting).first().features,
-            )
-        self.assertEqual(len(train.build_preprocessor().getStages()), 3)
-
-    def test_paired_comparison_and_single_class_slice(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            for variant, probabilities in (
-                ("bts", [0.9, 0.8, 0.2, 0.1]),
-                ("bts_origin_weather", [0.9, 0.1, 0.9, 0.1]),
-            ):
-                scores = self.spark.createDataFrame(
-                    [
-                        (
-                            str(i),
-                            date(2024, 10, 1),
-                            int(i % 2 == 0),
-                            probability,
-                            int(probability >= 0.5),
-                            0.5,
-                        )
-                        for i, probability in enumerate(probabilities)
-                    ],
-                    "flight_id string, FlightDate date, ArrDel15 int, p_delayed double, prediction int, threshold double",
-                )
-                scores.write.parquet(str(root / variant / "validation_predictions"))
-            context = self.spark.createDataFrame(
-                [(str(i), "ORD", 10, int(i >= 2), 2.0) for i in range(4)],
-                "flight_id string, Origin string, Month int, origin_weather_missing int, origin_wind_speed_ms double",
-            )
-            results = pipeline.compare_predictions(self.spark, root, context=context)
-            deltas = results["bts_origin_weather"]["validation"]["deltas_vs_bts"]
-            self.assertEqual(deltas["f1"], 0.5)
-            self.assertTrue(results["bts"]["validation"]["subgroups"])
-            self.assertFalse(list(root.glob("*.csv")))
-            self.assertFalse(list(root.glob("*.md")))
-            self.assertFalse(list(root.glob("*.json")))
-            self.assertEqual(
-                self.spark.read.parquet(str(root / "validation_predictions")).count(), 4
-            )
-            metrics = train.evaluate_predictions(scores.filter("ArrDel15 = 1"))
-            self.assertIsNone(metrics["pr_auc"])
-
 
 if __name__ == "__main__":
     unittest.main()

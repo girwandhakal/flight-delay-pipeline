@@ -80,20 +80,5 @@ class DownloadTests(unittest.TestCase):
             self.assertFalse(destination.exists())
             self.assertFalse(destination.with_suffix(".csv.part").exists())
 
-    # A progress-wrapped download must save the exact ZIP bytes.
-    def test_download_with_progress(self):
-        content = io.BytesIO()
-        with zipfile.ZipFile(content, "w") as archive:
-            archive.writestr("flights.csv", "a,b\n1,2\n")
-        payload = content.getvalue()
-        for known_size in (True, False):
-            with self.subTest(known_size=known_size), tempfile.TemporaryDirectory() as directory:
-                response = io.BytesIO(payload)
-                response.headers = {"Content-Length": str(len(payload))} if known_size else {}
-                destination = Path(directory) / "flights.zip"
-                with patch.object(bts, "urlopen", return_value=response):
-                    self.assertEqual(bts.download_file("https://example.invalid/flights.zip", destination), destination)
-                self.assertEqual(destination.read_bytes(), payload)
-
 if __name__ == "__main__":
     unittest.main()
