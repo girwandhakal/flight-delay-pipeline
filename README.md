@@ -20,4 +20,5 @@
 - **Requirements:** Internet access for downloads, substantial free disk space, and RAM beyond Spark's 6 GB Java heap. If Spark runs out of disk space, free space or set `SPARK_LOCAL_DIRS` to a writable directory on a roomier local drive before retrying.
 - **Configuration:** Dataset dates and weather settings are in `config.json`.
 - **Outputs:** Datasets in `data/`, models and predictions in `models/`, and reports in `results/results.json`.
+- **Weather Silver reuse:** Origin and destination processing reuse completed cleaned weather when raw-file paths, sizes and modification times, station time zones, cleaning code and Spark version match. Reuse also checks the saved Parquet file inventory and carries forward quality reports. Older Silver without this provenance is rebuilt once; changed or incomplete inputs/outputs trigger cleaning again. Files modified while preserving both size and modification time are outside this check.
 - **Optional test scoring:** After validation, use the printed run ID: `python pipeline/main.py --evaluate-destination-weather RUN_ID`.

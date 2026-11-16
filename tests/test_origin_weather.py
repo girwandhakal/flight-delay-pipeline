@@ -397,8 +397,19 @@ class WeatherSparkTests(unittest.TestCase):
             }
             observations = clean.clean_weather(
                 self.spark, root / "bronze", root / "silver", root / "quarantine",
-                manifest, root / "report",
+                manifest, root / "silver",
             )
+            with patch.object(self.spark, "createDataFrame", side_effect=AssertionError("Unexpected reclean")):
+                reused = clean.clean_weather(
+                    self.spark, root / "bronze", root / "reused", root / "unused_quarantine",
+                    manifest, root / "reused",
+                )
+                self.assertEqual(reused.collect(), observations.collect())
+                self.assertFalse((root / "unused_quarantine").exists())
+                self.assertEqual(
+                    json.loads((root / "reused/_metadata.json").read_text()),
+                    json.loads((root / "silver/_metadata.json").read_text()),
+                )
             flights = self.spark.createDataFrame(
                 [("a", date(2024, 1, 1), "ORD", "1200", "train", 0)],
                 "flight_id string, FlightDate date, Origin string, CRSDepTime string, split string, ArrDel15 int",

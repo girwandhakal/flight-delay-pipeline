@@ -13,12 +13,22 @@ from .download import (
     REPORTS,
     load_config,
     standard_offset,
+    sha256,
     write_json,
 )
 from .measurements import (
     SOURCE_FIELDS, NUMERIC_FEATURES, MISSING_FLAGS, INDICATOR_FLAGS,
     FEATURE_COLUMNS, UNITS, decode_weather,
 )
+
+
+def file_fingerprints(paths):
+    # shortcut: size/mtime detect ordinary edits; use content hashes if files can preserve both.
+    return [
+        {"path": str(path.resolve()), "bytes": path.stat().st_size,
+         "modified_ns": path.stat().st_mtime_ns}
+        for path in sorted(paths)
+    ]
 
 
 def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, report_dir):
@@ -31,6 +41,37 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
     if not entries:
         raise ValueError("No downloaded weather files available.")
     spark.conf.set("spark.sql.session.timeZone", "UTC")
+    silver_dir = Path(silver_dir)
+    cache_inputs = {
+        "files": file_fingerprints([
+            Path(bronze_dir) / f"{e['year']}/LCD_{e['station_id']}_{e['year']}.csv"
+            for e in entries
+        ]),
+        "stations": sorted([e["station_id"], e["year"], e["time_zone"]] for e in entries),
+        "code": {name: sha256(Path(__file__).with_name(name))
+                 for name in ("clean.py", "measurements.py", "download.py")},
+        "spark": spark.version,
+    }
+    for candidate in sorted(silver_dir.parent.glob("*/_metadata.json"), reverse=True):
+        try:
+            metadata = json.loads(candidate.read_text())
+            if not isinstance(metadata, dict) or not all(
+                name in metadata for name in ("quality", "station_quality", "source_contract")
+            ):
+                continue
+            cached = metadata.get("cleaning_cache", {})
+            if (not isinstance(cached, dict) or cached.get("inputs") != cache_inputs
+                    or not (candidate.parent / "_SUCCESS").is_file()
+                    or not cached.get("outputs")
+                    or cached["outputs"] != file_fingerprints(candidate.parent.rglob("*.parquet"))):
+                continue
+        except (OSError, ValueError):
+            continue
+        clean = spark.read.parquet(str(candidate.parent))
+        write_json(Path(report_dir) / "_metadata.json", metadata)
+        print(f"Reusing cleaned weather Silver from {candidate.parent} because inputs and cleaning code match.", flush=True)
+        return clean
+    print("Cleaning weather because no complete matching Silver dataset was found.", flush=True)
     paths = [
         str(
             Path(bronze_dir)
@@ -189,6 +230,10 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
         write_json(
             Path(report_dir) / "_metadata.json",
             {
+                "cleaning_cache": {
+                    "inputs": cache_inputs,
+                    "outputs": file_fingerprints(silver_dir.rglob("*.parquet")),
+                },
                 "quality": stats,
                 "station_quality": records(station_quality),
                 "source_contract": {
