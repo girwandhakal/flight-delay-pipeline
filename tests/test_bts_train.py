@@ -108,7 +108,7 @@ class TrainingTests(unittest.TestCase):
                   patch.object(bts.GBTClassifier, "fit", gbt_fit),
                   patch.object(bts, "LOGISTIC_PARAMS", logistic_params),
                   patch.object(bts, "GBT_PARAMS", tree_params)):
-                summary = bts.train(self.spark, gold, models, results)
+                summary = bts.train(self.spark, gold, models, results, include_gbt=True)
             self.assertEqual(len(classifier_fits), 1)
             self.assertEqual(len(gbt_fits), 1)
             self.assertEqual(set(reads), {str(gold / "train"), str(gold / "val")})
@@ -140,6 +140,10 @@ class TrainingTests(unittest.TestCase):
             self.assertNotIn("internal_pr_auc", challenger)
             self.assertEqual(challenger["max_depth"], tree_params["maxDepth"])
             self.assertEqual(challenger["max_iter"], tree_params["maxIter"])
+            self.assertEqual(set(challenger["timing_seconds"]), {
+                "preprocessor_fit", "classifier_fit", "validation", "save_model_and_threshold",
+            })
+            self.assertTrue(all(seconds >= 0 for seconds in challenger["timing_seconds"].values()))
             tree = PipelineModel.load(str(models / "gbt/baseline_pipeline"))
             self.assertEqual(tree.stages[-1].getMaxDepth(), challenger["max_depth"])
             tree_threshold = json.loads((models / "gbt/threshold.json").read_text())["threshold"]
@@ -147,6 +151,18 @@ class TrainingTests(unittest.TestCase):
             self.assertEqual(tree_metrics["confusion_matrix"], challenger["validation_metrics_at_selected_threshold"]["confusion_matrix"])
             published = json.loads((results / "results.json").read_text())["bts"]["validation"]
             self.assertEqual(published["selected"], expected)
+
+            default_models = root / "default"
+            with (patch.object(bts, "LOGISTIC_PARAMS", logistic_params),
+                  patch.object(bts, "GBTClassifier", side_effect=AssertionError("Unexpected GBT"))):
+                default = bts.train(self.spark, gold, default_models, results)
+            self.assertEqual(set(default["algorithm_comparison"]), {"logistic_regression"})
+            self.assertEqual(set(default_models.iterdir()), {
+                default_models / "baseline_pipeline", default_models / "threshold.json",
+            })
+            self.assertEqual(set(default["timing_seconds"]), {"prepare_cohorts", "reference_baselines"})
+            self.assertEqual(default["selected_model"], summary["selected_model"])
+            self.assertEqual(json.loads((results / "results.json").read_text())["bts"]["training"], default)
 
 
 if __name__ == "__main__":

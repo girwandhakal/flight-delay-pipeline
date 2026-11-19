@@ -49,7 +49,7 @@ class WeatherSilverCacheTests(unittest.TestCase):
                                             root / "quarantine", manifest, root / "reports")
                 spark.createDataFrame.assert_not_called()
                 spark.read.csv.assert_not_called()
-                spark.read.parquet.assert_called_once_with(str(silver))
+                spark.read.parquet.assert_called_once_with(str(silver), pathGlobFilter="*.parquet")
                 self.assertIs(result, spark.read.parquet.return_value)
 
             run()

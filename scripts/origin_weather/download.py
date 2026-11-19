@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 import re
 import time
+from typing import Any, Union
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -15,7 +16,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from tqdm import tqdm
 
 from scripts.results import replace_file
-
 from .measurements import MEASUREMENTS, SOURCE_FIELDS, UNITS
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -28,7 +28,25 @@ SOURCES = {
 REPORTS = ["FM-15", "FM-16"]
 
 
-def write_json(path, value):
+def haversine_distance_km(
+    lat1_deg: float,
+    lon1_deg: float,
+    lat2_deg: float,
+    lon2_deg: float,
+) -> float:
+    """Calculate the great-circle distance between two coordinate pairs in kilometers."""
+    lat1, lat2 = math.radians(lat1_deg), math.radians(lat2_deg)
+    dlat = lat2 - lat1
+    dlon = math.radians(lon2_deg - lon1_deg)
+    arc = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    )
+    return 12742 * math.asin(min(1.0, math.sqrt(arc)))
+
+
+def write_json(path: Union[str, Path], value: Any) -> None:
+    """Write an object to a formatted JSON file atomically using a temporary file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".part")
@@ -38,20 +56,24 @@ def write_json(path, value):
     replace_file(temporary, path)
 
 
-def sha256(path):
+def sha256(path: Union[str, Path]) -> str:
+    """Calculate the hex-encoded SHA-256 digest of a file on disk."""
     with Path(path).open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def reference_matches(path, checksum):
-    # Git checkouts and GitHub ZIPs can use different CSV line endings.
+def reference_matches(path: Union[str, Path], checksum: str) -> bool:
+    """Verify that file content matches checksum, tolerating CRLF vs LF differences."""
     content = Path(path).read_bytes()
     lf = content.replace(b"\r\n", b"\n")
-    return any(hashlib.sha256(value).hexdigest() == checksum
-               for value in (content, lf, lf.replace(b"\n", b"\r\n")))
+    return any(
+        hashlib.sha256(value).hexdigest() == checksum
+        for value in (content, lf, lf.replace(b"\n", b"\r\n"))
+    )
 
 
-def project_path(root, name):
+def project_path(root: Path, name: Union[str, Path]) -> Path:
+    """Resolve a path relative to the project root, ensuring it stays within root."""
     path = Path(name)
     resolved = (root / path).resolve()
     if path.is_absolute() or not resolved.is_relative_to(root.resolve()):
@@ -59,7 +81,10 @@ def project_path(root, name):
     return resolved
 
 
-def load_config(root=ROOT):
+def load_config(
+    root: Path = ROOT,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Load and validate weather dataset and policy configuration from config.json."""
     config = json.loads((root / "config.json").read_text(encoding="utf-8"))
     settings = config["datasets"]["weather"].copy()
     if settings["product"] != "lcdv2":
@@ -75,7 +100,8 @@ def load_config(root=ROOT):
     return settings, policy, config
 
 
-def fetch(url, path):
+def fetch(url: str, path: Union[str, Path]) -> Path:
+    """Download a URL to a temporary .part file with retries and progress tracking."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".part")
@@ -119,7 +145,14 @@ def fetch(url, path):
             time.sleep(2**attempt)
 
 
-def prepare_references(origins, directory, start_date, end_date, prefix="origin"):
+def prepare_references(
+    origins: list[str],
+    directory: Union[str, Path],
+    start_date: str,
+    end_date: str,
+    prefix: str = "origin",
+) -> None:
+    """Download OpenFlights and NOAA metadata to construct airport-to-station mappings."""
     if prefix not in ("origin", "destination"):
         raise ValueError("Weather role must be origin or destination.")
     directory = Path(directory)
@@ -194,18 +227,8 @@ def prepare_references(origins, directory, start_date, end_date, prefix="origin"
             # line[12:20] = latitude, line[21:30] = longitude
             line = stations[station_id]
             st_lat, st_lon = float(line[12:20]), float(line[21:30])
-            lat1, lat2 = math.radians(airport_lat), math.radians(st_lat)
-            dlat, dlon = lat2 - lat1, math.radians(st_lon - airport_lon)
-            distance = 12742 * math.asin(
-                min(
-                    1,
-                    math.sqrt(
-                        math.sin(dlat / 2) ** 2
-                        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-                    ),
-                )
-            )
-            # Exact ICAO linkage and a location check avoid a nearest-station fallback.
+            distance = haversine_distance_km(airport_lat, airport_lon, st_lat, st_lon)
+            # Exact ICAO linkage and a <= 5 km distance check avoid a nearest-station fallback.
             if distance <= 5:
                 matches[station_id] = round(distance, 3)
         if len(matches) == 1:
@@ -262,7 +285,7 @@ def prepare_references(origins, directory, start_date, end_date, prefix="origin"
     )
 
 
-def standard_offset(zone, year):
+def standard_offset(zone: str, year: int) -> int:
     """Return local standard time offset (seconds) for Northern Hemisphere airports.
 
     Compares Jan 1 (winter) and Jul 1 (summer) offsets; standard time is the minimum.
@@ -275,7 +298,11 @@ def standard_offset(zone, year):
     )
 
 
-def download_weather(requests, directory):
+def download_weather(
+    requests: list[tuple[str, int, str]],
+    directory: Union[str, Path],
+) -> dict[str, Any]:
+    """Download NOAA LCDv2 CSV files for the requested station-years and write manifest."""
     directory = Path(directory)
     manifest_path = directory / "manifest.json"
     manifest = (
@@ -350,7 +377,8 @@ def download_weather(requests, directory):
     return manifest
 
 
-def main():
+def main() -> int:
+    """Download weather reference tables and NOAA LCDv2 station files for all flight cohorts."""
     from scripts.bts.build_features import get_spark_session
     from .build_features import (
         build_flight_cutoffs,

@@ -67,9 +67,11 @@ class DestinationTests(unittest.TestCase):
     def test_default_driver_runs_destination_workflow(self):
         with patch.object(pipeline, "run_destination_weather", return_value=0) as run, patch.object(pipeline, "run_stage") as legacy:
             self.assertEqual(pipeline.main([]), 0)
-            run.assert_called_once()
+            run.assert_called_once_with(include_gbt=False, include_rotation=True)
             legacy.assert_not_called()
-        with patch.object(pipeline, "run_destination_weather") as run, patch.object(pipeline, "run_stage", return_value=0) as legacy:
+        with (patch.object(pipeline, "run_destination_weather") as run,
+              patch.object(pipeline, "features_current", return_value=False),
+              patch.object(pipeline, "run_stage", return_value=0) as legacy):
             self.assertEqual(pipeline.main(["--bts-only"]), 0)
             run.assert_not_called()
             self.assertEqual(legacy.call_count, 5)
@@ -107,11 +109,20 @@ class DestinationTests(unittest.TestCase):
 
     def test_modes_and_feature_contract(self):
         with patch.object(pipeline, "run_destination_weather", return_value=0) as run, patch.object(pipeline, "evaluate_destination_weather", return_value=0) as evaluate:
-            self.assertEqual(pipeline.main(["--destination-weather"]), 0)
-            run.assert_called_once()
+            self.assertEqual(pipeline.main(["--destination-weather", "--include-gbt"]), 0)
+            run.assert_called_once_with(include_gbt=True, include_rotation=False)
             evaluate.assert_not_called()
             self.assertEqual(pipeline.main(["--evaluate-destination-weather", "frozen"]), 0)
             evaluate.assert_called_once_with("frozen")
+        with patch.object(pipeline, "run_origin_weather", return_value=0) as run:
+            self.assertEqual(pipeline.main(["--origin-weather", "--include-gbt"]), 0)
+            run.assert_called_once_with(include_gbt=True)
+        with (patch.object(pipeline, "features_current", return_value=True),
+              patch.object(pipeline, "run_stage", return_value=0) as stage):
+            self.assertEqual(pipeline.main(["--bts-only", "--include-gbt"]), 0)
+            training = stage.call_args_list[0].args[2]
+            self.assertIs(training.func, train.main)
+            self.assertEqual(training.keywords, {"include_gbt": True})
         self.assertEqual(len(destination.DESTINATION_WEATHER_NUMERIC), 27)
         self.assertEqual(len(destination.DESTINATION_WEATHER_FLAGS), 18)
         self.assertEqual(destination.DESTINATION_WEATHER_NUMERIC, [name.replace("origin_", "destination_", 1) for name in origin.WEATHER_NUMERIC])
@@ -134,8 +145,7 @@ class DestinationTests(unittest.TestCase):
             before = current.read_bytes()
             with (patch.object(pipeline, "ROOT", root),
                   patch.object(pipeline, "features_current", return_value=True),
-                  patch.object(destination, "validate_parent"),
-                  patch.object(destination, "validate_parent_data"),
+                  patch.object(pipeline.weather_features, "main", return_value=(parent, parent)),
                   patch.object(destination, "main", return_value=(root / "combined", root / "combined")),
                   patch.object(pipeline.bts_transform, "get_spark_session") as session,
                   patch.object(train, "train", side_effect=[{}, {}, RuntimeError("third fit")]) as fit,
@@ -148,6 +158,59 @@ class DestinationTests(unittest.TestCase):
                 self.assertTrue(session.return_value.stop.called)
             self.assertEqual(current.read_bytes(), before)
             self.assertFalse(list((root / "models").rglob("_SUCCESS")))
+
+    def test_default_pipeline_trains_and_reports_four_arms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            origin_gold, combined_gold = root / "origin", root / "combined"
+            for directory in (origin_gold, combined_gold):
+                directory.mkdir()
+                (directory / "_metadata.json").write_text(
+                    json.dumps(dict.fromkeys(("quality", "station_quality", "source_contract"), {}))
+                )
+            variants = train.ALL_FEATURE_SETS
+            metrics = {key: 0.5 for key in pipeline.ABLATION_METRICS}
+            summary = {
+                "reference_baselines": {"train_prevalence": {"training_prevalence": 0.5}},
+                "selected_model": {"best_threshold": 0.5}, "training_rows": 2, "input_columns": [],
+            }
+            updates = {variant: {"validation": {"selected": {**metrics, "threshold": 0.5, "rows": 2}}}
+                       for variant in variants}
+            with (patch.object(pipeline, "ROOT", root),
+                  patch.object(pipeline, "load_config", return_value=({"reference_directory": root}, {}, {"splits": {}})),
+                  patch.object(pipeline, "features_current", return_value=True),
+                  patch.object(pipeline.weather_features, "main", return_value=(origin_gold, origin_gold)),
+                  patch.object(destination, "main", return_value=(combined_gold, combined_gold)),
+                  patch.object(pipeline.bts_transform, "get_spark_session") as session,
+                  patch.object(pipeline.rotation, "rotation_raw_files", return_value=[]),
+                  patch.object(pipeline.rotation, "source_identity", return_value={}),
+                  patch.object(pipeline.rotation, "prepare_rotation", return_value={"coverage": []}) as prepare,
+                  patch.object(train, "train", side_effect=lambda *args, **kwargs: dict(summary)) as fit,
+                  patch.object(pipeline, "compare_predictions", return_value=updates) as compare,
+                  patch.object(pipeline, "update_results") as publish):
+                session.return_value.version = "3.5.7"
+                self.assertEqual(pipeline.main([]), 0)
+                prepared_dir = prepare.call_args.args[-1]
+                self.assertEqual(prepare.call_args.args[-3], combined_gold)
+                self.assertEqual([call.kwargs["feature_set"] for call in fit.call_args_list], list(variants))
+                self.assertEqual({call.args[1] for call in fit.call_args_list}, {prepared_dir / "gold"})
+                self.assertTrue(all(not call.kwargs["include_gbt"] for call in fit.call_args_list))
+                self.assertEqual(compare.call_args.kwargs["variants"], variants)
+                self.assertEqual(set(publish.call_args.args[0]), set(variants))
+                session.return_value.stop.assert_called_once_with()
+                fit.side_effect = [summary, summary, summary, RuntimeError("fourth fit failed")]
+                compare.reset_mock()
+                publish.reset_mock()
+                with self.assertRaisesRegex(RuntimeError, "fourth fit failed"):
+                    pipeline.main([])
+                compare.assert_not_called()
+                publish.assert_not_called()
+            report = json.loads((prepared_dir / "validation_comparison.json").read_text())
+            self.assertEqual([row["feature_set"] for row in report["models"]], list(variants))
+            self.assertEqual(
+                list((root / "models/destination_weather_comparison").glob("*/_SUCCESS")),
+                [prepared_dir / "_SUCCESS"],
+            )
 
     def test_frozen_evaluation_rejects_stale_or_changed_artifacts_before_spark(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -356,23 +419,29 @@ class DestinationSparkTests(unittest.TestCase):
             model.write().save(path)
             self.assertEqual(PipelineModel.load(path).transform(validation).first().features, model.transform(validation).first().features)
 
-    def test_three_way_metrics_and_cohort_rejection(self):
+    def test_four_way_metrics_and_cohort_rejection(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for variant, probabilities in zip(train.FEATURE_SETS, ([.9, .8, .2, .1], [.9, .1, .9, .1], [.9, .1, .9, .1])):
+            variants = train.ALL_FEATURE_SETS
+            for variant, probabilities in zip(variants, ([.9, .8, .2, .1], [.9, .1, .9, .1], [.9, .1, .9, .1], [.8, .2, .1, .1])):
                 scores = self.spark.createDataFrame([(str(i), date(2024, 10, 1), int(i % 2 == 0), p, int(p >= .5), .5) for i, p in enumerate(probabilities)], "flight_id string, FlightDate date, ArrDel15 int, p_delayed double, prediction int, threshold double")
                 scores.write.parquet(str(root / variant / "validation_predictions"))
             context = self.spark.createDataFrame([(str(i), "ORD", "LAX", 10, 0, int(i > 1), 2.0, None if i > 1 else 7.0) for i in range(4)],
                 "flight_id string, Origin string, Dest string, Month int, origin_weather_missing int, destination_weather_missing int, origin_wind_speed_ms double, destination_wind_speed_ms double")
-            result = pipeline.compare_predictions(self.spark, root, context=context, variants=train.FEATURE_SETS, training_prevalence={v: .25 for v in train.FEATURE_SETS})
+            context = context.withColumn("rotation_outcome_missing", F.col("destination_weather_missing"))
+            result = pipeline.compare_predictions(self.spark, root, context=context, variants=variants, training_prevalence={v: .25 for v in variants})
             combined = result["bts_origin_destination_weather"]["validation"]
             self.assertEqual(combined["deltas_vs_bts"]["f1"], .5)
             self.assertEqual(combined["deltas_vs_bts_origin_weather"]["f1"], 0)
             self.assertEqual(combined["selected"]["tp"], 2)
             self.assertEqual(combined["reference_baselines"]["train_prevalence"]["training_prevalence"], .25)
-            self.assertEqual({row["subgroup_type"] for row in combined["subgroups"]}, {"Origin", "Dest", "Month", "origin_weather_missing", "destination_weather_missing", "origin_wind_bin", "destination_wind_bin"})
+            self.assertEqual({row["subgroup_type"] for row in combined["subgroups"]}, {"Origin", "Dest", "Month", "origin_weather_missing", "destination_weather_missing", "origin_wind_bin", "destination_wind_bin", "rotation_outcome_missing"})
             self.assertTrue(all(row["total_flights"] > 0 for row in combined["subgroups"]))
-            self.assertEqual(self.spark.read.parquet(str(root / "validation_predictions")).count(), 4)
-            scores.withColumn("ArrDel15", F.lit(0)).write.mode("overwrite").parquet(str(root / "bts_origin_destination_weather/validation_predictions"))
+            paired = self.spark.read.parquet(str(root / "validation_predictions"))
+            self.assertEqual(paired.count(), 4)
+            self.assertIn("rotation_p_delayed", paired.columns)
+            rotation = result[train.ROTATION_FEATURE_SET]["validation"]
+            self.assertLess(rotation["deltas_vs_bts_origin_destination_weather"]["f1"], 0)
+            scores.withColumn("ArrDel15", F.lit(0)).write.mode("overwrite").parquet(str(root / train.ROTATION_FEATURE_SET / "validation_predictions"))
             with self.assertRaisesRegex(ValueError, "cohorts differ"):
-                pipeline.compare_predictions(self.spark, root, variants=train.FEATURE_SETS)
+                pipeline.compare_predictions(self.spark, root, variants=variants)

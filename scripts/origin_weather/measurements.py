@@ -5,6 +5,7 @@ Source: https://www.ncei.noaa.gov/oa/local-climatological-data/v2/doc/lcdv2_DOCU
 
 import math
 import re
+from typing import Any, Optional
 
 
 # Keep the original EDA's three-field contract while expanding pipeline inputs.
@@ -78,13 +79,23 @@ NUMERIC_FEATURES = [
     *["origin_weather_" + name for name in CONDITIONS],
     "origin_cloud_cover_oktas", "origin_cloud_ceiling_m",
 ]
-MISSING_FLAGS = [
-    "origin_temperature_missing", "origin_wind_speed_missing", "origin_visibility_missing",
-    "origin_precipitation_missing", "origin_wind_gust_speed_missing",
-    "origin_wind_direction_missing", "origin_relative_humidity_missing",
-    "origin_dew_point_missing", "origin_sea_level_pressure_missing",
-    "origin_weather_type_missing", "origin_sky_conditions_missing", "origin_cloud_ceiling_missing",
+NUMERIC_MISSING_FLAGS = [
+    "origin_temperature_missing",
+    "origin_wind_speed_missing",
+    "origin_visibility_missing",
+    "origin_precipitation_missing",
+    "origin_wind_gust_speed_missing",
+    "origin_wind_direction_missing",
+    "origin_relative_humidity_missing",
+    "origin_dew_point_missing",
+    "origin_sea_level_pressure_missing",
 ]
+NON_NUMERIC_MISSING_FLAGS = [
+    "origin_weather_type_missing",
+    "origin_sky_conditions_missing",
+    "origin_cloud_ceiling_missing",
+]
+MISSING_FLAGS = [*NUMERIC_MISSING_FLAGS, *NON_NUMERIC_MISSING_FLAGS]
 INDICATOR_FLAGS = [
     "origin_precipitation_trace", "origin_wind_calm", "origin_wind_variable",
     "origin_cloud_no_ceiling", "origin_cloud_obscured",
@@ -98,7 +109,7 @@ UNITS = {
 }
 
 
-def number(token):
+def number(token: Optional[str]) -> Optional[float]:
     """Parse numeric token, returning None for non-numeric, flagged, or infinite values."""
     text = (token or "").strip()
     if not re.fullmatch(r"[+-]?(\d+(\.\d*)?|\.\d+)", text):
@@ -107,7 +118,7 @@ def number(token):
     return value if math.isfinite(value) else None
 
 
-def weather_conditions(token):
+def weather_conditions(token: Optional[str]) -> tuple[dict[str, Optional[float]], int]:
     """Decode AU contractions and source-specific AW/MW codes, preserving uncertainty."""
     found, unknown = set(), False
     for group, tokens in enumerate((token or "").strip().split("|")):
@@ -141,9 +152,14 @@ def weather_conditions(token):
     }, int(not known)
 
 
-def cloud_conditions(token):
+def cloud_conditions(
+    token: Optional[str],
+) -> tuple[Optional[float], Optional[float], int, int, int, int]:
     """Decode cloud layers into oktas cover, lowest ceiling height, and obscurity indicators."""
     text = (token or "").strip()
+    # Group 1: cloud cover type (e.g. CLR, FEW, SCT, BKN, OVC, VV, 10).
+    # Group 2: cloud cover amount in oktas (00-10).
+    # Group 3: optional cloud base height in hundreds of feet (e.g. 25 -> 2500 ft).
     pattern = r"(CLR|FEW|SCT|BKN|OVC|VV|10):(\d{2})(?:\s+([+]?(?:\d+(?:\.\d*)?|\.\d+)))?"
     layers = list(re.finditer(pattern, text))
     valid = bool(layers) and not re.sub(pattern, "", text).strip()
@@ -162,11 +178,11 @@ def cloud_conditions(token):
     return cover, ceiling, 0, int(not ceiling_known and not no_ceiling), int(no_ceiling), int(obscured)
 
 
-def decode_weather(values):
+def decode_weather(values: dict[str, Any]) -> dict[str, Any]:
     """Return training values and flags from one report, never mixing timestamps."""
     result = {}
     # Iterate through continuous measurements; missing values default to flag=1.
-    for (source, output), flag in zip(NUMERIC_MEASUREMENTS.items(), MISSING_FLAGS):
+    for (source, output), flag in zip(NUMERIC_MEASUREMENTS.items(), NUMERIC_MISSING_FLAGS):
         value = number(values.get(source))
         if source not in {"HourlyDryBulbTemperature", "HourlyDewPointTemperature"}:
             value = value if value is not None and value >= 0 else None
@@ -210,3 +226,4 @@ def decode_weather(values):
         result["origin_cloud_obscured"],
     ) = cloud_conditions(values.get("HourlySkyConditions"))
     return result
+

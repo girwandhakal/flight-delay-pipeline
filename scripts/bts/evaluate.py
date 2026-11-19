@@ -2,28 +2,36 @@
 
 from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
 import sys
-from scripts.results import records, update_results
+from typing import Any, Optional, Union
 
 import pandas as pd
 from pyspark.ml import PipelineModel
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml.functions import vector_to_array
-from pyspark.sql import functions as F
+from pyspark.sql import DataFrame, SparkSession, functions as F
 
 ROOT = Path(__file__).resolve().parents[2]
 
+from scripts.results import records, update_results
 from .build_features import get_spark_session
 from .train import confusion_metrics
 
 TARGET_COL = "ArrDel15"
 
 
+def to_relative_posix(path: Path, root: Path = ROOT) -> str:
+    """Format path as a forward-slash relative path if within root, else return string."""
+    return str(path.relative_to(root)).replace("\\", "/") if path.is_relative_to(root) else str(path)
+
+
 def compute_subgroup_slice(
-    scores, group_col: str, subgroup_type: str, limit: int = None
-) -> list:
+    scores: DataFrame,
+    group_col: str,
+    subgroup_type: str,
+    limit: Optional[int] = None,
+) -> list[dict[str, Any]]:
     """Aggregate slice-based metrics inside Spark to avoid collecting full dataset into driver memory."""
     label = F.col(TARGET_COL)
     pred = F.col("prediction")
@@ -72,7 +80,7 @@ def compute_subgroup_slice(
     return subgroup_records
 
 
-def compute_subgroups(scores) -> pd.DataFrame:
+def compute_subgroups(scores: DataFrame) -> pd.DataFrame:
     """Compute slice-based error analysis across reporting airlines, top origin airports, and departure hours."""
     airline_records = compute_subgroup_slice(scores, "Reporting_Airline", "airline")
     origin_records = compute_subgroup_slice(scores, "Origin", "origin", limit=20)
@@ -81,12 +89,21 @@ def compute_subgroups(scores) -> pd.DataFrame:
     return pd.DataFrame(all_records)
 
 
-def save_evaluation_results(summary, subgroup_df, results_dir):
+def save_evaluation_results(
+    summary: dict[str, Any],
+    subgroup_df: pd.DataFrame,
+    results_dir: Path,
+) -> None:
     """Replace BTS test results while preserving other models and stages."""
     update_results({"bts": {"test": {**summary, "subgroups": records(subgroup_df)}}}, results_dir)
 
 
-def evaluate(spark, gold_dir=None, models_dir=None, results_dir=None) -> dict:
+def evaluate(
+    spark: SparkSession,
+    gold_dir: Optional[Union[str, Path]] = None,
+    models_dir: Optional[Union[str, Path]] = None,
+    results_dir: Optional[Union[str, Path]] = None,
+) -> dict[str, Any]:
     """Execute test evaluation for the frozen baseline pipeline model and decision threshold."""
     results_dir = Path(results_dir or ROOT / "results")
     results_path = results_dir / "results.json"
@@ -202,26 +219,14 @@ def evaluate(spark, gold_dir=None, models_dir=None, results_dir=None) -> dict:
         print("\n--- [Step 4/4] Performing Subgroup Error Analysis ---", flush=True)
         subgroup_df = compute_subgroups(scores)
 
-        # Assemble summary object.
-        rel_data_path = (
-            str(test_data_path.relative_to(ROOT)).replace("\\", "/")
-            if test_data_path.is_relative_to(ROOT)
-            else str(test_data_path)
-        )
-        rel_model_path = (
-            str(model_path.relative_to(ROOT)).replace("\\", "/")
-            if model_path.is_relative_to(ROOT)
-            else str(model_path)
-        )
-
         summary = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "evaluation_split": "test",
-            "data_path": rel_data_path,
+            "data_path": to_relative_posix(test_data_path),
             "total_records": total_records,
             "positive_records": positive_records,
             "delayed_prevalence": delayed_prevalence,
-            "model_path": rel_model_path,
+            "model_path": to_relative_posix(model_path),
             "selected_threshold": threshold,
             "metrics_at_selected_threshold": selected_metrics,
             "metrics_at_default_0_5": default_metrics,
@@ -240,7 +245,8 @@ def evaluate(spark, gold_dir=None, models_dir=None, results_dir=None) -> dict:
         scores.unpersist()
 
 
-def main():
+def main() -> int:
+    """Run baseline test evaluation and report metrics."""
     spark = get_spark_session("bts_evaluation")
     try:
         summary = evaluate(spark)

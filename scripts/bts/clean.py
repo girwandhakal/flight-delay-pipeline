@@ -1,31 +1,54 @@
 """Clean raw BTS CSV files into Silver Parquet matching Bronze folder structure."""
 
-import os
+"""Clean raw BTS CSV files into Silver Parquet matching Bronze folder structure."""
+
 from pathlib import Path
 import sys
+from typing import Optional, Union
 
 from scripts.results import records, update_results
 
 import pandas as pd
-from pyspark.sql import functions as F
+from pyspark.sql import SparkSession, functions as F
 
 from .build_features import get_spark_session as _get_spark_session
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def get_spark_session(app_name="bts_cleaning"):
+def get_spark_session(app_name: str = "bts_cleaning") -> SparkSession:
+    """Create or retrieve a Spark session configured for BTS cleaning."""
     return _get_spark_session(app_name=app_name)
 
 
 def clean_bts_data(
-    spark=None,
-    bronze_dir=None,
-    silver_dir=None,
-    results_dir=None,
-    quarantine_dir=None,
-    publish_results=True,
-):
+    spark: Optional[SparkSession] = None,
+    bronze_dir: Optional[Union[str, Path]] = None,
+    silver_dir: Optional[Union[str, Path]] = None,
+    results_dir: Optional[Union[str, Path]] = None,
+    quarantine_dir: Optional[Union[str, Path]] = None,
+    publish_results: bool = True,
+) -> pd.DataFrame:
+    """Clean and filter monthly BTS raw CSV files into typed Silver Parquet datasets.
+
+    Enforces domain validity rules:
+    - Retains only non-cancelled, non-diverted flights with confirmed binary arrival delay.
+    - Excludes flights with missing airline flight numbers.
+    - Quarantines flights with non-positive distance or duration.
+    - Generates a deterministic unique composite `flight_id`.
+    - Deduplicates exact duplicate flight keys.
+
+    Args:
+        spark: Active SparkSession instance.
+        bronze_dir: Directory containing raw BTS CSVs. Defaults to <ROOT>/data/bronze/bts.
+        silver_dir: Directory for cleaned Silver Parquet outputs. Defaults to <ROOT>/data/silver/bts.
+        results_dir: Directory for publishing results.json. Defaults to <ROOT>/results.
+        quarantine_dir: Directory for quarantined records. Defaults to <ROOT>/data/quarantine/bts.
+        publish_results: Whether to publish cleaning summary to results.json.
+
+    Returns:
+        Pandas DataFrame summarizing raw, excluded, and retained records by month.
+    """
     bronze_dir = Path(bronze_dir or ROOT / "data" / "bronze" / "bts")
     silver_dir = Path(silver_dir or ROOT / "data" / "silver" / "bts")
     quarantine_dir = Path(quarantine_dir or ROOT / "data" / "quarantine" / "bts")
@@ -44,7 +67,7 @@ def clean_bts_data(
 
         raw_df = spark.read.csv(str(csv_path), header=True)
 
-        # Clean string identifiers and pad schedule times to 4-character HHMM.
+        # Standardize string identifiers and pad scheduled times to 4-character HHMM
         crs_dep = F.lpad(F.trim(F.col("CRSDepTime")), 4, "0")
         crs_arr = F.lpad(F.trim(F.col("CRSArrTime")), 4, "0")
         flight_num = F.trim(F.col("Flight_Number_Reporting_Airline"))
@@ -53,24 +76,24 @@ def clean_bts_data(
         dest = F.trim(F.col("Dest"))
         flight_date = F.to_date(F.col("FlightDate"), "yyyy-MM-dd")
 
-        # Deterministic flight ID constructed from complete scheduled key.
+        # Deterministic unique flight ID constructed from complete scheduled key
         flight_id = F.concat_ws(
             "_", F.col("FlightDate"), airline, flight_num, origin, dest, crs_dep
         )
 
-        # Default missing Cancelled/Diverted to 1.0 so unconfirmed flights are safely excluded.
+        # Default missing Cancelled/Diverted to 1.0 so unconfirmed flights are safely excluded
         cancelled = F.coalesce(F.col("Cancelled").cast("double"), F.lit(1.0))
         diverted = F.coalesce(F.col("Diverted").cast("double"), F.lit(1.0))
         arr_del = F.col("ArrDel15").cast("double")
         distance = F.col("Distance").cast("double")
         elapsed_time = F.col("CRSElapsedTime").cast("double")
 
-        # Retain only non-cancelled, non-diverted flights with a confirmed binary arrival delay label.
+        # Retain only non-cancelled, non-diverted flights with confirmed binary arrival delay label
         is_eligible = (cancelled == 0.0) & (diverted == 0.0) & arr_del.isin([0.0, 1.0])
         has_flight_num = flight_num.isNotNull() & (flight_num != "")
         has_positive_dimensions = (distance > 0.0) & (elapsed_time > 0.0)
 
-        # Compute summary metrics and counts in a single pass over raw data.
+        # Compute summary metrics and counts in a single pass over raw data
         stats = raw_df.agg(
             F.count("*").alias("raw_count"),
             F.count(F.when(cancelled == 1.0, 1)).alias("canc_count"),
@@ -88,14 +111,14 @@ def clean_bts_data(
         eligible_df = raw_df.filter(is_eligible)
         valid_df = eligible_df.filter(has_flight_num & has_positive_dimensions)
 
-        # Quarantine records with non-positive distance or duration among eligible flights.
+        # Quarantine records with non-positive distance or duration among eligible flights
         if quarantine_count > 0:
             quarantine_df = eligible_df.filter(has_flight_num & ~has_positive_dimensions)
             dest_quarantine = quarantine_dir / year_str / month_str
             dest_quarantine.mkdir(parents=True, exist_ok=True)
             quarantine_df.write.mode("overwrite").parquet(str(dest_quarantine))
 
-        # Project typed silver schema and deduplicate identical flight IDs.
+        # Project typed silver schema and deduplicate identical flight IDs
         silver_df = (
             valid_df.select(
                 flight_id.alias("flight_id"),
@@ -114,9 +137,7 @@ def clean_bts_data(
                 F.lit(csv_path.name).alias("source_file"),
                 F.lit(int(year_str)).alias("Year"),
                 F.lit(int(month_str)).alias("Month"),
-            ).dropDuplicates(
-                ["flight_id"]
-            )  # Deduplicate exact complete keys if any repeats occur.
+            ).dropDuplicates(["flight_id"])
         )
 
         dest_month_dir = silver_dir / year_str / month_str
@@ -144,7 +165,8 @@ def clean_bts_data(
     return summary_pd
 
 
-def main(publish_results=True):
+def main(publish_results: bool = True) -> int:
+    """Clean BTS raw CSV files and display tabular summary."""
     spark = get_spark_session()
     try:
         summary = clean_bts_data(spark, publish_results=publish_results)
@@ -159,6 +181,7 @@ def main(publish_results=True):
         return 0
     finally:
         spark.stop()
+
 
 
 if __name__ == "__main__":
