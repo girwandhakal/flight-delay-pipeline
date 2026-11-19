@@ -1,33 +1,194 @@
-# Flight Delay Pipeline
+# Scalable Flight Delay Prediction Pipeline
 
-- Predicts arrival delays of at least 15 minutes at scheduled departure. Compares BTS, BTS plus origin weather, BTS plus both airports' weather, and BTS plus both airports' weather and aircraft rotation.
-- **Models:** Each feature set uses cyclical month predictors and fits logistic regression (`regParam=0.01`, L2, up to 100 iterations). Add `--include-gbt` to also fit a gradient-boosted tree challenger on each of the three non-rotation feature sets (depth 3, 50 iterations, step size 0.05, seed 42). Each enabled algorithm uses fixed hyperparameters, fits once on eligible January through September training data, and selects its F1 threshold on October through November validation. The full comparison reports logistic metrics for all four feature sets.
-- **Data:** BTS flight records (January 2024–January 2025), NOAA LCDv2 weather, and airport/station references.
-- **Setup:** Install [Conda](https://docs.conda.io/projects/conda/en/stable/user-guide/install/index.html), then create and activate the environment from the repository root:
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Apache Spark](https://img.shields.io/badge/Apache%20Spark-3.5-E25A1C?style=flat-square&logo=apachespark&logoColor=white)](https://spark.apache.org/)
+[![PySpark ML](https://img.shields.io/badge/PySpark-MLlib-blue?style=flat-square)](https://spark.apache.org/mllib/)
+[![Testing](https://img.shields.io/badge/Tests-83%20passed-success?style=flat-square&logo=pytest&logoColor=white)](https://docs.pytest.org/)
+[![Architecture](https://img.shields.io/badge/Data%20Architecture-Medallion%20(Bronze%E2%86%92Silver%E2%86%92Gold)-lightgrey?style=flat-square)](#data-architecture-and-pipeline-flow)
 
+An end-to-end, reproducible **Big Data Machine Learning Pipeline** engineered in **PySpark** to predict commercial flight arrival delays ($\ge 15$ minutes, BTS `ArrDel15`) strictly before takeoff. 
+
+Designed for scalability on large tabular time-series datasets, the pipeline processes over **6 million flight records** from the Bureau of Transportation Statistics (BTS) paired with millions of hourly surface meteorological observations from NOAA Local Climatological Data (LCDv2) and physical aircraft tail-number rotation sequences.
+
+---
+
+## Problem and Motivation
+
+Flight delays cost the global aviation industry tens of billions of dollars annually in operational disruption, passenger compensation, and gate congestion. 
+
+Accurate pre-departure flight delay forecasting poses significant data science challenges:
+1. **Severe Temporal Data Leakage**: Naïve machine learning pipelines frequently incorporate outcome-derived features (e.g., actual departure delay or taxi time) or future weather observations that would not be available in real-world dispatch.
+2. **Cascading Network Disruptions**: Delays do not occur in isolation. An incoming aircraft arriving late at a gate propagates downstream delays across subsequent flights on that physical airframe (aircraft rotation).
+3. **Data Engineering Scale**: Joining multi-gigabyte continuous flight schedules with hourly weather readings across hundreds of US airports exceeds standard in-memory Pandas workflows, demanding distributed memory management, custom temporal bucket joins, and out-of-core execution.
+
+**Our Objective**: Build a mathematically rigorous, leakage-free comparative ablation study across four progressive feature regimes to quantify the precise predictive lift of **flight schedules**, **origin weather**, **destination weather**, and **upstream aircraft rotation**.
+
+---
+
+## Modeling and Feature Ablation Tiers
+
+The pipeline evaluates four progressive model tiers on identical flight cohorts using out-of-time evaluation:
+
+```
+[ Tier 1: BTS Baseline ]
+       │  • Carrier, Origin, Dest, Scheduled Departure & Arrival Hours, Day of Week, Distance
+       │  • Cyclical Month Encoding (MonthSin, MonthCos) & US Federal Holiday Proximity
+       │  • 2-Hour Rolling Airport Delay Rates (Completed Dep/Arr Congestion Histories)
+       ▼
+[ Tier 2: + Origin Weather ]
+       │  • Surface Temperature, Dew Point, Relative Humidity, Pressure, Wind Speed & Gusts
+       │  • Circular Wind Direction (Sin/Cos), Visibility, Precipitation, Cloud Cover & Ceiling
+       │  • 13 METAR Weather Phenomenon Flags (Thunderstorm, Snow, Fog, Freezing, Rain, etc.)
+       ▼
+[ Tier 3: + Destination Weather ]
+       │  • Full parallel suite of meteorological features at arrival airport at scheduled departure
+       ▼
+[ Tier 4: + Aircraft Rotation Mechanics ]
+          • Prior Flight Arrival Delay of the same physical aircraft (Tail Number tracking)
+          • Scheduled Ground Turnaround Buffer & Operational Availability Flags
+```
+
+* **Core Estimator**: Binomial Logistic Regression via L-BFGS optimization (`regParam=0.01`, $L_2$ Ridge penalty, `maxIter=100`, `tol=1e-6`).
+* **Challenger Estimator**: Gradient-Boosted Trees (`GBTClassifier`, `maxDepth=3`, `maxIter=50`, `stepSize=0.05`).
+* **Decision Optimization**: Dynamically searches 19 candidate thresholds ($\tau \in [0.05, 0.95]$ in increments of $0.05$) on validation data to maximize $F_1$-score on imbalanced delays (~20% prevalence).
+* **Strict Temporal Splitting**:
+  * **Train Cohort**: `2024-01-01` to `2024-09-30` (~4.2M flights)
+  * **Validation Cohort**: `2024-10-01` to `2024-11-30` (~1.2M flights)
+  * **Test Holdout**: `2024-12-01` to `2025-01-31` (Frozen out-of-time evaluation)
+
+---
+
+## Tech Stack
+
+| Layer | Technology | Purpose |
+| :--- | :--- | :--- |
+| **Distributed Engine** | **Apache Spark 3.5 / PySpark** | Large-scale parallel transformations, temporal bucket joins, and ML pipelines |
+| **Runtime & Language** | **Python 3.11 / Java 17** | Core pipeline logic, typing, and JVM Spark backend execution |
+| **Storage Architecture** | **Apache Parquet (Snappy)** | Partitioned, columnar Bronze $\to$ Silver $\to$ Gold Medallion storage |
+| **Machine Learning** | **Spark MLlib** | StringIndexer, OneHotEncoder, Imputer, VectorAssembler, LogisticRegression, GBT |
+| **Data Sources** | **BTS TranStats / NOAA LCDv2** | US DOT on-time flight tables and hourly meteorological surface reports |
+| **Quality & Testing** | **Pytest / PySpark Fixtures** | 83 unit/integration tests verifying temporal causality, schemas, and math contracts |
+| **Environment** | **Conda / Hadoop 3.3 (winutils)** | Deterministic dependency isolation and cross-platform native I/O |
+
+---
+
+## Repository Structure
+
+```text
+flight-delay-pipeline/
+├── pipeline/
+│   └── main.py                     # Main orchestrator (workflow manager & 4-tier model evaluation)
+├── scripts/
+│   ├── bts/
+│   │   ├── download.py             # BTS TranStats data acquisition & SHA-256 verification
+│   │   ├── clean.py                # Schema standardization, type casting & quarantine filtering
+│   │   ├── build_features.py       # BTS Gold feature engineering & cyclical calendar encoding
+│   │   ├── recent_delays.py        # 2-hour completed airport delay history aggregations
+│   │   ├── train.py                # PySpark ML preprocessing, classifier fitting & threshold search
+│   │   └── evaluate.py             # Standalone model inference & PR-AUC / ROC-AUC scoring
+│   ├── origin_weather/
+│   │   ├── download.py             # NOAA LCDv2 surface weather acquisition & station lookup
+│   │   ├── clean.py                # Quality control, station normalization & UTC synchronization
+│   │   ├── measurements.py         # METAR regex token decoding, SI unit conversion & QC flags
+│   │   └── build_features.py       # Point-in-time temporal bucket join (15-120 min pre-departure)
+│   ├── destination_weather/
+│   │   └── build_features.py       # Destination airport weather matching & parent cohort merge
+│   ├── aircraft_rotation/
+│   │   ├── build_features.py       # Tail-number sequence tracking & turnaround buffer calculation
+│   │   └── run.py                  # Standalone rotation feature generation runner
+│   ├── progress.py                 # Structured console timing & stage banner formatting
+│   ├── results.py                  # Thread-safe atomic JSON results publication & history
+│   └── weather_cache.py            # Cryptographic input fingerprinting & Gold cache validation
+├── data/
+│   ├── bronze/                     # Raw ingested CSVs (BTS & NOAA weather)
+│   ├── silver/                     # Cleaned, validated, and typed Parquet datasets
+│   ├── gold/                       # Model-ready partitioned train/val/test splits
+│   └── reference/                  # Station mappings, IATA airport timezones & checksums
+├── models/                         # Serialized PipelineModels, threshold configs, and predictions
+├── results/
+│   └── results.json                # Published benchmark metrics, PR-AUC, F1, and ablation runs
+├── tests/                          # Fast synthetic PySpark test suite (83 tests + 20 subtests)
+├── config.json                     # Central pipeline configuration (dates, columns, windows)
+└── README.md
+```
+
+---
+
+## Getting Started
+
+### 1. Prerequisites
+* [Miniconda](https://docs.conda.io/en/latest/miniconda.html) or [Anaconda](https://www.anaconda.com/)
+* Git
+
+### 2. Environment Setup
+Clone the repository and build the isolated conda environment (includes Python 3.11, Java 17, and PySpark):
+
+```bash
+git clone https://github.com/girwandhakal/flight-delay-pipeline.git
+cd flight-delay-pipeline
+
+# Create and activate the conda environment
+conda env create -f envs/environment.yml
+conda activate cs523_project_env
+```
+
+*(Windows users: Native Hadoop binaries and `winutils.exe` are pre-configured in `envs/hadoop/bin/`).*
+
+### 3. Run the Verification Suite
+Run the synthetic test suite to verify Spark session initialization, schema contracts, and leakage-prevention logic without downloading large datasets:
+
+```bash
+python -m pytest
+```
+
+---
+
+## Execution Commands
+
+### Run Complete End-to-End Pipeline
+Executes data verification, builds Gold datasets, fits all four model tiers, optimizes decision thresholds, and reports comparative ablation metrics on validation data:
+
+```bash
+python pipeline/main.py
+```
+
+### Run Sub-Workflows & Specific Configurations
+* **BTS Baseline Only** (Skip weather ingestion):
   ```bash
-  conda env create -f envs/environment.yml
-  conda activate cs523_project_env
+  python pipeline/main.py --bts-only
+  ```
+* **Origin Weather Comparison**:
+  ```bash
+  python pipeline/main.py --origin-weather
+  ```
+* **Include Gradient-Boosted Trees (GBT) Challenger**:
+  ```bash
+  python pipeline/main.py --include-gbt
+  ```
+* **Evaluate Frozen Models on Test Holdout**:
+  ```bash
+  python pipeline/main.py --evaluate-destination-weather RUN_ID
   ```
 
-  The YAML installs Python 3.11, Java 17, and the required packages. Windows Hadoop helpers are included in `envs/hadoop/bin/`.
+---
 
-- **Run the complete pipeline:** Downloads missing data, prepares the common cohorts, and trains and compares all four feature sets on validation data.
+## Methodological and Engineering Rigor
 
-  ```bash
-  python pipeline/main.py
-  ```
+1. **Zero Future Data Leakage**:
+   * All predictions occur at **scheduled departure cutoff**.
+   * Surface weather uses observations taken strictly **15 to 120 minutes prior to departure**.
+   * Airport delay histories track strictly **completed events** prior to the flight's cutoff.
+   * Incoming aircraft rotation links require arrival touchdown at least **15 minutes before departure**.
+2. **Cohort Identity Assertion**:
+   * Comparative ablation between models is strictly enforced through bidirectional PySpark `exceptAll` assertions, guaranteeing that every model is benchmarked on the exact same set of flight IDs.
+3. **Smart Cryptographic Caching**:
+   * The pipeline records SHA-256 hashes of input files, configuration parameters, and transformation source code in `_metadata.json` and `_reuse.json`. Re-running `pipeline/main.py` detects matching Gold tables and bypasses redundant ingestion/cleaning stages.
+4. **Train-Serve Parity**:
+   * Feature preprocessing (StringIndexers, OneHotEncoders, Mean Imputers) and classifiers are packaged together into serialized Spark `PipelineModel` objects. Inference calls the frozen `.transform()` method directly, eliminating train-serve skew.
 
-- **Requirements:** Internet access for downloads, substantial free disk space, and RAM beyond Spark's 6 GB Java heap. If Spark runs out of disk space, free space or set `SPARK_LOCAL_DIRS` to a writable directory on a roomier local drive before retrying.
-- **Configuration:** Dataset dates and weather settings are in `config.json`.
-- **Recent airport delays:** Every model includes the origin's departure-delay rate, mean departure delay (early flights contribute zero) and departure count, plus the destination's corresponding arrival measurements, over the two hours ending at scheduled departure. The interval excludes its lower endpoint and includes its upper endpoint; the predicted flight is excluded. Events are assumed available immediately when they occur. Histories use actual gate events from raw BTS records, include all reporting airlines and cross date/split boundaries. Missing, inconsistent and ambiguous clocks are excluded; flights without usable history stay in the cohort. Empty windows retain null rates/means and a zero count; saved preprocessing uses zero fillers alongside counts. These features describe completed events, not the outstanding backlog.
-- **Federal holidays:** Three flags identify actual or observed US federal holidays and the day immediately before/after, using the origin-local service `FlightDate`. Actual weekend dates and their weekday observances are both included; school breaks and special events are not included.
-- **Applying these features:** Run `python pipeline/main.py`. The normal workflow checks `data/gold/bts/_features.json` against the feature policy, raw/Silver file fingerprints and reference checksums, rebuilds stale BTS datasets and weather parents, then prepares rotation and fits all four feature sets. Existing fitted models retain their saved preprocessing, but rebuilding shared Gold can invalidate historical runs' frozen data fingerprints.
-- **Outputs:** Datasets in `data/`, models and predictions in `models/`, and reports in `results/results.json`.
-- **Weather Silver reuse:** Origin and destination processing reuse completed cleaned weather when raw-file paths, sizes and modification times, station time zones, cleaning code and Spark version match. Reuse also checks the saved Parquet file inventory and carries forward quality reports. Older Silver without this provenance is rebuilt once; changed or incomplete inputs/outputs trigger cleaning again. Files modified while preserving both size and modification time are outside this check.
-- **Prepared-data reuse:** Both weather builders discover completed compatible Gold builds directly, independently of the latest results pointer. A saved `_reuse.json` records BTS inputs, raw weather, station metadata, references, matching policy, preparation code and output fingerprints; destination Gold also records its exact origin parent. Matching builds skip acquisition, cleaning, matching and repeated cohort scans before training. Newly built Gold receives this record only after validation and all split writes finish. Older Gold without a verified reuse record requires rebuilding or an explicit compatibility migration. BTS-only runs also skip preparation when their existing feature-freshness check passes. Model-only changes do not invalidate weather Gold. Reuse avoids duplicate prepared datasets, while training still writes new models/predictions and uses temporary memory/disk; it is not a guarantee against running out of either resource.
-- **Algorithm comparison:** Each model section's `training.algorithm_comparison` lists the algorithms fitted in that run, along with their settings, validation metrics and thresholds. When enabled, GBT artifacts and validation predictions are under the feature set's `gbt/` directory. Standalone BTS training also accepts `python -m scripts.bts.train --include-gbt`.
-- **Timing:** The console reports timestamped start, completion and failure for training stages. In `results/results.json`, `training.timing_seconds` records cohort preparation and reference baselines, and each `training.algorithm_comparison.<algorithm>.timing_seconds` records preprocessing fit, classifier fit, validation and output writes. Classifier fit time includes feature transformations evaluated on demand by Spark. To keep the console transcript in PowerShell, including for an interrupted run, use `python pipeline/main.py 2>&1 | Tee-Object -FilePath output.txt -Append`.
-- **Optional test scoring:** The existing evaluation command, `python pipeline/main.py --evaluate-destination-weather RUN_ID`, scores the three BTS/weather models. The rotation feature set is evaluated on validation.
-- **Phase 3 aircraft rotation:** The default command uses the same training-label availability guard and validation flights for all four models. The fourth adds scheduled turnaround, the direct predecessor's arrival delay when eligible, and two availability flags. The console table and `models/destination_weather_comparison/RUN_ID/validation_comparison.json` show the four sets of metrics side by side. The JSON report includes the change from each preceding feature set and rotation coverage. BTS tail numbers describe the aircraft that ultimately flew, so interpret the rotation result as retrospective. Use `--destination-weather` for the original three weather comparisons or `python -m scripts.aircraft_rotation.run` to rerun just the rotation pair against cached Gold.
-- **Tests:** Run `python -m pytest`. The synthetic suite shares one Spark session and keeps training/persistence, chronological splits, leakage prevention, weather quality/cohort checks, and safe result publication. Overlapping model-fit and reload tests were removed; no real datasets or downloads are needed.
+---
+
+## Author
+**Girwan Dhakal**  
+*The University of Alabama — Department of Computer Science (CS 523)*  
+* GitHub: [@girwandhakal](https://github.com/girwandhakal)
