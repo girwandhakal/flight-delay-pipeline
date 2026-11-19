@@ -3,10 +3,11 @@
 from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
+from typing import Any, Union
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pyspark import StorageLevel
-from pyspark.sql import functions as F
+from pyspark.sql import DataFrame, SparkSession, functions as F
 
 from scripts.origin_weather import build_features as origin
 from scripts.origin_weather.clean import clean_weather
@@ -22,7 +23,12 @@ DESTINATION_WEATHER_FLAGS = [name.replace("origin_", "destination_", 1) for name
 bts_fingerprints = origin.bts_fingerprints
 
 
-def validate_parent(directory, settings, policy, config):
+def validate_parent(
+    directory: Union[str, Path],
+    settings: dict[str, Any],
+    policy: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
     """Reject stale parent data without hashing raw weather or inspecting test labels."""
     directory = Path(directory).resolve()
     if not directory.is_relative_to((ROOT / "data/gold/bts_origin_weather").resolve()):
@@ -44,22 +50,12 @@ def validate_parent(directory, settings, policy, config):
     return metadata
 
 
-def validate_parent_data(spark, directory, config):
-    expected = {name: "double" for name in origin.WEATHER_NUMERIC}
-    expected.update({name: "int" for name in origin.WEATHER_FLAGS})
-    expected["scheduled_departure_utc"] = "timestamp"
-    for split in config["splits"]:
-        frame = spark.read.parquet(str(Path(directory) / split))
-        actual = dict(frame.dtypes)
-        if any(actual.get(name) != dtype for name, dtype in expected.items()):
-            raise ValueError(f"Parent Gold has an outdated schema in {split}.")
-        bts = spark.read.parquet(str(ROOT / "data/gold/bts" / split))
-        if frame.select(bts.columns).schema != bts.schema:
-            raise ValueError(f"Parent BTS column types changed in {split}.")
-        origin.validate_cohort(bts, frame, **config["origin_weather"])
-
-
-def build_destination_cutoffs(spark, flights, references):
+def build_destination_cutoffs(
+    spark: SparkSession,
+    flights: DataFrame,
+    references: tuple[list[dict[str, str]], list[dict[str, str]]],
+) -> DataFrame:
+    """Attach destination station ID, time zone, and mapping method to flights."""
     spark.conf.set("spark.sql.session.timeZone", "UTC")
     airports, mappings = references
     by_airport, by_mapping = {}, {}
@@ -104,11 +100,23 @@ def build_destination_cutoffs(spark, flights, references):
     )
 
 
-def build_destination_features(cutoffs, observations, manifest, **policy):
+def build_destination_features(
+    cutoffs: DataFrame,
+    observations: DataFrame,
+    manifest: dict[str, Any],
+    **policy: Any,
+) -> DataFrame:
+    """Enrich flights with destination weather observations at the scheduled departure instant."""
     return origin.build_weather_features(cutoffs, observations, manifest, prefix="destination", **policy)
 
 
-def validate_destination_cohort(original, enriched, max_age_minutes=120, publication_lag_minutes=0):
+def validate_destination_cohort(
+    original: DataFrame,
+    enriched: DataFrame,
+    max_age_minutes: int = 120,
+    publication_lag_minutes: int = 0,
+) -> None:
+    """Verify that destination enrichment preserved parent flight cohort and predictor values."""
     if original.schema != enriched.select(original.columns).schema:
         raise ValueError("Destination enrichment changed parent columns or types.")
     for frame in (original, enriched):
@@ -150,16 +158,22 @@ def validate_destination_cohort(original, enriched, max_age_minutes=120, publica
         raise ValueError("Destination observation or missing-report semantics violate the cutoff contract.")
 
 
-def main(origin_gold_dir):
+def main(origin_gold_dir: Union[str, Path]) -> tuple[Path, Path]:
+    """Execute end-to-end destination weather enrichment on the origin-weather Gold dataset."""
+    from scripts.weather_cache import find_gold, input_identity, save_gold
     from scripts.progress import stage as progress_stage
     from scripts.bts.build_features import get_spark_session
 
     settings, policy, config = load_config()
+    cached = find_gold(ROOT, settings, policy, config, origin_gold_dir)
+    if cached is not None:
+        return cached, cached
     parent = validate_parent(origin_gold_dir, settings, policy, config)
     reference = project_path(ROOT, config["destination_weather"]["reference_directory"])
     if reference == settings["reference_directory"]:
         raise ValueError("Destination references must have a separate scope.")
     spark = get_spark_session("destination_weather_features")
+    enriched = None
     try:
         with progress_stage("Destination weather: validate the origin-weather parent cohort"):
             flights = spark.read.parquet(*[str(Path(origin_gold_dir) / split) for split in config["splits"]])
@@ -198,6 +212,7 @@ def main(origin_gold_dir):
             # Combine destination requests with origin requests to ensure unified cache coverage in single fetch pass.
             requests += origin.required_station_years(flights, policy["max_age_minutes"])
             manifest = download_weather(requests, settings["output_directory"])
+        cache_inputs = input_identity(ROOT, settings, policy, config, origin_gold_dir)
         build_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         gold = ROOT / "data/gold/bts_origin_destination_weather" / build_id
         silver = ROOT / "data/silver/weather" / build_id
@@ -264,7 +279,12 @@ def main(origin_gold_dir):
                 ],
             }
             write_json(gold / "_metadata.json", metadata)
+            if input_identity(ROOT, settings, policy, config, origin_gold_dir) != cache_inputs:
+                raise ValueError("Weather inputs changed while building destination Gold.")
+            save_gold(gold, cache_inputs)
         return gold, gold
     finally:
+        if enriched is not None:
+            enriched.unpersist(blocking=True)
         spark.catalog.clearCache()
         spark.stop()

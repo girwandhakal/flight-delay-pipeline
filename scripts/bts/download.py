@@ -16,31 +16,80 @@ ROOT = Path(__file__).resolve().parents[2]
 BTS_URL = "https://transtats.bts.gov/PREZIP/On_Time_Reporting_Carrier_On_Time_Performance_1987_present_{year}_{month}.zip"
 
 
-# Return every year and month in the requested range, including both endpoints.
-def iter_months(start_month, end_month):
+"""Download and extract an inclusive range of monthly BTS flight files."""
+
+from collections.abc import Iterator
+from datetime import datetime
+import json
+from pathlib import Path
+import shutil
+import time
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+import zipfile
+
+from tqdm import tqdm
+
+ROOT = Path(__file__).resolve().parents[2]
+
+BTS_URL = (
+    "https://transtats.bts.gov/PREZIP/"
+    "On_Time_Reporting_Carrier_On_Time_Performance_1987_present_{year}_{month}.zip"
+)
+
+
+def iter_months(start_month: str, end_month: str) -> Iterator[tuple[int, int]]:
+    """Yield every (year, month) tuple in the requested inclusive range.
+
+    Args:
+        start_month: Start month string in 'YYYY-MM' format.
+        end_month: End month string in 'YYYY-MM' format.
+
+    Yields:
+        Tuple of (year, month) integers.
+
+    Raises:
+        ValueError: If dates are not in YYYY-MM format, start year is before 1987,
+            or start date is after end date.
+    """
     start = datetime.strptime(start_month, "%Y-%m")
     end = datetime.strptime(end_month, "%Y-%m")
-    # Parsing accepts unpadded months, so check the spelling too.
+
+    # Parsing accepts unpadded months, so check exact string representation
     if start.strftime("%Y-%m") != start_month or end.strftime("%Y-%m") != end_month:
         raise ValueError("Months must use YYYY-MM format.")
     if start.year < 1987 or start > end:
         raise ValueError(
             "BTS range must start in 1987 or later and end on or after its start."
         )
+
     year, month = start.year, start.month
     while (year, month) <= (end.year, end.month):
         yield year, month
-        # December rolls into January of the following year.
+        # December rolls into January of the subsequent year
         year, month = (year + 1, 1) if month == 12 else (year, month + 1)
 
 
-# Read the BTS download settings and check the dates and output folder.
-def load_config(root=ROOT):
+def load_config(root: Path = ROOT) -> dict[str, Any]:
+    """Read BTS download settings and validate configured date range and directory.
+
+    Args:
+        root: Project root path. Defaults to ROOT.
+
+    Returns:
+        BTS configuration dictionary.
+
+    Raises:
+        ValueError: If output directory is absolute or escapes the project root.
+    """
     settings = json.loads((root / "config.json").read_text(encoding="utf-8"))[
         "datasets"
     ]["bts"]
-    # Run the generator now so invalid dates fail before any files are written.
+
+    # Validate the full month sequence before creating any directories
     list(iter_months(settings["start_month"], settings["end_month"]))
+
     directory = Path(settings.setdefault("output_directory", "data/bronze/bts"))
     if directory.is_absolute() or not (root / directory).resolve().is_relative_to(
         root.resolve()
@@ -51,13 +100,23 @@ def load_config(root=ROOT):
     return settings
 
 
-# Build the official BTS ZIP address for one month.
-def build_download_url(year, month):
+def build_download_url(year: int, month: int) -> str:
+    """Build the official BTS ZIP download URL for a given year and month."""
     return BTS_URL.format(year=year, month=month)
 
 
-# Check that the ZIP is readable and contains exactly one CSV.
-def validate_archive(path):
+def validate_archive(path: Path) -> zipfile.ZipInfo:
+    """Verify ZIP file integrity and ensure it contains exactly one CSV member.
+
+    Args:
+        path: Path to the ZIP archive.
+
+    Returns:
+        ZipInfo member for the flight CSV.
+
+    Raises:
+        ValueError: If ZIP is corrupted or contains other than one CSV file.
+    """
     with zipfile.ZipFile(path) as archive:
         bad_member = archive.testzip()
         if bad_member is not None:
@@ -74,10 +133,19 @@ def validate_archive(path):
         return members[0]
 
 
-# Download a missing ZIP, retry temporary failures, and keep incomplete files separate.
-def download_file(url, destination):
+def download_file(url: str, destination: Path) -> Path:
+    """Download a remote ZIP file with retries and atomic staging.
+
+    Args:
+        url: Remote URL to download.
+        destination: Final destination Path for the archive.
+
+    Returns:
+        Destination Path once verified and renamed.
+    """
     if destination.exists():
         return destination
+
     temporary = destination.with_suffix(".zip.part")
     for attempt in range(3):
         try:
@@ -96,15 +164,18 @@ def download_file(url, destination):
                     unit_scale=True,
                 ) as progress:
                     shutil.copyfileobj(response, progress, length=1024 * 1024)
+
             if expected_size and temporary.stat().st_size != int(expected_size):
                 raise ValueError("Download size differs from Content-Length")
+
+            # Validate ZIP structure prior to committing the downloaded file
             validate_archive(temporary)
-            # Give the file its final name only after the download passes ZIP checks.
             temporary.replace(destination)
             return destination
+
         except (OSError, URLError, ValueError, zipfile.BadZipFile) as error:
             temporary.unlink(missing_ok=True)
-            # Retry rate limits and temporary server errors, but stop on errors such as 404.
+            # Retry transient rate limits or 5xx server errors; re-raise permanent 4xx errors
             if isinstance(error, HTTPError) and error.code not in (
                 429,
                 500,
@@ -119,10 +190,19 @@ def download_file(url, destination):
             time.sleep(2 ** (attempt + 1))
 
 
-# Extract the flight CSV and delete its ZIP only after extraction succeeds.
-def extract_csv(zip_path, destination):
+def extract_csv(zip_path: Path, destination: Path) -> Path:
+    """Extract the flight CSV from a ZIP archive and delete the ZIP on success.
+
+    Args:
+        zip_path: Source ZIP archive path.
+        destination: Target CSV output path.
+
+    Returns:
+        Destination Path of the extracted CSV.
+    """
     if destination.exists():
         return destination
+
     member = validate_archive(zip_path)
     temporary = destination.with_suffix(".csv.part")
     try:
@@ -131,18 +211,19 @@ def extract_csv(zip_path, destination):
             archive.open(member) as source,
             temporary.open("wb") as output,
         ):
-            # Fixed destination prevents archive paths from escaping the month folder.
             shutil.copyfileobj(source, output)
+
         temporary.replace(destination)
-        # Keep the ZIP if extraction fails so the original data is still available.
+        # Delete the ZIP only after extraction completes successfully to save disk space
         zip_path.unlink()
     finally:
         temporary.unlink(missing_ok=True)
+
     return destination
 
 
-# Process each requested month and report which months completed, skipped, or failed.
-def main():
+def main() -> int:
+    """Execute the full BTS monthly acquisition process based on config.json."""
     settings = load_config()
     for layer in ("bronze", "silver", "gold", "quarantine"):
         (ROOT / "data" / layer / "bts").mkdir(parents=True, exist_ok=True)
@@ -169,6 +250,7 @@ def main():
                 print(f"  Reusing BTS archive {zip_path} because it already exists.", flush=True)
             else:
                 print(f"  Downloading BTS archive {zip_path} from {url}", flush=True)
+
             download_file(url, zip_path)
             print(f"  Extracting BTS file {csv_path}", flush=True)
             extract_csv(zip_path, csv_path)
@@ -193,6 +275,7 @@ def main():
         print("  Failed months: " + ", ".join(failed))
     print("-" * 80)
     return 1 if failed else 0
+
 
 
 if __name__ == "__main__":

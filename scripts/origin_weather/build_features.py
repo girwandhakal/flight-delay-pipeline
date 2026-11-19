@@ -4,12 +4,12 @@ import csv
 from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
+from typing import Any, Optional, Union
 from zoneinfo import ZoneInfo
 
-from pyspark.sql import functions as F, types as T, Window
+from pyspark.sql import DataFrame, SparkSession, Window, functions as F, types as T
 
 from scripts.results import records, update_results
-
 from .download import ROOT, load_config, standard_offset, write_json
 from .measurements import NUMERIC_FEATURES, MISSING_FLAGS, INDICATOR_FLAGS, FEATURE_COLUMNS
 
@@ -17,7 +17,11 @@ WEATHER_NUMERIC = [*NUMERIC_FEATURES, "origin_weather_age_minutes"]
 WEATHER_FLAGS = ["origin_weather_missing", *MISSING_FLAGS, *INDICATOR_FLAGS]
 
 
-def load_references(directory, prefix="origin"):
+def load_references(
+    directory: Union[str, Path],
+    prefix: str = "origin",
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Load airports.csv and airport_station.csv mappings and validate interval validity."""
     validate_prefix(prefix)
     directory = Path(directory)
     with (directory / "airports.csv").open(encoding="utf-8", newline="") as stream:
@@ -56,7 +60,12 @@ def load_references(directory, prefix="origin"):
     return airports, mappings
 
 
-def local_cutoff(flight_date, clock, zone):
+def local_cutoff(
+    flight_date: Optional[date],
+    clock: Optional[Union[int, str]],
+    zone: Optional[str],
+) -> tuple[Optional[datetime], str]:
+    """Convert local scheduled departure time to UTC, rejecting DST ambiguity or gaps."""
     if flight_date is None or clock is None or not zone:
         return None, "invalid_cutoff"
     spelling = str(clock).strip()
@@ -68,11 +77,11 @@ def local_cutoff(flight_date, clock, zone):
     local = datetime.combine(flight_date, datetime.min.time()) + timedelta(
         hours=hours, minutes=minutes
     )
-    zone = ZoneInfo(zone)
+    zone_info = ZoneInfo(zone)
     candidates = set()
     for fold in (0, 1):
-        utc = local.replace(tzinfo=zone, fold=fold).astimezone(timezone.utc)
-        if utc.astimezone(zone).replace(tzinfo=None) == local:
+        utc = local.replace(tzinfo=zone_info, fold=fold).astimezone(timezone.utc)
+        if utc.astimezone(zone_info).replace(tzinfo=None) == local:
             candidates.add(utc)
     # A DST gap or repeated clock has no uniquely defensible departure instant.
     if len(candidates) != 1:
@@ -80,7 +89,12 @@ def local_cutoff(flight_date, clock, zone):
     return candidates.pop().replace(tzinfo=None), "valid"
 
 
-def build_flight_cutoffs(spark, flights, references):
+def build_flight_cutoffs(
+    spark: SparkSession,
+    flights: DataFrame,
+    references: tuple[list[dict[str, str]], list[dict[str, str]]],
+) -> DataFrame:
+    """Attach airport time zone, mapped station ID, and UTC departure timestamp to flights."""
     spark.conf.set("spark.sql.session.timeZone", "UTC")
     airports, mappings = references
     airport_df = spark.createDataFrame(
@@ -133,7 +147,12 @@ def build_flight_cutoffs(spark, flights, references):
     )
 
 
-def required_station_years(cutoffs, max_age_minutes, prefix="origin"):
+def required_station_years(
+    cutoffs: DataFrame,
+    max_age_minutes: int,
+    prefix: str = "origin",
+) -> list[tuple[str, int, str]]:
+    """Determine all (station_id, year, timezone) tuples needed to cover the flight cutoffs."""
     validate_prefix(prefix)
     cutoffs = cutoffs.select(
         "scheduled_departure_utc",
@@ -171,12 +190,13 @@ def required_station_years(cutoffs, max_age_minutes, prefix="origin"):
     return requests
 
 
-def validate_prefix(prefix):
+def validate_prefix(prefix: str) -> None:
+    """Validate that weather role prefix is either 'origin' or 'destination'."""
     if prefix not in ("origin", "destination"):
         raise ValueError("Weather role must be origin or destination.")
 
 
-def bts_fingerprints():
+def bts_fingerprints() -> list[dict[str, Any]]:
     """Return provenance fingerprints (relative path, size, mtime) for all BTS Gold parquet files."""
     return [
         {
@@ -188,14 +208,26 @@ def bts_fingerprints():
     ]
 
 
-def build_origin_features(cutoffs, observations, manifest, max_age_minutes=120, publication_lag_minutes=0):
+def build_origin_features(
+    cutoffs: DataFrame,
+    observations: DataFrame,
+    manifest: dict[str, Any],
+    max_age_minutes: int = 120,
+    publication_lag_minutes: int = 0,
+) -> DataFrame:
     """Enrich flight cutoffs with origin weather observations matching the configured time policy."""
     return build_weather_features(cutoffs, observations, manifest, max_age_minutes, publication_lag_minutes)
 
 
 def build_weather_features(
-    cutoffs, observations, manifest, max_age_minutes=120, publication_lag_minutes=0, prefix="origin"
-):
+    cutoffs: DataFrame,
+    observations: DataFrame,
+    manifest: dict[str, Any],
+    max_age_minutes: int = 120,
+    publication_lag_minutes: int = 0,
+    prefix: str = "origin",
+) -> DataFrame:
+    """Match the latest eligible weather observation within policy age/lag to each flight."""
     validate_prefix(prefix)
     observation = "observation_utc" if prefix == "origin" else "destination_observation_utc"
     source = "source_file" if prefix == "origin" else "destination_source_file"
@@ -207,7 +239,8 @@ def build_weather_features(
     weather = observations.withColumn(
         "weather_hour", F.floor(F.col("observation_utc").cast("long") / 3600)
     ).alias("weather")
-    # Hour buckets bound candidate expansion before the exact timestamp checks.
+    # Integer hour buckets (floor of epoch seconds / 3600) bound candidate expansion
+    # before exact timestamp checks, enabling a scalable merge join.
     flights = cutoffs.select(
         "flight_id", f"{prefix}_station_id", "scheduled_departure_utc"
     ).withColumn(
@@ -339,8 +372,11 @@ def build_weather_features(
 
 
 def validate_cohort(
-    original, enriched, max_age_minutes=120, publication_lag_minutes=0
-):
+    original: DataFrame,
+    enriched: DataFrame,
+    max_age_minutes: int = 120,
+    publication_lag_minutes: int = 0,
+) -> None:
     """Verify that weather enrichment preserved flight identities, count, and predictor values."""
     for frame in (original, enriched):
         stats = frame.agg(
@@ -376,13 +412,20 @@ def validate_cohort(
         raise ValueError("Selected weather violates age/lag bounds.")
 
 
-def main(publish_results=True):
+def main(publish_results: bool = True) -> tuple[Path, Path]:
+    """Execute end-to-end origin weather enrichment pipeline on BTS Gold cohorts."""
+    from scripts.weather_cache import find_gold, input_identity, save_gold
     from scripts.progress import stage as progress_stage
     from scripts.bts.build_features import get_spark_session
     from .clean import clean_weather
     from .download import download_weather, prepare_references
 
     settings, policy, config = load_config()
+    cached = find_gold(ROOT, settings, policy, config)
+    if cached is not None:
+        if publish_results:
+            update_results({"bts_origin_weather": {"data": json.loads((cached / "_metadata.json").read_text())}})
+        return cached, cached
     spark = get_spark_session("origin_weather_features")
     try:
         flights = spark.read.parquet(
@@ -402,6 +445,7 @@ def main(publish_results=True):
                 required_station_years(cutoffs, policy["max_age_minutes"]),
                 settings["output_directory"],
             )
+        cache_inputs = input_identity(ROOT, settings, policy, config)
         build_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         gold = ROOT / "data/gold/bts_origin_weather" / build_id
         report = ROOT / "data/silver/weather" / build_id
@@ -449,6 +493,9 @@ def main(publish_results=True):
                     "bts_input_files": bts_fingerprints(),
                 },
             )
+            if input_identity(ROOT, settings, policy, config) != cache_inputs:
+                raise ValueError("Weather inputs changed while building origin Gold.")
+            save_gold(gold, cache_inputs)
             if publish_results:
                 update_results({"bts_origin_weather": {"data": json.loads((gold / "_metadata.json").read_text())}})
         return gold, gold

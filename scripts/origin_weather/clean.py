@@ -1,13 +1,13 @@
 """Normalize downloaded LCDv2 reports into UTC observations and retain rejection counts."""
 
 from datetime import datetime, timezone
-from pathlib import Path
 import json
+from pathlib import Path
+from typing import Any, Union
+
+from pyspark.sql import DataFrame, SparkSession, Window, functions as F, types as T
 
 from scripts.results import records, update_results
-
-from pyspark.sql import functions as F, types as T, Window
-
 from .download import (
     ROOT,
     REPORTS,
@@ -22,8 +22,8 @@ from .measurements import (
 )
 
 
-def file_fingerprints(paths):
-    # shortcut: size/mtime detect ordinary edits; use content hashes if files can preserve both.
+def file_fingerprints(paths: list[Path]) -> list[dict[str, Any]]:
+    """Capture file sizes and modification timestamps to detect changes without full hashing."""
     return [
         {"path": str(path.resolve()), "bytes": path.stat().st_size,
          "modified_ns": path.stat().st_mtime_ns}
@@ -31,7 +31,15 @@ def file_fingerprints(paths):
     ]
 
 
-def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, report_dir):
+def clean_weather(
+    spark: SparkSession,
+    bronze_dir: Union[str, Path],
+    silver_dir: Union[str, Path],
+    quarantine_dir: Union[str, Path],
+    manifest: dict[str, Any],
+    report_dir: Union[str, Path],
+) -> DataFrame:
+    """Clean and decode raw Bronze LCDv2 CSVs into partitioned Silver observations."""
     if not manifest.get("complete"):
         raise ValueError("Weather acquisition is incomplete.")
     entries = [
@@ -60,14 +68,19 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
             ):
                 continue
             cached = metadata.get("cleaning_cache", {})
-            if (not isinstance(cached, dict) or cached.get("inputs") != cache_inputs
-                    or not (candidate.parent / "_SUCCESS").is_file()
-                    or not cached.get("outputs")
-                    or cached["outputs"] != file_fingerprints(candidate.parent.rglob("*.parquet"))):
+            if not isinstance(cached, dict):
+                continue
+            inputs_match = cached.get("inputs") == cache_inputs
+            has_success_marker = (candidate.parent / "_SUCCESS").is_file()
+            cached_outputs = cached.get("outputs")
+            outputs_match = bool(cached_outputs) and cached_outputs == file_fingerprints(
+                candidate.parent.rglob("*.parquet")
+            )
+            if not (inputs_match and has_success_marker and outputs_match):
                 continue
         except (OSError, ValueError):
             continue
-        clean = spark.read.parquet(str(candidate.parent))
+        clean = spark.read.parquet(str(candidate.parent), pathGlobFilter="*.parquet")
         write_json(Path(report_dir) / "_metadata.json", metadata)
         print(f"Reusing cleaned weather Silver from {candidate.parent} because inputs and cleaning code match.", flush=True)
         return clean
@@ -191,7 +204,7 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
             .withColumn("month", F.month("observation_utc"))
         )
         observations.write.partitionBy("year", "month").parquet(str(silver_dir))
-        clean = spark.read.parquet(str(silver_dir))
+        clean = spark.read.parquet(str(silver_dir), pathGlobFilter="*.parquet")
         stats["retained_observations"] = clean.count()
         eligible = parsed.filter(~invalid & F.col("REPORT_TYPE").isin(REPORTS)).count()
         stats["duplicate_observations"] = eligible - stats["retained_observations"]
@@ -255,7 +268,8 @@ def clean_weather(spark, bronze_dir, silver_dir, quarantine_dir, manifest, repor
         parsed.unpersist(blocking=True)
 
 
-def main():
+def main() -> int:
+    """Clean and validate raw Bronze weather data into Silver observation tables."""
     from scripts.bts.build_features import get_spark_session
 
     settings, _, _ = load_config()
