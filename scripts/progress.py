@@ -14,6 +14,13 @@ import time
 from typing import Any, Optional
 
 
+def print_progress(label: str, completed: int, total: int) -> None:
+    """Print a progress snapshot that stays readable alongside stage logs."""
+    filled = 24 * completed // total
+    bar = "#" * filled + "-" * (24 - filled)
+    print(f"  {label} [{bar}] {completed}/{total} ({completed / total:.0%})", flush=True)
+
+
 @contextmanager
 def stage(
     title: str,

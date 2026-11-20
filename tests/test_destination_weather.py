@@ -18,6 +18,7 @@ from scripts.destination_weather import build_features as destination
 from scripts.origin_weather import build_features as origin, download
 from scripts.origin_weather.measurements import FEATURE_COLUMNS, NUMERIC_FEATURES, SOURCE_FIELDS, decode_weather
 from scripts.results import update_results
+from scripts.weather_cache import resolve_stage
 
 
 class DestinationTests(unittest.TestCase):
@@ -186,7 +187,7 @@ class DestinationTests(unittest.TestCase):
                   patch.object(pipeline.bts_transform, "get_spark_session") as session,
                   patch.object(pipeline.rotation, "rotation_raw_files", return_value=[]),
                   patch.object(pipeline.rotation, "source_identity", return_value={}),
-                  patch.object(pipeline.rotation, "prepare_rotation", return_value={"coverage": []}) as prepare,
+                  patch.object(pipeline.rotation, "prepare_rotation", return_value={"coverage": [], "training_gold": str(root / "cached-rotation")}) as prepare,
                   patch.object(train, "train", side_effect=lambda *args, **kwargs: dict(summary)) as fit,
                   patch.object(pipeline, "compare_predictions", return_value=updates) as compare,
                   patch.object(pipeline, "update_results") as publish,
@@ -197,7 +198,7 @@ class DestinationTests(unittest.TestCase):
                 prepared_dir = prepare.call_args.args[-1]
                 self.assertEqual(prepare.call_args.args[-3], combined_gold)
                 self.assertEqual([call.kwargs["feature_set"] for call in fit.call_args_list], list(variants))
-                self.assertEqual({call.args[1] for call in fit.call_args_list}, {prepared_dir / "gold"})
+                self.assertEqual({call.args[1] for call in fit.call_args_list}, {root / "cached-rotation"})
                 self.assertEqual([call.args[2].name for call in fit.call_args_list],
                                  ["bts", "origin", "both", "rot"])
                 self.assertTrue(all(call.kwargs["model_name"] == "model" for call in fit.call_args_list))
@@ -209,7 +210,7 @@ class DestinationTests(unittest.TestCase):
                     session.return_value, root, {"splits": {}}, combined_gold, prepared_dir.name,
                 )
                 fit_enroute.assert_called_once_with(
-                    session.return_value, root, prepared_dir, combined_gold, "prepared forecasts", summary,
+                    session.return_value, root, prepared_dir, combined_gold, "prepared forecasts", summary, root / "cached-rotation",
                 )
                 session.return_value.stop.assert_called_once_with()
                 fit.side_effect = [summary, summary, summary, RuntimeError("fourth fit failed")]
@@ -263,8 +264,18 @@ class DestinationTests(unittest.TestCase):
             models.mkdir(parents=True)
             (models / "_SUCCESS").touch()
             dirs = {variant: root / "data/gold" / variant for variant in train.FEATURE_SETS}
+            if not legacy:
+                # The frozen run must keep reading A after a later run selects B.
+                base = root / "data/gold/bts_generations"
+                def build(path):
+                    (path / "test").mkdir()
+                    (path / "test/_SUCCESS").touch()
+                    (path / "test/part.parquet").write_bytes(path.name.encode())
+                dirs["bts"] = resolve_stage(base, lambda: {"source": "A"}, ("test",), (), build)
+                latest = resolve_stage(base, lambda: {"source": "B"}, ("test",), (), build)
+                (base / "_current.json").write_text(json.dumps(latest.name))
             for variant, path in dirs.items():
-                path.mkdir(parents=True)
+                path.mkdir(parents=True, exist_ok=True)
                 (path / "_metadata.json").write_text("{}")
                 model = models / (variant if legacy else variant_dirs[variant]) / model_name
                 expected_models.append(model)
@@ -276,7 +287,7 @@ class DestinationTests(unittest.TestCase):
             run = {"run_id": "frozen", "models_dir": str(models),
                    "data_dirs": {v: str(p) for v, p in dirs.items()},
                    "inference_sha256": hashes,
-                   "data_fingerprints": {v: [] for v in dirs},
+                   "data_fingerprints": {v: pipeline.data_fingerprints(p) for v, p in dirs.items()},
                    "data_metadata_sha256": {v: download.sha256(p / "_metadata.json") for v, p in dirs.items() if v != "bts"},
                    "thresholds": {v: .6 for v in dirs}, "training_prevalence": {v: .25 for v in dirs}}
             (models / "run.json").write_text(json.dumps(run))
@@ -298,6 +309,7 @@ class DestinationTests(unittest.TestCase):
                   patch.object(pipeline, "compare_predictions", return_value={v: {"test": {}} for v in dirs}),
                   patch.object(pipeline, "update_results") as publish):
                 self.assertEqual(pipeline.evaluate_destination_weather("frozen"), 0)
+                session.return_value.read.parquet.assert_any_call(str(dirs["bts"] / "test"))
                 self.assertEqual([Path(call.args[0]) for call in load.call_args_list], expected_models)
                 self.assertEqual(
                     [Path(call.args[0]).parent.name for call in scores.write.parquet.call_args_list],
@@ -416,7 +428,7 @@ class DestinationSparkTests(unittest.TestCase):
         columns = train.INPUT_FEATURES
         fitting = self.spark.createDataFrame([
             ("AA", "ORD", "LAX", 1, 1, 12, 15, 120.0, 800.0,
-             0.25, 8.0, 4.0, 0.5, 10.0, 6.0, 18.0, 5.0, 3, 0, 0, 0),
+             0.25, 8.0, 4.0, 0.5, 10.0, 6.0, 18.0, 5.0, 3, 0, 0, 0, 0.2, 3, 1.0, 0.4, 4, 0.5),
         ], columns)
         for name in origin.WEATHER_NUMERIC:
             fitting = fitting.withColumn(name, F.lit(10.0))
@@ -431,7 +443,14 @@ class DestinationSparkTests(unittest.TestCase):
         validation = validation.withColumn("origin_temperature_c", F.lit(None).cast("double")).withColumn("Month", F.lit(12))
         for name in train.ROLLING_FEATURES:
             validation = validation.withColumn(name, F.lit(None).cast("double"))
+        validation = (validation.withColumn("origin_upstream_delay_pressure", F.lit(None).cast("double"))
+                      .withColumn("origin_upstream_scheduled_arrivals", F.lit(None).cast("long"))
+                      .withColumn("dest_upstream_delay_pressure", F.lit(0.0)))
         row = model.transform(validation).first()
+        self.assertEqual(row.origin_upstream_delay_pressure_filled, 0)
+        self.assertEqual(row.origin_upstream_scheduled_arrivals_filled, -1)
+        self.assertEqual(row.origin_upstream_pressure_missing, 1)
+        self.assertEqual(row.dest_upstream_pressure_missing, 0)
         vector = row.features.toArray().tolist()
         self.assertEqual(row.Reporting_Airline_idx, len(model.stages[0].labelsArray[0]))
         self.assertNotIn("Month", model.stages[0].getInputCols())

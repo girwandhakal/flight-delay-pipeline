@@ -5,10 +5,20 @@ import io
 import unittest
 from unittest.mock import patch
 
-from scripts.progress import stage
+from scripts.progress import print_progress, stage
 
 
 class ProgressTests(unittest.TestCase):
+    def test_progress_shows_completed_steps(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            print_progress("Fit model", 1, 3)
+            print_progress("Fit model", 3, 3)
+        self.assertEqual(output.getvalue().splitlines(), [
+            "  Fit model [########----------------] 1/3 (33%)",
+            "  Fit model [########################] 3/3 (100%)",
+        ])
+
     def test_failure_reports_stage_and_reraises_original_error(self):
         for error in (ValueError("invalid observations"), KeyboardInterrupt()):
             with self.subTest(error=type(error).__name__):

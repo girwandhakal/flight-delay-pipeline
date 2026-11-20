@@ -6,9 +6,8 @@ from typing import Any, Optional
 from pyspark.sql import DataFrame, Window, functions as F
 
 from scripts.bts.recent_delays import (
-    EVENT_COLUMNS, airport_zone, clock_matches, event_clocks, event_zone, valid_delay,
+    EVENT_COLUMNS, airport_zone, clock_matches, event_clocks, event_zone, scheduled_clocks, valid_delay,
 )
-from scripts.origin_weather.build_features import local_cutoff
 
 
 ROTATION_NUMERIC = ("rotation_scheduled_turnaround_minutes", "rotation_prior_arrival_delay_minutes")
@@ -17,28 +16,6 @@ MAX_GAP_HOURS = 24
 OUTCOME_LAG_MINUTES = 15
 RAW_COLUMNS = [*EVENT_COLUMNS, "Tail_Number", "CRSArrTime", "Cancelled"]
 KEY_COLUMNS = ["Reporting_Airline", "Flight_Number_Reporting_Airline", "Origin", "Dest"]
-
-
-def scheduled_clocks(
-    row: Any,
-    airports: dict,
-) -> tuple[Optional[str], Optional[str]]:
-    """Resolve scheduled UTC clocks using only schedule fields."""
-    scheduled, _ = local_cutoff(
-        row.FlightDate, row.CRSDepTime, airport_zone(airports, row.Origin, row.FlightDate)
-    )
-    if scheduled is None:
-        return None, None
-    elapsed = valid_delay(row.CRSElapsedTime)
-    scheduled_arrival = None
-    if elapsed is not None and elapsed > 0:
-        try:
-            instant = scheduled + timedelta(minutes=elapsed)
-            if clock_matches(instant, row.CRSArrTime, event_zone(airports, row.Dest, instant)):
-                scheduled_arrival = instant.isoformat() + "Z"
-        except (OverflowError, ValueError):
-            pass
-    return scheduled.isoformat() + "Z", scheduled_arrival
 
 
 def operation_clocks(

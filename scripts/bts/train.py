@@ -7,7 +7,8 @@ from pathlib import Path
 import sys
 from typing import Any, Optional, Union
 
-from scripts.progress import stage
+from scripts.bts.cache import active
+from scripts.progress import print_progress, stage
 from scripts.results import records, update_results
 from scripts.aircraft_rotation.build_features import ROTATION_FLAGS, ROTATION_NUMERIC
 from scripts.enroute_weather.build_features import ENROUTE_FLAGS, ENROUTE_NUMERIC, FEATURES as ENROUTE_FEATURES
@@ -26,7 +27,9 @@ ROOT = Path(__file__).resolve().parents[2]
 from .build_features import get_spark_session, load_split_config
 from scripts.origin_weather.build_features import WEATHER_NUMERIC, WEATHER_FLAGS
 from scripts.destination_weather.build_features import DESTINATION_WEATHER_NUMERIC, DESTINATION_WEATHER_FLAGS
-from .recent_delays import FEATURES as RECENT_CALENDAR_FEATURES, ROLLING_FEATURES, HOLIDAY_FEATURES
+from .recent_delays import (
+    FEATURES as RECENT_CALENDAR_FEATURES, ROLLING_FEATURES, HOLIDAY_FEATURES, UPSTREAM_FEATURES, UPSTREAM_ROLES,
+)
 
 FEATURE_SETS = ("bts", "bts_origin_weather", "bts_origin_destination_weather")
 ROTATION_FEATURE_SET = "bts_origin_destination_weather_rotation"
@@ -83,6 +86,16 @@ def build_preprocessor(feature_set: str = "bts", *,
         ),
     ]
     numeric = NUMERIC_FEATURES + ["MonthSin", "MonthCos"] + [name + "_filled" for name in ROLLING_FEATURES] + HOLIDAY_FEATURES
+    upstream_fills = [
+        f"COALESCE({name}, {'-1D' if name.endswith('_scheduled_arrivals') else '0D'}) AS {name}_filled"
+        for name in UPSTREAM_FEATURES
+    ]
+    upstream_missing = [f"{role}_upstream_pressure_missing" for role in UPSTREAM_ROLES]
+    upstream_fills += [
+        f"CAST({role}_upstream_delay_pressure IS NULL AS DOUBLE) AS {name}"
+        for role, name in zip(UPSTREAM_ROLES, upstream_missing)
+    ]
+    numeric += [f"{name}_filled" for name in UPSTREAM_FEATURES] + upstream_missing
     if feature_set != "bts":
         weather_numeric, _ = weather_columns(feature_set)
         imputed = [name + "_imputed" for name in weather_numeric]
@@ -98,7 +111,7 @@ def build_preprocessor(feature_set: str = "bts", *,
     stages.append(SQLTransformer(statement=(
         "SELECT *, SIN(2 * PI() * (Month - 1) / 12) AS MonthSin, "
         "COS(2 * PI() * (Month - 1) / 12) AS MonthCos, "
-        + ", ".join(f"COALESCE({name}, 0D) AS {name}_filled" for name in filled)
+        + ", ".join([*(f"COALESCE({name}, 0D) AS {name}_filled" for name in filled), *upstream_fills])
         + " FROM __THIS__"
     )))
     if feature_set == ENROUTE_FEATURE_SET:
@@ -289,7 +302,7 @@ def train(
         raise ValueError(
             "Origin-weather training requires enriched Gold and isolated model paths."
         )
-    gold_dir = Path(gold_dir or ROOT / "data/gold/bts")
+    gold_dir = Path(gold_dir or active(ROOT, "gold"))
     models_dir = Path(models_dir or ROOT / "models/bts")
     results_dir = Path(results_dir or ROOT / "results")
 
@@ -377,13 +390,16 @@ def train(
             algorithm_timings = {}
             print(f"  Fitting {name} on all training flights with fixed settings: "
                   f"{LOGISTIC_PARAMS if name == 'logistic_regression' else GBT_PARAMS}", flush=True)
+            print_progress(label, 0, 3)
             with stage(f"{label}: fit preprocessing", timings=algorithm_timings, key="preprocessor_fit"):
                 preprocessor = build_preprocessor(
                     feature_set, empty_enroute=empty_enroute,
                 ).fit(train_features)
+            print_progress(label, 1, 3)
             with stage(f"{label}: fit classifier", timings=algorithm_timings, key="classifier_fit"):
                 classifier = estimator.fit(preprocessor.transform(train_features))
                 selected_model = PipelineModel(stages=[*preprocessor.stages, classifier])
+            print_progress(label, 2, 3)
             with stage(f"{label}: score validation and select threshold",
                        timings=algorithm_timings, key="validation"):
                 selected_scores = (
@@ -403,6 +419,7 @@ def train(
                     imputation_means = next((item.surrogateDF.first().asDict()
                                              for item in preprocessor.stages
                                              if hasattr(item, "surrogateDF")), {})
+            print_progress(label, 3, 3)
             # Keep a common logistic reference across weather variants; trees are a separate challenger.
             directory = models_dir if name == "logistic_regression" else models_dir / "gbt"
             with stage(f"{label}: save model and threshold",

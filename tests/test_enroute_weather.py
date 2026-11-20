@@ -115,7 +115,7 @@ def test_preprocessor_appends_enroute_columns_and_uses_training_only_medians(spa
     data = spark.range(3).select(
         *[F.lit("AA").alias(name) for name in train.CATEGORICAL_FEATURES],
         F.lit(1).alias("Month"),
-        *[F.lit(1.0).alias(name) for name in train.NUMERIC_FEATURES + train.ROLLING_FEATURES
+        *[F.lit(1.0).alias(name) for name in train.NUMERIC_FEATURES + train.ROLLING_FEATURES + train.UPSTREAM_FEATURES
           + weather + list(train.ROTATION_NUMERIC)],
         *[F.lit(0).alias(name) for name in train.HOLIDAY_FEATURES + flags
           + list(train.ROTATION_FLAGS) + list(features.ENROUTE_FLAGS)],

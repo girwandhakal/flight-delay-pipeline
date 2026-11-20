@@ -28,6 +28,7 @@ def clean_bts_data(
     results_dir: Optional[Union[str, Path]] = None,
     quarantine_dir: Optional[Union[str, Path]] = None,
     publish_results: bool = True,
+    selected_months: Optional[list[str]] = None,
 ) -> pd.DataFrame:
     """Clean and filter monthly BTS raw CSV files into typed Silver Parquet datasets.
 
@@ -41,20 +42,25 @@ def clean_bts_data(
     Args:
         spark: Active SparkSession instance.
         bronze_dir: Directory containing raw BTS CSVs. Defaults to <ROOT>/data/bronze/bts.
-        silver_dir: Directory for cleaned Silver Parquet outputs. Defaults to <ROOT>/data/silver/bts.
+        silver_dir: Explicit output directory for a standalone build. The default pipeline uses generations.
         results_dir: Directory for publishing results.json. Defaults to <ROOT>/results.
-        quarantine_dir: Directory for quarantined records. Defaults to <ROOT>/data/quarantine/bts.
+        quarantine_dir: Directory for quarantined records. Cached builds keep them with the Silver generation.
         publish_results: Whether to publish cleaning summary to results.json.
 
     Returns:
         Pandas DataFrame summarizing raw, excluded, and retained records by month.
     """
+    if all(path is None for path in (bronze_dir, silver_dir, results_dir, quarantine_dir)):
+        from .cache import prepare
+        return prepare(spark, ROOT, "silver", publish_results)
     bronze_dir = Path(bronze_dir or ROOT / "data" / "bronze" / "bts")
     silver_dir = Path(silver_dir or ROOT / "data" / "silver" / "bts")
     quarantine_dir = Path(quarantine_dir or ROOT / "data" / "quarantine" / "bts")
     results_dir = Path(results_dir or ROOT / "results")
 
     csv_files = sorted(bronze_dir.glob("*/*/*.csv"))
+    if selected_months is not None:
+        csv_files = [path for path in csv_files if path.parent.relative_to(bronze_dir).as_posix() in selected_months]
     if not csv_files:
         raise FileNotFoundError(f"No BTS CSV files found in {bronze_dir}")
 

@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from pyspark.sql import DataFrame, SparkSession, Window, functions as F, types as T
 
+from scripts.bts.cache import active
 from scripts.results import records, update_results
 from .download import ROOT, load_config, standard_offset, write_json
 from .measurements import NUMERIC_FEATURES, MISSING_FLAGS, INDICATOR_FLAGS, FEATURE_COLUMNS
@@ -198,13 +199,14 @@ def validate_prefix(prefix: str) -> None:
 
 def bts_fingerprints() -> list[dict[str, Any]]:
     """Return provenance fingerprints (relative path, size, mtime) for all BTS Gold parquet files."""
+    gold = active(ROOT, "gold")
     return [
         {
-            "path": str(path.relative_to(ROOT)),
+            "path": str(path.relative_to(gold)),
             "bytes": path.stat().st_size,
             "modified_ns": path.stat().st_mtime_ns,
         }
-        for path in sorted((ROOT / "data/gold/bts").rglob("*.parquet"))
+        for path in sorted(gold.rglob("*.parquet"))
     ]
 
 
@@ -414,7 +416,7 @@ def validate_cohort(
 
 def main(publish_results: bool = True) -> tuple[Path, Path]:
     """Execute end-to-end origin weather enrichment pipeline on BTS Gold cohorts."""
-    from scripts.weather_cache import find_gold, input_identity, save_gold
+    from scripts.weather_cache import find_gold, input_identity, save_gold, scoped_manifest
     from scripts.progress import stage as progress_stage
     from scripts.bts.build_features import get_spark_session
     from .clean import clean_weather
@@ -429,7 +431,7 @@ def main(publish_results: bool = True) -> tuple[Path, Path]:
     spark = get_spark_session("origin_weather_features")
     try:
         flights = spark.read.parquet(
-            *[str(ROOT / "data/gold/bts" / name) for name in config["splits"]]
+            *[str(active(ROOT, "gold") / name) for name in config["splits"]]
         )
         with progress_stage("Origin weather: prepare airport references and acquire files"):
             origins = [row.Origin for row in flights.select("Origin").distinct().collect()]
@@ -441,11 +443,11 @@ def main(publish_results: bool = True) -> tuple[Path, Path]:
             )
             refs = load_references(settings["reference_directory"])
             cutoffs = build_flight_cutoffs(spark, flights, refs).cache()
-            manifest = download_weather(
-                required_station_years(cutoffs, policy["max_age_minutes"]),
-                settings["output_directory"],
-            )
-        cache_inputs = input_identity(ROOT, settings, policy, config)
+            requests = required_station_years(cutoffs, policy["max_age_minutes"])
+            manifest = download_weather(requests, settings["output_directory"])
+            scope = sorted({f"{year}/LCD_{station}_{year}.csv" for station, year, _ in requests})
+            manifest = scoped_manifest(manifest, scope)
+        cache_inputs = input_identity(ROOT, settings, policy, config, scope=scope)
         build_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         gold = ROOT / "data/gold/bts_origin_weather" / build_id
         report = ROOT / "data/silver/weather" / build_id
@@ -493,7 +495,7 @@ def main(publish_results: bool = True) -> tuple[Path, Path]:
                     "bts_input_files": bts_fingerprints(),
                 },
             )
-            if input_identity(ROOT, settings, policy, config) != cache_inputs:
+            if input_identity(ROOT, settings, policy, config, scope=scope) != cache_inputs:
                 raise ValueError("Weather inputs changed while building origin Gold.")
             save_gold(gold, cache_inputs)
             if publish_results:

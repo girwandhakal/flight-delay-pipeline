@@ -13,6 +13,7 @@ import time
 
 # Find the project scripts even when this file is run from another directory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.bts.cache import active, features_current
 from scripts.results import update_results
 from scripts.progress import stage as progress_stage
 from scripts.aircraft_rotation import run as rotation
@@ -23,7 +24,7 @@ from scripts.bts import (
     train as bts_train,
     build_features as bts_transform,
 )
-from scripts.bts.recent_delays import features_current
+from scripts.weather_cache import consumed
 from scripts.origin_weather import build_features as weather_features
 from scripts.destination_weather import build_features as destination_features
 from scripts.origin_weather.download import ROOT, load_config, sha256, write_json
@@ -202,6 +203,19 @@ def data_fingerprints(directory):
             for path in sorted(directory.rglob("*.parquet"))]
 
 
+def prepare_bts(config, *, publish_results=True):
+    if features_current(ROOT, config):
+        print("Reusing verified BTS Silver and Gold generations.", flush=True)
+        return 0
+    functions = (bts_download.main, partial(bts_clean.main, publish_results=publish_results),
+                 partial(bts_transform.main, publish_results=publish_results))
+    for (step, title, _), fn in zip(STAGES, functions):
+        status = run_stage(step, title, fn)
+        if status:
+            return status
+    return 0
+
+
 def run_destination_weather(*, include_gbt=False, include_rotation=False, include_enroute=False):
     start = time.monotonic()
     print("Starting pipeline: BTS + origin + destination weather"
@@ -209,20 +223,11 @@ def run_destination_weather(*, include_gbt=False, include_rotation=False, includ
     settings, policy, config = load_config()
     if include_enroute and not include_rotation:
         raise ValueError("En-route weather requires the aircraft-rotation comparison.")
-    print("Checking whether BTS features can be reused...", flush=True)
-    # Check if existing BTS Gold Parquet files match current source inputs to avoid redundant re-ingestion.
-    if not features_current(ROOT, config):
-        for step, title, stage in (
-            ("Preparing BTS 1/3", "BTS Data Acquisition", bts_download.main),
-            ("Preparing BTS 2/3", "BTS Data Cleaning", lambda: bts_clean.main(publish_results=False)),
-            ("Preparing BTS 3/3", "BTS Features and Splits", lambda: bts_transform.main(publish_results=False)),
-        ):
-            status = run_stage(step, title, stage)
-            if status:
-                return status
-    else:
-        print("Reusing BTS features because they match the current inputs and policy.", flush=True)
+    status = prepare_bts(config, publish_results=False)
+    if status:
+        return status
     # Prepare origin and destination weather Gold cohorts, reusing cached tables if valid.
+    bts_gold = active(ROOT, "gold")
     with progress_stage("Stage: Prepare origin-weather features (validate cached data or rebuild)"):
         parent, _ = weather_features.main(publish_results=False)
     with progress_stage("Stage: Prepare destination-weather features"):
@@ -231,7 +236,7 @@ def run_destination_weather(*, include_gbt=False, include_rotation=False, includ
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "_" + uuid4().hex[:8]
     models = ROOT / DESTINATION_RUNS / run_id
     models.mkdir(parents=True)
-    data_dirs = dict(zip(bts_train.FEATURE_SETS, (ROOT / "data/gold/bts", parent, gold)))
+    data_dirs = dict(zip(bts_train.FEATURE_SETS, (bts_gold, parent, gold)))
     variants = bts_train.ALL_FEATURE_SETS if include_rotation else bts_train.FEATURE_SETS
     spark = bts_transform.get_spark_session("destination_weather_comparison")
     try:
@@ -245,8 +250,9 @@ def run_destination_weather(*, include_gbt=False, include_rotation=False, includ
             raw_files = rotation.rotation_raw_files(ROOT, config)
             inputs = rotation.source_identity(ROOT, references, gold, raw_files)
             rotation_metadata = rotation.prepare_rotation(spark, config, references, gold, raw_files, models)
+            rotation_gold = Path(rotation_metadata["training_gold"])
         for variant in variants:
-            directory = models / "gold" if include_rotation else data_dirs[variant]
+            directory = rotation_gold if include_rotation else data_dirs[variant]
             started = time.monotonic()
             with progress_stage(f"Training {variant}: fixed settings and validation"):
                 summaries[variant] = bts_train.train(spark, directory, models / DESTINATION_MODEL_DIRS[variant],
@@ -256,7 +262,7 @@ def run_destination_weather(*, include_gbt=False, include_rotation=False, includ
         prevalence = {variant: summary["reference_baselines"]["train_prevalence"]["training_prevalence"] for variant, summary in summaries.items()}
         # Join predictions and compare validation metrics across all active feature sets.
         with progress_stage(f"Stage: Compare {len(variants)} models on validation"):
-            comparison_gold = models / "gold" if include_rotation else gold
+            comparison_gold = rotation_gold if include_rotation else gold
             updates = compare_predictions(spark, models,
                 context=spark.read.parquet(str(comparison_gold / "val")), variants=variants, training_prevalence=prevalence,
                 summaries=summaries, variant_dirs=DESTINATION_MODEL_DIRS)
@@ -289,7 +295,7 @@ def run_destination_weather(*, include_gbt=False, include_rotation=False, includ
                 "holdout_status": "Potentially inspected development benchmark. No test metrics used in validation comparison.",
             }
             if rotation_metadata is not None:
-                run["aircraft_rotation"] = {**rotation_metadata, "inputs": inputs, "training_gold": str(models / "gold")}
+                run["aircraft_rotation"] = {**rotation_metadata, "inputs": inputs}
             report = models / "validation_comparison.json"
             write_json(report, {"run_id": run_id, "models": comparison, "aircraft_rotation": rotation_metadata})
             write_json(models / "run.json", run)
@@ -309,7 +315,7 @@ def run_destination_weather(*, include_gbt=False, include_rotation=False, includ
               .to_string(index=False, float_format=lambda value: f"{value:.4f}"), flush=True)
         print(f"Validation report: {report}", flush=True)
         if include_enroute:
-            report = enroute.fit(spark, ROOT, models, gold, prepared_enroute, summaries[ROTATION])
+            report = enroute.fit(spark, ROOT, models, gold, prepared_enroute, summaries[ROTATION], rotation_gold)
             print(f"En-route validation report: {report}", flush=True)
         print(f"Pipeline completed in {time.monotonic() - start:.1f}s. Results: {models}", flush=True)
         return 0
@@ -344,8 +350,13 @@ def evaluate_destination_weather(run_id):
     data_dirs = {}
     for variant in bts_train.FEATURE_SETS:
         path = Path(run["data_dirs"][variant]).resolve()
-        if not path.is_relative_to((ROOT / "data/gold" / variant).resolve()):
+        allowed = [(ROOT / "data/gold" / variant).resolve()]
+        if variant == "bts":
+            allowed.append((ROOT / "data/gold/bts_generations").resolve())
+        if not any(path.is_relative_to(base) for base in allowed):
             raise ValueError("Frozen data path escaped its feature-set directory.")
+        if variant == "bts" and path.parent == (ROOT / "data/gold/bts_generations").resolve():
+            consumed(path, ("test",))
         if data_fingerprints(path) != run["data_fingerprints"][variant]:
             raise ValueError("Frozen Gold files changed.")
         if variant != "bts" and sha256(path / "_metadata.json") != run["data_metadata_sha256"][variant]:
@@ -382,14 +393,9 @@ def run_origin_weather(*, include_gbt=False):
     start = time.monotonic()
     print("Starting pipeline: BTS + origin weather (validation)", flush=True)
     _, _, config = load_config()
-    print("Checking whether BTS features can be reused...", flush=True)
-    # Reuse existing BTS Gold if inputs and configuration have not changed.
-    if not features_current(ROOT, config):
-        for step, title, stage in STAGES[:3]:
-            if run_stage(step, title, stage):
-                return 1
-    else:
-        print("Reusing BTS features because they match the current inputs and policy.", flush=True)
+    if prepare_bts(config):
+        return 1
+    bts_gold = active(ROOT, "gold")
     with progress_stage("Stage: Prepare origin-weather features"):
         gold, data_report = weather_features.main()
     run_id = (
@@ -402,7 +408,7 @@ def run_origin_weather(*, include_gbt=False):
     try:
         timings, summaries = {}, {}
         for variant, data in (
-            ("bts", ROOT / "data/gold/bts"),
+            ("bts", bts_gold),
             ("bts_origin_weather", gold),
         ):
             started = time.monotonic()
@@ -429,7 +435,8 @@ def run_origin_weather(*, include_gbt=False):
                 {
                     "run_id": run_id,
                     "gold_dir": str(gold),
-                    "bts_gold_dir": str(ROOT / "data/gold/bts"),
+                    "bts_gold_dir": str(bts_gold),
+                    "bts_fingerprints": data_fingerprints(bts_gold),
                     "models_dir": str(models),
                     "data_report": str(data_report),
                     "dataset_manifest_sha256": sha256(
@@ -479,6 +486,14 @@ def evaluate_origin_weather(run_id):
            for variant in ("bts", "bts_origin_weather")):
         raise ValueError("Test evaluation requires the current comparison run; results have been replaced.")
     run = json.loads((results / "run.json").read_text())
+    if "bts_fingerprints" in run:
+        bts = Path(run["bts_gold_dir"]).resolve()
+        if bts.parent != (ROOT / "data/gold/bts_generations").resolve() and bts != (ROOT / "data/gold/bts").resolve():
+            raise ValueError("Frozen BTS Gold path escaped its data directory")
+        if bts.parent == (ROOT / "data/gold/bts_generations").resolve():
+            consumed(bts, ("test",))
+        if data_fingerprints(bts) != run["bts_fingerprints"]:
+            raise ValueError("Frozen BTS Gold files changed")
     output = results / "test"
     output.mkdir()
     spark = bts_transform.get_spark_session("origin_weather_test")
@@ -598,13 +613,9 @@ def main(argv=None):
     print(f"{banner}")
 
     _, _, config = load_config()
-    # Skip acquisition, cleaning, and feature building if existing BTS Gold matches current inputs.
-    if features_current(ROOT, config):
-        print("Reusing BTS Gold; skipping acquisition, cleaning and feature construction.", flush=True)
-        stages = STAGES[3:]
-    else:
-        stages = STAGES
-    for step, title, func in stages:
+    if prepare_bts(config):
+        return 1
+    for step, title, func in STAGES[3:]:
         if args.include_gbt and func is bts_train.main:
             func = partial(func, include_gbt=True)
         if run_stage(step, title, func) != 0:

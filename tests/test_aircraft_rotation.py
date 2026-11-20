@@ -176,7 +176,13 @@ def test_entry_point_reads_only_development_splits(tmp_path):
     raw_file = tmp_path / "november.csv"
     config = {"datasets": {"bts": {"start_month": "2024-01"}},
               "splits": {"val": {"start_date": "2024-10-01"}}}
-    with (patch.object(run, "ROOT", tmp_path),
+    def cold_cache(base, inputs, partitions, sidecars, build):
+        base.mkdir(parents=True)
+        build(base)
+        return base
+
+    with (patch.object(run, "resolve_stage", side_effect=cold_cache),
+          patch.object(run, "ROOT", tmp_path),
           patch.object(run, "resolve_inputs", return_value=(config, tmp_path, parent, [raw_file])),
           patch.object(run, "source_identity", return_value={}),
           patch.object(run, "get_spark_session", return_value=spark),

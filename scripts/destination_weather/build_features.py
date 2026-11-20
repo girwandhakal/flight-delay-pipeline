@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pyspark import StorageLevel
 from pyspark.sql import DataFrame, SparkSession, functions as F
 
+from scripts.bts.cache import active
 from scripts.origin_weather import build_features as origin
 from scripts.origin_weather.clean import clean_weather
 from scripts.origin_weather.download import (
@@ -160,7 +161,7 @@ def validate_destination_cohort(
 
 def main(origin_gold_dir: Union[str, Path]) -> tuple[Path, Path]:
     """Execute end-to-end destination weather enrichment on the origin-weather Gold dataset."""
-    from scripts.weather_cache import find_gold, input_identity, save_gold
+    from scripts.weather_cache import find_gold, input_identity, save_gold, scoped_manifest
     from scripts.progress import stage as progress_stage
     from scripts.bts.build_features import get_spark_session
 
@@ -180,7 +181,7 @@ def main(origin_gold_dir: Union[str, Path]) -> tuple[Path, Path]:
             expected = set(origin.WEATHER_NUMERIC + origin.WEATHER_FLAGS + ["scheduled_departure_utc"])
             if not expected.issubset(flights.columns):
                 raise ValueError("Parent Gold lacks the current origin feature schema.")
-            bts = spark.read.parquet(*[str(ROOT / "data/gold/bts" / split) for split in config["splits"]])
+            bts = spark.read.parquet(*[str(active(ROOT, "gold") / split) for split in config["splits"]])
             origin.validate_cohort(bts, flights, **policy)
         with progress_stage("Destination weather: prepare airport references and acquire files"):
             dates = flights.agg(
@@ -209,10 +210,10 @@ def main(origin_gold_dir: Union[str, Path]) -> tuple[Path, Path]:
                 spark, flights, origin.load_references(reference, prefix="destination")
             )
             requests = origin.required_station_years(cutoffs, policy["max_age_minutes"], "destination")
-            # Combine destination requests with origin requests to ensure unified cache coverage in single fetch pass.
-            requests += origin.required_station_years(flights, policy["max_age_minutes"])
             manifest = download_weather(requests, settings["output_directory"])
-        cache_inputs = input_identity(ROOT, settings, policy, config, origin_gold_dir)
+            scope = sorted({f"{year}/LCD_{station}_{year}.csv" for station, year, _ in requests})
+            manifest = scoped_manifest(manifest, scope)
+        cache_inputs = input_identity(ROOT, settings, policy, config, origin_gold_dir, scope)
         build_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         gold = ROOT / "data/gold/bts_origin_destination_weather" / build_id
         silver = ROOT / "data/silver/weather" / build_id
@@ -275,11 +276,11 @@ def main(origin_gold_dir: Union[str, Path]) -> tuple[Path, Path]:
                 "raw_integrity": "Cached CSVs reused without content scans or checksums; cleaning checks records, not historical immutability.",
                 "source_files": [
                     {"path": str(path.relative_to(ROOT)), "bytes": path.stat().st_size}
-                    for path in sorted(settings["output_directory"].rglob("*.csv"))
+                    for path in (settings["output_directory"] / name for name in scope) if path.is_file()
                 ],
             }
             write_json(gold / "_metadata.json", metadata)
-            if input_identity(ROOT, settings, policy, config, origin_gold_dir) != cache_inputs:
+            if input_identity(ROOT, settings, policy, config, origin_gold_dir, scope) != cache_inputs:
                 raise ValueError("Weather inputs changed while building destination Gold.")
             save_gold(gold, cache_inputs)
         return gold, gold

@@ -10,6 +10,14 @@ An end-to-end, reproducible **Big Data Machine Learning Pipeline** engineered in
 
 Designed for scalability on large tabular time-series datasets, the pipeline processes over **6 million flight records** from the Bureau of Transportation Statistics (BTS) paired with millions of hourly surface meteorological observations from NOAA Local Climatological Data (LCDv2) and physical aircraft tail-number rotation sequences.
 
+### Reusing prepared data
+
+Each pipeline run checks its data dependencies before starting the corresponding Spark transformations. BTS Silver and Gold generations live under `data/{silver,gold}/bts_generations`. New comparison manifests pin the BTS generation they trained against. Keep older generations while a frozen run references them. The first run after migrating builds generation manifests and can require substantial additional disk space.
+
+Origin and destination weather use their requested NOAA station-years. Rotation uses destination train and validation, while en-route preparation also reads destination test schedules. TAF station selection, TAF Silver, and SIGMET Silver have separate caches. Replacing a verified TAF archive rebuilds its Silver table and en-route Gold while allowing rotation and SIGMET Silver to be reused.
+
+Cache messages report hits, misses and elapsed lookup or preparation time. A completed `_stage.json` records the dependency key, output fingerprints, required sidecars and cold-build duration. A missing marker or a changed output triggers a fresh generation. Interrupted generations may remain on disk. Model fitting and explicit scoring retain their existing CLI behavior.
+
 ---
 
 ## Problem and Motivation
@@ -35,6 +43,7 @@ The pipeline evaluates five progressive model tiers on identical validation coho
        │  • Cyclical Month Encoding (MonthSin, MonthCos) & US Federal Holiday Proximity
        │  • 2-Hour Rolling Airport Delay Rates (Completed Dep/Arr Congestion Histories)
        │  • Origin taxi-out mean, observation count, and surge above the airport's training baseline
+       │  • Upstream delay pressure, scheduled feeder arrivals, and observed coverage at both airports
        ▼
 [ Tier 2: + Origin Weather ]
        │  • Surface Temperature, Dew Point, Relative Humidity, Pressure, Wind Speed & Gusts
@@ -62,6 +71,11 @@ The pipeline evaluates five progressive model tiers on identical validation coho
   * **Test Holdout**: `2024-12-01` to `2025-01-31` (Frozen out-of-time evaluation)
 
 The BTS stage computes taxi-out surge as the mean taxi time of other flights in the two-hour window ending 15 minutes before scheduled departure, minus the origin airport's 15th-percentile taxi time. It uses verified wheels-off clocks and caps individual observations at 120 minutes. Training uses earlier training months for the baseline. Validation and test share a frozen training baseline. When an airport has no baseline, the feature uses 12 minutes. Gold keeps missing window measurements null and records the observed taxi count. The model fills missing rolling inputs with zero.
+
+
+Upstream delay pressure weights each feeder airport's recent departure delay rate by its scheduled incoming flights. The origin window starts at scheduled departure. The destination window extends 30 minutes on either side of scheduled arrival. Both use only departure events available before the target's scheduled departure, rounded down to a 15-minute snapshot with a modeled 15-minute reporting lag. The score reconstructs historical knowledge from BTS schedules and actual events. Missing feeder observations are tracked separately from observed on-time departures.
+
+A normal pipeline run rebuilds older BTS Gold and its weather descendants when their feature provenance changes. All five tiers inherit the six upstream inputs.
 
 ---
 
@@ -167,7 +181,7 @@ The explicit `--include-enroute` command also runs the full five-tier comparison
 python pipeline/main.py --include-enroute
 ```
 
-This mode downloads public IEM raw TAF bulletins for the top 50 training destinations and domestic convective SIGMET polygons. It caches checksummed archives under `data/bronze/taf/` and `data/bronze/sigmets/`, and writes processed Silver and cohort-preserving `data/gold/enroute/RUN_ID/`. Train and validation use rotation Gold. Test enrichment uses the existing weather-only test Gold because the rotation experiment has no test cohort. The command publishes validation metrics only, including Tier 4 versus en-route PR-AUC, F1, precision, recall and false alarms at both operating points. The direct TAF and nearby-station coverage and the route overlap are reported as modeled features based on public archive coverage.
+This mode downloads public IEM raw TAF bulletins for the top 50 training destinations and domestic convective SIGMET polygons. It caches checksummed archives under `data/bronze/taf/` and `data/bronze/sigmets/`, and writes processed Silver and cohort-preserving `data/gold/enroute/GENERATION/`. Train and validation use rotation Gold. Test enrichment uses the existing weather-only test Gold because the rotation experiment has no test cohort. The command publishes validation metrics only, including Tier 4 versus en-route PR-AUC, F1, precision, recall and false alarms at both operating points. The direct TAF and nearby-station coverage and the route overlap are reported as modeled features based on public archive coverage.
 
 TAF forecasts must be issued by departure and valid at scheduled arrival. The deterioration feature subtracts the destination ceiling observed by departure. SIGMET features use advisories active at scheduled departure and a buffered great-circle corridor approximation. The report is saved under `models/enroute/RUN_ID/validation_comparison.json`.
 

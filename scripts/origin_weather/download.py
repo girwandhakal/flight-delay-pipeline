@@ -387,10 +387,11 @@ def main() -> int:
     )
 
     settings, policy, config = load_config()
+    from scripts.bts.cache import active
     spark = get_spark_session("weather_download")
     try:
         flights = spark.read.parquet(
-            *[str(ROOT / "data/gold/bts" / name) for name in config["splits"]]
+            *[str(active(ROOT, "gold") / name) for name in config["splits"]]
         )
         origins = [row.Origin for row in flights.select("Origin").distinct().collect()]
         prepare_references(

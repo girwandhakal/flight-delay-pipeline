@@ -1,6 +1,7 @@
 """Compare combined weather with and without aircraft rotation on validation."""
 
 import argparse
+import json
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -12,11 +13,13 @@ from pyspark.sql import DataFrame, SparkSession, functions as F
 from scripts.bts import train as bts_train
 from scripts.bts.build_features import get_spark_session
 from scripts.bts.download import build_download_url, iter_months
-from scripts.bts.recent_delays import features_current, load_airports
+from scripts.bts.cache import features_current
+from scripts.bts.recent_delays import load_airports
+from scripts.origin_weather.build_features import local_cutoff
 from scripts.origin_weather.clean import file_fingerprints
 from scripts.origin_weather.download import ROOT, load_config, project_path, sha256, write_json
 from scripts.progress import stage
-from scripts.weather_cache import find_gold
+from scripts.weather_cache import consumed, find_gold, logic_hash, resolve_stage
 
 from .build_features import (
     MAX_GAP_HOURS, OUTCOME_LAG_MINUTES, ROTATION_FLAGS, ROTATION_NUMERIC,
@@ -177,17 +180,18 @@ def validation_predictions(
     return predictions
 
 
-def run_comparison(spark: SparkSession, run_dir: Path) -> dict[str, Any]:
+def run_comparison(spark: SparkSession, run_dir: Path, gold: Optional[Path] = None) -> dict[str, Any]:
     """Train and evaluate W2 (weather baseline) and H1 (weather + rotation) models on validation."""
+    gold = gold or run_dir / "gold"
     timings, arms = {}, {}
     for arm, variant in (("w2", FEATURE_SET), ("h1", bts_train.ROTATION_FEATURE_SET)):
         with stage(f"Phase 3 fit and validate {arm.upper()}", timings=timings, key=arm):
             arms[arm] = bts_train.train(
-                spark, run_dir / "gold", run_dir / arm, feature_set=variant,
+                spark, gold, run_dir / arm, feature_set=variant,
                 save_predictions=True, publish_results=False,
             )
     with stage("Phase 3 verify prediction cohorts and compare scores", timings=timings, key="compare"):
-        validation = spark.read.parquet(str(run_dir / "gold" / "val"))
+        validation = spark.read.parquet(str(gold / "val"))
         expected = validation.select(*IDENTITY)
         covered = validation.where(F.col(ROTATION_FLAGS[1]) == 0).select("flight_id")
         covered_rows = covered.count()
@@ -229,21 +233,40 @@ def prepare_rotation(
     first_reliable_date = date.fromisoformat(config["datasets"]["bts"]["start_month"] + "-01") + timedelta(days=2)
     validation_bound = datetime.fromisoformat(config["splits"]["val"]["start_date"] + "T00:00:00+14:00")
     validation_bound = validation_bound.astimezone(timezone.utc)
-    timings = {}
-    with stage("Phase 3 link aircraft and prepare shared splits", timings=timings, key="prepare"):
+    numeric, flags = bts_train.weather_columns(FEATURE_SET)
+    projection = [*IDENTITY, "split", "scheduled_departure_utc", *bts_train.INPUT_FEATURES, *numeric, *flags]
+
+    def inputs():
+        # Rotation only reads development splits. A new destination test
+        # partition can change en-route schedules without changing these links.
+        return {"destination": consumed(parent, ("train", "val")), "raw": file_fingerprints(raw_files),
+                "projection": projection, "first_reliable": first_reliable_date.isoformat(),
+                "validation_bound": validation_bound.isoformat(),
+                "linking": logic_hash(build, prepare_experiment, local_cutoff),
+                "audit": AUDIT, "identity": IDENTITY,
+                "code": {name: sha256(ROOT / "scripts" / name) for name in
+                         ("aircraft_rotation/build_features.py", "bts/recent_delays.py")},
+                "reference": {name: sha256(references / name) for name in ("airports.csv", "sources.json")}}
+
+    def build(directory):
         raw = spark.read.option("header", True).option("enforceSchema", False).csv([str(path) for path in raw_files])
         operations = build_operations(raw, load_airports(references))
-        numeric, flags = bts_train.weather_columns(FEATURE_SET)
-        weather = spark.read.parquet(str(parent / "train"), str(parent / "val")).select(
-            *IDENTITY, "split", "scheduled_departure_utc", *bts_train.INPUT_FEATURES, *numeric, *flags
-        )
-        preparation = prepare_experiment(weather, operations, run_dir, first_reliable_date, validation_bound)
+        weather = spark.read.parquet(str(parent / "train"), str(parent / "val")).select(*projection)
+        report = prepare_experiment(weather, operations, directory, first_reliable_date, validation_bound)
+        write_json(directory / "coverage.json", report)
+        return {"destination": str(parent)}
+
+    timings = {}
+    with stage("Phase 3 link aircraft and prepare shared splits", timings=timings, key="prepare"):
+        directory = resolve_stage(ROOT / "data/gold/rotation", inputs, ("gold/train", "gold/val", "rotation_links"),
+                                  ("coverage.json",), build)
+        preparation = json.loads((directory / "coverage.json").read_text())
     return {
         "scope": "Conditional retrospective aircraft rotation using final BTS tail assignments. Validation only.",
         "max_gap_hours": MAX_GAP_HOURS, "assumed_outcome_lag_minutes": OUTCOME_LAG_MINUTES,
         "first_reliable_service_date": first_reliable_date.isoformat(),
         "validation_lower_bound_utc": validation_bound.isoformat(),
-        "timing_seconds": timings, **preparation,
+        "training_gold": str(directory / "gold"), "timing_seconds": timings, **preparation,
     }
 
 
@@ -259,7 +282,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     spark = get_spark_session("aircraft_rotation_comparison")
     try:
         preparation = prepare_rotation(spark, config, references, parent, raw_files, run_dir)
-        comparison = run_comparison(spark, run_dir)
+        comparison = run_comparison(spark, run_dir, Path(preparation["training_gold"]))
         comparison["timing_seconds"].update(preparation["timing_seconds"])
         manifest = {
             "run_id": run_id, "parent": str(parent), "splits": config["splits"], "inputs": inputs,

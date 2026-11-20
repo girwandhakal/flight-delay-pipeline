@@ -1,26 +1,6 @@
 """Build schedule-based features and assign chronological splits for BTS modeling."""
 
-import json
-import os
-from pathlib import Path
-import sys
-
-from scripts.results import records, update_results
-
-import pandas as pd
-from pyspark import StorageLevel
-from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
-
-from .recent_delays import (
-    add_cutoffs, add_holidays, add_recent_delays, build_events, feature_manifest, load_airports,
-)
-from scripts.origin_weather.download import project_path, write_json
-
-ROOT = Path(__file__).resolve().parents[2]
-
-"""Build schedule-based features and assign chronological splits for BTS modeling."""
-
+from datetime import date
 import json
 import os
 from pathlib import Path
@@ -34,9 +14,11 @@ from pyspark import StorageLevel
 from pyspark.sql import SparkSession, functions as F
 
 from .recent_delays import (
-    TAXI_BASELINE_FALLBACK_MINUTES, TAXI_BASELINE_FILE, TAXI_MEAN, TAXI_SURGE, compute_unimpeded_taxi_baselines,
-    add_cutoffs, add_holidays, add_recent_delays, build_events, feature_manifest, load_airports,
+    TAXI_BASELINE_FALLBACK_MINUTES, TAXI_BASELINE_FILE, TAXI_MEAN, TAXI_SURGE, UPSTREAM_ROLES,
+    add_cutoffs, add_holidays, add_recent_delays, build_events, compute_unimpeded_taxi_baselines,
+    feature_manifest, feature_months, load_airports,
 )
+from .upstream import add_upstream_pressure, build_inbound_schedule, uncovered_month_edges
 from scripts.origin_weather.download import project_path, sha256, write_json
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -121,6 +103,9 @@ def build_features(
     Returns:
         Pandas DataFrame summarizing split counts, date ranges, and delay rates.
     """
+    if all(path is None for path in (bronze_dir, silver_dir, results_dir, gold_dir, config_path)):
+        from .cache import prepare
+        return prepare(spark, ROOT, "gold", publish_results)
     silver_dir = Path(silver_dir or ROOT / "data" / "silver" / "bts")
     gold_dir = Path(gold_dir or ROOT / "data" / "gold" / "bts")
     results_dir = Path(results_dir or ROOT / "results")
@@ -135,10 +120,22 @@ def build_features(
     csv_files = sorted(bronze.glob("*/*/*.csv"))
     if not csv_files:
         raise FileNotFoundError(f"No BTS CSV files found in {bronze}")
+    settings = config["datasets"]["bts"]
+    core_months, adjacent_months = feature_months(settings)
+    source_months = {path: date(int(path.parent.parent.name), int(path.parent.name), 1) for path in csv_files}
+    core_files = [str(path) for path in csv_files if source_months[path] in core_months]
+    adjacent_files = [str(path) for path in csv_files if source_months[path] in adjacent_months]
+    if not core_files:
+        raise FileNotFoundError(f"No configured BTS month CSVs found in {bronze}")
+    edges = uncovered_month_edges(core_months, set(source_months.values()))
     airports = load_airports(project_path(ROOT, config["datasets"]["weather"]["reference_directory"]))
 
-    # Read all cleaned Silver Parquet partitions
-    silver_df = spark.read.parquet(str(silver_dir / "*/*"))
+    # Adjacent Bronze months can populate schedule windows but cannot enter the model cohort.
+    silver_months = [silver_dir / f"{month.year:04d}" / f"{month.month:02d}" for month in sorted(core_months)]
+    silver_paths = [str(path) for path in silver_months if path.is_dir()]
+    if not silver_paths:
+        raise FileNotFoundError(f"No configured BTS Silver partitions found in {silver_dir}")
+    silver_df = spark.read.parquet(*silver_paths)
     input_count = silver_df.count()
     if input_count == 0:
         raise ValueError(f"No records found in {silver_dir}")
@@ -197,8 +194,11 @@ def build_features(
         )
 
     spark.conf.set("spark.sql.session.timeZone", "UTC")
-    events = build_events(spark.read.csv([str(p) for p in csv_files], header=True), airports)
-    events = events.persist(StorageLevel.DISK_ONLY)
+    raw = spark.read.csv(core_files, header=True)
+    adjacent = spark.read.csv(adjacent_files, header=True) if adjacent_files else None
+    upstream_raw = raw.unionByName(adjacent) if adjacent is not None else raw
+    events = build_events(raw, airports).persist(StorageLevel.DISK_ONLY)
+    schedule = None
     try:
         baselines = compute_unimpeded_taxi_baselines(events, feature_df, splits, airports)
         # Materialize the small lookup once for both the join and the published reference.
@@ -216,11 +216,23 @@ def build_features(
           .withColumn(TAXI_SURGE, F.col(TAXI_MEAN) - F.coalesce("unimpeded_taxi_minutes",
                                                                F.lit(TAXI_BASELINE_FALLBACK_MINUTES)))
           .drop("taxi_snapshot", "unimpeded_taxi_minutes"))
+        schedule = build_inbound_schedule(upstream_raw, airports).persist(StorageLevel.DISK_ONLY)
+        schedule_coverage = {row.status: row["count"] for row in schedule.groupBy("status").count().collect()}
+        schedule_rejections = [
+            row.asDict() for row in schedule.where("status != 'usable'")
+            .groupBy("source_month", "Dest", "status").count().orderBy("source_month", "Dest", "status").collect()
+        ]
+        upstream_events = build_events(upstream_raw, airports) if adjacent is not None else events
+        feature_df = add_upstream_pressure(feature_df, schedule, upstream_events, airports, edges)
         feature_df = add_holidays(feature_df, splits["train"]["start_date"], splits["test"]["end_date"])
         feature_df = feature_df.persist(StorageLevel.DISK_ONLY)
 
         (gold_dir / "_features.json").unlink(missing_ok=True)
         summary_records = []
+        upstream_coverage = {
+            "schedule": schedule_coverage, "schedule_rejections": schedule_rejections,
+            "uncovered_edges_utc_seconds": edges, "splits": {},
+        }
         # Save partitioned Parquet datasets directly for each chronological split
         for split_name in ["train", "val", "test"]:
             split_df = feature_df.filter(F.col("split") == split_name)
@@ -237,7 +249,17 @@ def build_features(
             if publish_results:
                 aggregates.append(F.count(F.when(F.col("ArrDel15") == 1, 1)).alias("delayed_flights"))
 
+            for role in UPSTREAM_ROLES:
+                aggregates.extend([
+                    F.count(f"{role}_upstream_scheduled_arrivals").alias(f"{role}_window_count"),
+                    F.count(f"{role}_upstream_delay_pressure").alias(f"{role}_pressure_count"),
+                    F.avg(f"{role}_upstream_observed_share").alias(f"{role}_mean_observed_share"),
+                ])
             stats = split_df.agg(*aggregates).first()
+            upstream_coverage["splits"][split_name] = {
+                key: value for key, value in stats.asDict().items()
+                if key.startswith(("origin_", "dest_"))
+            }
             total_flights = stats["total_flights"]
             record = {
                 "split": split_name,
@@ -254,9 +276,13 @@ def build_features(
                 })
             summary_records.append(record)
 
+        if sum(record["total_flights"] for record in summary_records) != input_count:
+            raise ValueError("BTS features changed the Silver cohort size")
         baseline_path = gold_dir / TAXI_BASELINE_FILE
         write_json(baseline_path, [row.asDict() for row in baseline_rows])
-        write_json(gold_dir / "_features.json", {**manifest, "taxi_baselines_sha256": sha256(baseline_path)})
+        write_json(gold_dir / "_features.json", {
+            **manifest, "taxi_baselines_sha256": sha256(baseline_path), "upstream_coverage": upstream_coverage,
+        })
         summary_pd = pd.DataFrame(summary_records)
         if publish_results:
             update_results({"bts": {"splits": records(summary_pd)}}, results_dir)
@@ -264,6 +290,8 @@ def build_features(
         return summary_pd
     finally:
         feature_df.unpersist(blocking=True)
+        if schedule is not None:
+            schedule.unpersist(blocking=True)
         events.unpersist(blocking=True)
 
 

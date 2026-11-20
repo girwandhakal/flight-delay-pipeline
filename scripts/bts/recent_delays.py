@@ -13,6 +13,8 @@ import pandas as pd
 from pandas.tseries.holiday import USFederalHolidayCalendar
 from pyspark.sql import DataFrame, Row, Window, functions as F
 
+from scripts.bts.cache import active
+from scripts.bts.download import iter_months
 from scripts.origin_weather.build_features import local_cutoff
 from scripts.origin_weather.download import project_path, reference_matches, sha256
 
@@ -35,7 +37,18 @@ HOLIDAY_FEATURES = [
     "is_day_before_federal_holiday",
     "is_day_after_federal_holiday",
 ]
-FEATURES = ROLLING_FEATURES + HOLIDAY_FEATURES
+UPSTREAM_ROLES = {"origin": (0, 60), "dest": (-30, 30)}
+UPSTREAM_FEATURES = [
+    f"{role}_upstream_{metric}"
+    for role in UPSTREAM_ROLES
+    for metric in ("delay_pressure", "scheduled_arrivals", "observed_share")
+]
+UPSTREAM_SNAPSHOT_MINUTES = 15
+UPSTREAM_LAG_MINUTES = 15
+UPSTREAM_HISTORY_MINUTES = 120
+UPSTREAM_EDGE_HOURS = 48
+DELAY_THRESHOLD_MINUTES = 15
+FEATURES = ROLLING_FEATURES + HOLIDAY_FEATURES + UPSTREAM_FEATURES
 EVENT_COLUMNS = [
     "FlightDate", "Reporting_Airline", "Flight_Number_Reporting_Airline", "Origin", "Dest",
     "CRSDepTime", "CRSElapsedTime", "DepTime", "DepDelay", "ArrTime", "ArrDelay", "Diverted",
@@ -57,14 +70,21 @@ def feature_policy(root: Union[str, Path], config: dict[str, Any]) -> dict[str, 
             raise ValueError(f"Reference changed: {name}")
 
     return {
-        "version": 2,
+        "version": 3,
         "rolling_window_minutes": window,
         "event_availability": "immediate",
-        "delay_threshold_minutes": 15,
+        "delay_threshold_minutes": DELAY_THRESHOLD_MINUTES,
         "holiday_calendar": "USFederalHolidayCalendar_actual_and_observed",
         "columns": FEATURES,
         "splits": config["splits"],
         "reference_files": sources["files"],
+        "upstream": {
+            "windows_minutes": {role: list(bounds) for role, bounds in UPSTREAM_ROLES.items()},
+            "snapshot_minutes": UPSTREAM_SNAPSHOT_MINUTES,
+            "availability_lag_minutes": UPSTREAM_LAG_MINUTES,
+            "history_minutes": UPSTREAM_HISTORY_MINUTES,
+            "uncovered_edge_hours": UPSTREAM_EDGE_HOURS,
+        },
         "taxi_out": {
             "availability": "verified wheels-off plus assumed reporting lag",
             "availability_lag_minutes": TAXI_AVAILABILITY_LAG_MINUTES,
@@ -76,7 +96,16 @@ def feature_policy(root: Union[str, Path], config: dict[str, Any]) -> dict[str, 
     }
 
 
-def file_fingerprints(directory: Path, pattern: str) -> list[dict[str, Any]]:
+def feature_months(settings):
+    core = {date(year, month, 1) for year, month in iter_months(settings["start_month"], settings["end_month"])}
+    # Adjacent schedules contribute to windows at the study boundaries, but
+    # their flights never enter the model cohort.
+    previous = (min(core) - timedelta(days=1)).replace(day=1)
+    following = (max(core) + timedelta(days=32)).replace(day=1)
+    return core, {previous, following}
+
+
+def file_fingerprints(directory: Path, pattern: str, months) -> list[dict[str, Any]]:
     """Generate path, byte size, and mtime fingerprints for matching files."""
     return [
         {
@@ -84,7 +113,8 @@ def file_fingerprints(directory: Path, pattern: str) -> list[dict[str, Any]]:
             "bytes": p.stat().st_size,
             "modified_ns": p.stat().st_mtime_ns,
         }
-        for p in sorted(directory.glob(pattern))
+        for month in sorted(months)
+        for p in sorted((directory / month.strftime("%Y/%m")).glob(pattern))
     ]
 
 
@@ -97,23 +127,28 @@ def feature_manifest(
     """Build a complete provenance dictionary covering policy and input files."""
     root = Path(root)
     bronze = Path(bronze_dir or project_path(root, config["datasets"]["bts"]["output_directory"]))
-    silver = Path(silver_dir or root / "data/silver/bts")
+    silver = Path(silver_dir or active(root, "silver"))
+    core, adjacent = feature_months(config["datasets"]["bts"])
     return {
         **feature_policy(root, config),
-        "bronze_files": file_fingerprints(bronze, "*/*/*.csv"),
-        "silver_files": file_fingerprints(silver, "*/*/*.parquet"),
+        "bronze_files": file_fingerprints(bronze, "*.csv", core | adjacent),
+        "silver_files": file_fingerprints(silver, "*.parquet", core),
     }
 
 
 def features_current(root: Union[str, Path], config: dict[str, Any]) -> bool:
     """Check whether BTS Gold datasets exist and match the current feature manifest."""
-    gold = Path(root) / "data/gold/bts"
+    gold = active(Path(root), "gold")
+    if gold.parent.name == "bts_generations":
+        from .cache import features_current as generation_current
+        return generation_current(Path(root), config)
     try:
         recorded = json.loads((gold / "_features.json").read_text())
         return (
             isinstance(recorded, dict)
             and all((gold / split / "_SUCCESS").exists() for split in config["splits"])
             and recorded.pop("taxi_baselines_sha256") == sha256(gold / TAXI_BASELINE_FILE)
+            and isinstance(recorded.pop("upstream_coverage"), dict)
             and recorded == feature_manifest(root, config)
         )
     except (KeyError, OSError, ValueError):
@@ -233,6 +268,28 @@ def event_clocks(row: Row, airports: dict[str, list[dict[str, Any]]]) -> tuple[O
         return None, None
 
     return departure, arrival
+
+
+def scheduled_clocks(
+    row: Any,
+    airports: dict,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve scheduled UTC clocks using only schedule fields."""
+    scheduled, _ = local_cutoff(
+        row.FlightDate, row.CRSDepTime, airport_zone(airports, row.Origin, row.FlightDate)
+    )
+    if scheduled is None:
+        return None, None
+    elapsed = valid_delay(row.CRSElapsedTime)
+    scheduled_arrival = None
+    if elapsed is not None and elapsed > 0:
+        try:
+            instant = scheduled + timedelta(minutes=elapsed)
+            if clock_matches(instant, row.CRSArrTime, event_zone(airports, row.Dest, instant)):
+                scheduled_arrival = instant.isoformat() + "Z"
+        except (OverflowError, ValueError):
+            pass
+    return scheduled.isoformat() + "Z", scheduled_arrival
 
 
 def build_events(raw: DataFrame, airports: dict[str, list[dict[str, Any]]]) -> DataFrame:

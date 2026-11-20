@@ -158,7 +158,7 @@ def test_feature_freshness_checks_sources_references_policy_and_splits(tmp_path)
     sources = {"files": {"airports.csv": sha256(reference / "airports.csv")}}
     write_json(reference / "sources.json", sources)
     config = {"bts_features": {"rolling_window_minutes": 120}, "splits": {"train": {}},
-              "datasets": {"bts": {"output_directory": "bronze"}, "weather": {"reference_directory": "refs"}}}
+              "datasets": {"bts": {"output_directory": "bronze", "start_month": "2024-01", "end_month": "2024-01"}, "weather": {"reference_directory": "refs"}}}
     bronze = tmp_path / "bronze/2024/01/events.csv"
     bronze.parent.mkdir(parents=True)
     bronze.write_text("events")
@@ -171,7 +171,7 @@ def test_feature_freshness_checks_sources_references_policy_and_splits(tmp_path)
 
     def save_manifest():
         write_json(gold / "_features.json", {**recent.feature_manifest(tmp_path, config),
-                                             "taxi_baselines_sha256": sha256(lookup)})
+                                             "taxi_baselines_sha256": sha256(lookup), "upstream_coverage": {}})
 
     save_manifest()
     assert recent.features_current(tmp_path, config)
@@ -206,3 +206,75 @@ def test_origin_workflow_prepares_only_stale_features_without_scoring(tmp_path, 
         with pytest.raises(RuntimeError, match="stop before training"):
             pipeline.run_origin_weather()
         assert stage.call_count == (0 if current else 3)
+
+
+def test_upstream_pressure_weights_coverage_and_cutoff(spark):
+    from scripts.bts.upstream import add_upstream_pressure
+
+    day = date(2024, 10, 15)
+    cutoff = int(datetime(2024, 10, 15, 16, 0, tzinfo=timezone.utc).timestamp())
+    flights = spark.createDataFrame([
+        ("target", day, "JFK", "LAX", "1200", "1500", 360, 1, "val"),
+        ("empty", day, "JFK", "LAX", "1800", "2100", 360, 0, "val"),
+        ("weighted", day, "LAX", "JFK", "0900", "1800", 360, 0, "val"),
+        ("unknown", day, "XXX", "LAX", "1200", "1500", 360, 0, "val"),
+    ], "flight_id string, FlightDate date, Origin string, Dest string, CRSDepTime string, "
+       "CRSArrTime string, CRSElapsedTime int, ArrDel15 int, split string")
+    schedule = spark.createDataFrame([
+        ("a", "LAX", "JFK", cutoff, "usable"),
+        ("b", "LAX", "JFK", cutoff + 600, "usable"),
+        ("c", "LAX", "JFK", cutoff + 3599, "usable"),
+        ("d", "ORD", "JFK", cutoff + 1200, "usable"),
+        ("outside", "ORD", "JFK", cutoff + 3600, "usable"),
+        ("target", "JFK", "LAX", cutoff + 21600, "usable"),
+        ("dest", "JFK", "LAX", cutoff + 21600, "usable"),
+        ("weighted-a", "JFK", "LAX", cutoff + 600, "usable"),
+        ("weighted-b", "JFK", "LAX", cutoff + 1200, "usable"),
+        ("weighted-c", "JFK", "LAX", cutoff + 1800, "usable"),
+        ("weighted-d", "DFW", "LAX", cutoff + 2400, "usable"),
+    ], "flight_id string, Origin string, Dest string, arrival long, status string")
+    events = spark.createDataFrame([
+        ("lo", "LAX", "departure", cutoff - 8100, 15),
+        ("ok", "LAX", "departure", cutoff - 901, 0),
+        ("upper", "LAX", "departure", cutoff - 900, 30),
+        ("old", "LAX", "departure", cutoff - 8101, 30),
+        ("target", "JFK", "departure", cutoff - 901, 0),
+        ("known", "JFK", "departure", cutoff - 1200, 30),
+        ("future", "JFK", "departure", cutoff + 300, 0),
+        ("late-dfw", "DFW", "departure", cutoff - 1200, 30),
+    ], "flight_id string, airport string, role string, event_seconds long, minutes int")
+    rows = {row.flight_id: row for row in add_upstream_pressure(flights, schedule, events, airports(), []).collect()}
+    target = rows["target"]
+    assert (target.ArrDel15, target.split) == (1, "val")
+    assert (target.origin_upstream_delay_pressure, target.origin_upstream_scheduled_arrivals,
+            target.origin_upstream_observed_share) == (0.5, 4, 0.75)
+    assert (target.dest_upstream_delay_pressure, target.dest_upstream_scheduled_arrivals,
+            target.dest_upstream_observed_share) == (1.0, 1, 1.0)
+    weighted = rows["weighted"]
+    assert (weighted.origin_upstream_delay_pressure, weighted.origin_upstream_scheduled_arrivals,
+            weighted.origin_upstream_observed_share) == (0.625, 4, 1.0)
+    assert rows["empty"].origin_upstream_scheduled_arrivals == 0
+    assert rows["empty"].origin_upstream_delay_pressure is None
+    assert all(rows["unknown"][name] is None for name in recent.UPSTREAM_FEATURES)
+
+
+def test_inbound_schedule_keeps_canceled_flights_and_rejects_conflicting_clocks(spark):
+    from scripts.bts.upstream import build_inbound_schedule, uncovered_month_edges
+
+    raw = spark.createDataFrame([
+        ("2024-10-15", "AA", "1", "JFK", "LAX", "1200", "1500", "360", 1),
+        ("2024-10-15", "AA", "1", "JFK", "LAX", "1200", "1500", "360", 1),
+        ("2024-10-15", "AA", "2", "JFK", "LAX", "1200", "1500", "360", 0),
+        ("2024-10-15", "AA", "2", "JFK", "LAX", "1200", "1530", "390", 0),
+        ("2024-11-03", "AA", "3", "JFK", "LAX", "0130", "0430", "360", 0),
+    ], ["FlightDate", "Reporting_Airline", "Flight_Number_Reporting_Airline",
+        "Origin", "Dest", "CRSDepTime", "CRSArrTime", "CRSElapsedTime", "Cancelled"])
+    schedule = {row.flight_id: row.status for row in build_inbound_schedule(raw, airports()).collect()}
+    assert schedule == {
+        "2024-10-15_AA_1_JFK_LAX_1200": "usable",
+        "2024-10-15_AA_2_JFK_LAX_1200": "conflict",
+        "2024-11-03_AA_3_JFK_LAX_0130": "unresolved",
+    }
+    october = date(2024, 10, 1)
+    assert len(uncovered_month_edges({october}, {october})) == 2
+    assert uncovered_month_edges({october}, {date(2024, 9, 1), october, date(2024, 11, 1)}) == []

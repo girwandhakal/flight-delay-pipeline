@@ -25,7 +25,7 @@ class TrainingTests(unittest.TestCase):
     def flights(self):
         rows = [("AA" if i % 2 else "DL", "ORD", "LAX", i // 4 + 1, i % 7 + 1, i % 24,
                  (i + 3) % 24, 120.0 + i, 800.0 + i * 5, int(i % 3 == 0), date(2024, i // 4 + 1, i % 4 + 1)) for i in range(36)]
-        rows = [tuple(row[:9]) + (0.25, 8.0, 4.0, 0.5, 10.0, 6.0, 18.0, 5.0, 3, 0, 0, 0) + tuple(row[9:]) for row in rows]
+        rows = [tuple(row[:9]) + (0.25, 8.0, 4.0, 0.5, 10.0, 6.0, 18.0, 5.0, 3, 0, 0, 0, 0.2, 3, 1.0, 0.4, 4, 0.5) + tuple(row[9:]) for row in rows]
         return self.spark.createDataFrame(rows, bts.INPUT_FEATURES + [bts.TARGET_COL, "FlightDate"]).coalesce(2)
 
     def test_evaluation_matches_hand_counts(self):

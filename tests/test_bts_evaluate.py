@@ -40,7 +40,7 @@ class EvaluateTests(unittest.TestCase):
             )
             for i in range(count)
         ]
-        rows = [tuple(row[:9]) + (0.25, 8.0, 4.0, 0.5, 10.0, 6.0, 18.0, 5.0, 3, 0, 0, 0) + tuple(row[9:]) for row in rows]
+        rows = [tuple(row[:9]) + (0.25, 8.0, 4.0, 0.5, 10.0, 6.0, 18.0, 5.0, 3, 0, 0, 0, 0.2, 3, 1.0, 0.4, 4, 0.5) + tuple(row[9:]) for row in rows]
         columns = bts_tr.INPUT_FEATURES + [bts_eval.TARGET_COL]
         return self.spark.createDataFrame(rows, columns).coalesce(2)
 
