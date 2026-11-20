@@ -414,7 +414,10 @@ class DestinationSparkTests(unittest.TestCase):
 
     def test_combined_vector_prefix_means_and_reload(self):
         columns = train.INPUT_FEATURES
-        fitting = self.spark.createDataFrame([("AA", "ORD", "LAX", 1, 1, 12, 15, 120.0, 800.0, 0.25, 8.0, 4.0, 0.5, 10.0, 6.0, 0, 0, 0)], columns)
+        fitting = self.spark.createDataFrame([
+            ("AA", "ORD", "LAX", 1, 1, 12, 15, 120.0, 800.0,
+             0.25, 8.0, 4.0, 0.5, 10.0, 6.0, 18.0, 5.0, 3, 0, 0, 0),
+        ], columns)
         for name in origin.WEATHER_NUMERIC:
             fitting = fitting.withColumn(name, F.lit(10.0))
         for name in destination.DESTINATION_WEATHER_NUMERIC:
