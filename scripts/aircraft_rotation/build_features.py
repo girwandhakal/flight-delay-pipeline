@@ -19,17 +19,16 @@ RAW_COLUMNS = [*EVENT_COLUMNS, "Tail_Number", "CRSArrTime", "Cancelled"]
 KEY_COLUMNS = ["Reporting_Airline", "Flight_Number_Reporting_Airline", "Origin", "Dest"]
 
 
-def operation_clocks(
+def scheduled_clocks(
     row: Any,
-    airports: list[dict[str, str]],
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """Resolve scheduled departure, scheduled arrival, and actual arrival UTC clocks."""
+    airports: dict,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve scheduled UTC clocks using only schedule fields."""
     scheduled, _ = local_cutoff(
         row.FlightDate, row.CRSDepTime, airport_zone(airports, row.Origin, row.FlightDate)
     )
     if scheduled is None:
-        return None, None, None
-    departure, arrival = event_clocks(row, airports)
+        return None, None
     elapsed = valid_delay(row.CRSElapsedTime)
     scheduled_arrival = None
     if elapsed is not None and elapsed > 0:
@@ -39,9 +38,20 @@ def operation_clocks(
                 scheduled_arrival = instant.isoformat() + "Z"
         except (OverflowError, ValueError):
             pass
+    return scheduled.isoformat() + "Z", scheduled_arrival
+
+
+def operation_clocks(
+    row: Any, airports: dict,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Resolve scheduled departure, scheduled arrival, and actual arrival UTC clocks."""
+    scheduled, scheduled_arrival = scheduled_clocks(row, airports)
+    if scheduled is None:
+        return None, None, None
+    departure, arrival = event_clocks(row, airports)
     if not departure or not arrival or valid_delay(row.Cancelled) != 0:
         arrival = None
-    return scheduled.isoformat() + "Z", scheduled_arrival, arrival
+    return scheduled, scheduled_arrival, arrival
 
 
 def build_operations(raw: DataFrame, airports: list[dict[str, str]]) -> DataFrame:

@@ -10,6 +10,7 @@ from typing import Any, Optional, Union
 from scripts.progress import stage
 from scripts.results import records, update_results
 from scripts.aircraft_rotation.build_features import ROTATION_FLAGS, ROTATION_NUMERIC
+from scripts.enroute_weather.build_features import ENROUTE_FLAGS, ENROUTE_NUMERIC, FEATURES as ENROUTE_FEATURES
 
 import pandas as pd
 from pyspark import StorageLevel
@@ -30,12 +31,15 @@ from .recent_delays import FEATURES as RECENT_CALENDAR_FEATURES, ROLLING_FEATURE
 FEATURE_SETS = ("bts", "bts_origin_weather", "bts_origin_destination_weather")
 ROTATION_FEATURE_SET = "bts_origin_destination_weather_rotation"
 ALL_FEATURE_SETS = (*FEATURE_SETS, ROTATION_FEATURE_SET)
+ENROUTE_FEATURE_SET = "bts_origin_destination_weather_rotation_enroute"
+ROTATION_FEATURE_SETS = (ROTATION_FEATURE_SET, ENROUTE_FEATURE_SET)
+TRAINING_FEATURE_SETS = (*FEATURE_SETS, *ROTATION_FEATURE_SETS)
 
 
 def weather_columns(feature_set: str) -> tuple[list[str], list[str]]:
     """Return numeric and binary flag column names for the given weather feature set."""
     numeric, flags = WEATHER_NUMERIC.copy(), WEATHER_FLAGS.copy()
-    if feature_set in ("bts_origin_destination_weather", ROTATION_FEATURE_SET):
+    if feature_set in ("bts_origin_destination_weather", *ROTATION_FEATURE_SETS):
         numeric += DESTINATION_WEATHER_NUMERIC
         flags += DESTINATION_WEATHER_FLAGS
     return numeric, flags
@@ -57,16 +61,17 @@ GBT_PARAMS = {"maxDepth": 3, "maxIter": 50, "stepSize": 0.05, "seed": 42}
 THRESHOLDS = [round(i * 0.05, 2) for i in range(1, 20)]
 
 
-def build_preprocessor(feature_set: str = "bts") -> Pipeline:
+def build_preprocessor(feature_set: str = "bts", *,
+                       empty_enroute: tuple[str, ...] = ()) -> Pipeline:
     """Build the PySpark ML pipeline stages for feature preprocessing.
 
     Encodes categorical features with StringIndexer and OneHotEncoder, adds
     cyclical month features and filled rolling features, imputes weather
     features with training means when present, and assembles a feature vector.
     """
-    if feature_set not in ALL_FEATURE_SETS:
+    if feature_set not in TRAINING_FEATURE_SETS:
         raise ValueError(f"Unknown feature set: {feature_set}")
-    include_rotation = feature_set == ROTATION_FEATURE_SET
+    include_rotation = feature_set in ROTATION_FEATURE_SETS
     indices = [name + "_idx" for name in CATEGORICAL_FEATURES]
     vectors = [name + "_vec" for name in CATEGORICAL_FEATURES]
     stages = [
@@ -84,7 +89,7 @@ def build_preprocessor(feature_set: str = "bts") -> Pipeline:
         stages.append(Imputer(inputCols=weather_numeric, outputCols=imputed, strategy="mean"))
         # Preserve exact vector ordering: origin numeric + flags, then destination numeric + flags.
         numeric += [name + "_imputed" for name in WEATHER_NUMERIC] + WEATHER_FLAGS
-        if feature_set in ("bts_origin_destination_weather", ROTATION_FEATURE_SET):
+        if feature_set in ("bts_origin_destination_weather", *ROTATION_FEATURE_SETS):
             numeric += [name + "_imputed" for name in DESTINATION_WEATHER_NUMERIC] + DESTINATION_WEATHER_FLAGS
     filled = [*ROLLING_FEATURES, *ROTATION_NUMERIC] if include_rotation else ROLLING_FEATURES
     if include_rotation:
@@ -96,6 +101,15 @@ def build_preprocessor(feature_set: str = "bts") -> Pipeline:
         + ", ".join(f"COALESCE({name}, 0D) AS {name}_filled" for name in filled)
         + " FROM __THIS__"
     )))
+    if feature_set == ENROUTE_FEATURE_SET:
+        impute = [name for name in ENROUTE_NUMERIC if name not in empty_enroute]
+        fill = [*ENROUTE_FLAGS, *empty_enroute]
+        stages.append(SQLTransformer(statement="SELECT *, " + ", ".join(
+            f"COALESCE({name}, 0D) AS {name}_filled" for name in fill
+        ) + " FROM __THIS__"))
+        if impute:
+            stages.append(Imputer(inputCols=impute, outputCols=[f"{name}_filled" for name in impute], strategy="median"))
+        numeric += [f"{name}_filled" for name in ENROUTE_FEATURES]
     stages.append(
         VectorAssembler(
             inputCols=vectors + numeric, outputCol="features", handleInvalid="error"
@@ -256,6 +270,7 @@ def train(
     publish_results: bool = True,
     *,
     include_gbt: bool = False,
+    model_name: str = "baseline_pipeline",
 ) -> dict[str, Any]:
     """Train and validate classification models on Gold feature sets.
 
@@ -263,11 +278,11 @@ def train(
     performance across decision thresholds on the validation cohort, optionally
     saves models and predictions, and updates project results.
     """
-    if feature_set not in ALL_FEATURE_SETS:
+    if feature_set not in TRAINING_FEATURE_SETS:
         raise ValueError(f"Unknown feature set: {feature_set}")
-    include_rotation = feature_set == ROTATION_FEATURE_SET
+    include_rotation = feature_set in ROTATION_FEATURE_SETS
     if include_rotation and (include_gbt or publish_results):
-        raise ValueError("Aircraft rotation requires an isolated combined-weather logistic comparison.")
+        raise ValueError("Aircraft rotation and en-route weather require an isolated combined-weather logistic comparison.")
     if feature_set != "bts" and any(
         path is None for path in (gold_dir, models_dir)
     ):
@@ -287,6 +302,8 @@ def train(
         columns += numeric + flags
     if include_rotation:
         columns += [*ROTATION_NUMERIC, *ROTATION_FLAGS]
+    if feature_set == ENROUTE_FEATURE_SET:
+        columns += list(ENROUTE_FEATURES)
     metadata = ["flight_id", "FlightDate"] if save_predictions else []
     # Leave JVM heap for concurrent classifier tasks rather than duplicated training rows.
     train_features = train_data.select("FlightDate", *columns).persist(StorageLevel.DISK_ONLY)
@@ -295,6 +312,7 @@ def train(
     timings = {}
     vector_dimension: Optional[int] = None
     imputation_means: dict[str, float] = {}
+    empty_enroute = ()
 
     try:
         with stage(f"{feature_set}: prepare training and validation cohorts",
@@ -306,6 +324,9 @@ def train(
             if feature_set != "bts":
                 validate_weather(val_features, "validation", feature_set, require_values=False)
                 validate_weather(train_features, "full training", feature_set)
+            if feature_set == ENROUTE_FEATURE_SET:
+                observed = train_features.agg(*[F.count(name).alias(name) for name in ENROUTE_NUMERIC]).first()
+                empty_enroute = tuple(name for name in ENROUTE_NUMERIC if not observed[name])
             val_count = val_features.count()
         prevalence = training_stats["prevalence"]
         print(
@@ -357,7 +378,9 @@ def train(
             print(f"  Fitting {name} on all training flights with fixed settings: "
                   f"{LOGISTIC_PARAMS if name == 'logistic_regression' else GBT_PARAMS}", flush=True)
             with stage(f"{label}: fit preprocessing", timings=algorithm_timings, key="preprocessor_fit"):
-                preprocessor = build_preprocessor(feature_set).fit(train_features)
+                preprocessor = build_preprocessor(
+                    feature_set, empty_enroute=empty_enroute,
+                ).fit(train_features)
             with stage(f"{label}: fit classifier", timings=algorithm_timings, key="classifier_fit"):
                 classifier = estimator.fit(preprocessor.transform(train_features))
                 selected_model = PipelineModel(stages=[*preprocessor.stages, classifier])
@@ -385,7 +408,7 @@ def train(
             with stage(f"{label}: save model and threshold",
                        timings=algorithm_timings, key="save_model_and_threshold"):
                 directory.mkdir(parents=True, exist_ok=True)
-                selected_model.write().overwrite().save(str(directory / "baseline_pipeline"))
+                selected_model.write().overwrite().save(str(directory / model_name))
                 (directory / "threshold.json").write_text(json.dumps({
                     "threshold": threshold, "positive_class": 1,
                     "decision_rule": "p_delayed >= threshold",
@@ -437,6 +460,7 @@ def train(
             "gold_dir": str(gold_dir),
             "vector_dimension": vector_dimension,
             "imputation_means": imputation_means,
+            **({"enroute_all_missing_training_columns": list(empty_enroute)} if feature_set == ENROUTE_FEATURE_SET else {}),
             "seasonal_encoding": "MonthSin=sin(2*pi*(Month-1)/12), MonthCos=cos(2*pi*(Month-1)/12)",
             "training_rows": training_stats["rows"],
             "validation_rows": val_count,

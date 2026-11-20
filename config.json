@@ -9,6 +9,15 @@
       "product": "lcdv2",
       "output_directory": "data/bronze/weather",
       "reference_directory": "data/reference/weather/2024-2025-v1"
+    },
+    "taf": {
+      "bronze_directory": "data/bronze/taf",
+      "silver_directory": "data/silver/taf",
+      "station_limit": 50
+    },
+    "sigmets": {
+      "bronze_directory": "data/bronze/sigmets",
+      "silver_directory": "data/silver/sigmets"
     }
   },
   "modeling": {

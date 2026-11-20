@@ -38,7 +38,7 @@ class TestBuildFeatures(unittest.TestCase):
                 "flight_id,FlightDate,Reporting_Airline,Flight_Number_Reporting_Airline,Origin,Dest,CRSDepTime,CRSArrTime,CRSElapsedTime,Distance,ArrDel15,Cancelled,Diverted,source_file,Year,Month\n",
                 "2024-01-01_AA_101_JFK_LAX_0600,2024-01-01,AA,101,JFK,LAX,0600,0930,330.0,2475.0,0,0,0,test.csv,2024,1\n",
                 "2024-01-07_DL_202_ATL_ORD_2400,2024-01-07,DL,202,ATL,ORD,2400,0115,135.0,606.0,1,0,0,test.csv,2024,1\n",
-                "2024-10-15_UA_303_SFO_DEN_1415,2024-10-15,UA,303,SFO,DEN,1415,1745,150.0,967.0,0,0,0,test.csv,2024,10\n",
+                "2024-10-15_UA_303_JFK_DEN_1415,2024-10-15,UA,303,JFK,DEN,1415,1745,150.0,967.0,0,0,0,test.csv,2024,10\n",
                 "2025-01-10_WN_404_MDW_BWI_2130,2025-01-10,WN,404,MDW,BWI,2130,0020,110.0,607.0,1,0,0,test.csv,2025,1\n",
             ]
 
@@ -67,17 +67,27 @@ class TestBuildFeatures(unittest.TestCase):
             raw_month = bronze / "2024/01"
             raw_month.mkdir(parents=True)
             raw_events = raw_df
-            for name in ("DepTime", "DepDelay", "ArrTime", "ArrDelay"):
+            for name in ("DepTime", "DepDelay", "ArrTime", "ArrDelay", "TaxiOut", "WheelsOff"):
                 raw_events = raw_events.withColumn(name, F.lit(None).cast("string"))
             earlier = (raw_events.filter("Flight_Number_Reporting_Airline = '101'")
                 .withColumn("Flight_Number_Reporting_Airline", F.lit("999"))
                 .withColumn("CRSDepTime", F.lit("0430"))
                 .withColumn("DepTime", F.lit("0500"))
                 .withColumn("DepDelay", F.lit("30"))
+                .withColumn("TaxiOut", F.lit("20"))
+                .withColumn("WheelsOff", F.lit("0520"))
                 .withColumn("ArrTime", F.lit("0730"))
                 .withColumn("ArrDelay", F.lit("30"))
                 .withColumn("ArrDel15", F.lit(None).cast("int")))
-            raw_events = raw_events.unionByName(earlier)
+            training_taxi = (raw_events.filter("Flight_Number_Reporting_Airline = '101'")
+                .withColumn("DepTime", F.lit("0600")).withColumn("DepDelay", F.lit("0"))
+                .withColumn("TaxiOut", F.lit("10")).withColumn("WheelsOff", F.lit("0610")))
+            validation_taxi = (raw_events.filter("Flight_Number_Reporting_Airline = '303'")
+                .withColumn("Flight_Number_Reporting_Airline", F.lit("998"))
+                .withColumn("CRSDepTime", F.lit("1300"))
+                .withColumn("DepTime", F.lit("1300")).withColumn("DepDelay", F.lit("0"))
+                .withColumn("TaxiOut", F.lit("35")).withColumn("WheelsOff", F.lit("1335")))
+            raw_events = raw_events.unionByName(earlier).unionByName(training_taxi).unionByName(validation_taxi)
             raw_events.coalesce(1).write.option("header", True).csv(str(raw_month / "events"))
             event_csv = next((raw_month / "events").glob("*.csv"))
             event_csv.rename(raw_month / "events.csv")
@@ -117,7 +127,13 @@ class TestBuildFeatures(unittest.TestCase):
 
             self.assertEqual(train_df.count(), 2)
             self.assertEqual(val_df.count(), 1)
+            self.assertEqual(val_df.first()["origin_departure_taxi_out_surge_2h"], 25.0)
             self.assertEqual(test_df.count(), 1)
+            identity = ["flight_id", "FlightDate", "ArrDel15"]
+            original = raw_df.select(*identity)
+            enriched = train_df.unionByName(val_df).unionByName(test_df).select(*identity)
+            self.assertEqual(original.exceptAll(enriched).count(), 0)
+            self.assertEqual(enriched.exceptAll(original).count(), 0)
 
             train_records = {r["flight_id"]: r for r in train_df.collect()}
             # AA flight: 2024-01-01 (Monday), dep 0600 -> hour 6, arr 0930 -> hour 9
@@ -131,6 +147,9 @@ class TestBuildFeatures(unittest.TestCase):
             self.assertEqual(aa["origin_departure_count_2h"], 1)
             self.assertEqual(aa["origin_departure_delay_rate_2h"], 1.0)
             self.assertEqual(aa["origin_departure_mean_delay_minutes_2h"], 30.0)
+            self.assertEqual(aa["origin_departure_mean_taxi_out_2h"], 20.0)
+            self.assertEqual(aa["origin_departure_taxi_out_count_2h"], 1)
+            self.assertEqual(aa["origin_departure_taxi_out_surge_2h"], 8.0)
             self.assertIsNone(aa["destination_arrival_delay_rate_2h"])
             self.assertTrue((gold / "_features.json").exists())
 

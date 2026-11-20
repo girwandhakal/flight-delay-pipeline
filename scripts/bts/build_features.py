@@ -34,9 +34,10 @@ from pyspark import StorageLevel
 from pyspark.sql import SparkSession, functions as F
 
 from .recent_delays import (
+    TAXI_BASELINE_FALLBACK_MINUTES, TAXI_BASELINE_FILE, TAXI_MEAN, TAXI_SURGE, compute_unimpeded_taxi_baselines,
     add_cutoffs, add_holidays, add_recent_delays, build_events, feature_manifest, load_airports,
 )
-from scripts.origin_weather.download import project_path, write_json
+from scripts.origin_weather.download import project_path, sha256, write_json
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -61,8 +62,8 @@ configure_spark_env()
 def get_spark_session(app_name: str = "bts_features") -> SparkSession:
     """Create or retrieve a tuned local Spark session bounded for laptop execution.
 
-    Configures local[2] parallelism, 6GB driver memory, 64 shuffle partitions,
-    and adaptive execution parameters.
+    Configures loopback networking, local[2] parallelism, 6GB driver memory,
+    64 shuffle partitions, and adaptive execution parameters.
     """
     python_path = os.environ.get("PYTHONPATH", "")
     if str(ROOT) not in python_path.split(os.pathsep):
@@ -71,6 +72,8 @@ def get_spark_session(app_name: str = "bts_features") -> SparkSession:
     return (
         SparkSession.builder.master("local[2]")
         .appName(app_name)
+        .config("spark.driver.host", "127.0.0.1")
+        .config("spark.driver.bindAddress", "127.0.0.1")
         .config("spark.driver.memory", "6g")
         .config("spark.sql.shuffle.partitions", "64")
         .config("spark.sql.files.maxPartitionBytes", "32m")
@@ -98,7 +101,7 @@ def build_features(
     publish_results: bool = True,
     bronze_dir: Optional[Union[str, Path]] = None,
 ) -> pd.DataFrame:
-    """Construct schedule, rolling delay, and holiday features and partition into chronological splits.
+    """Construct schedule, rolling delay, taxi-out and holiday features for chronological splits.
 
     Generates:
     - Month, DayOfWeek (Monday=1..Sunday=7), DepHour (0-23), ArrHour (0-23).
@@ -197,11 +200,22 @@ def build_features(
     events = build_events(spark.read.csv([str(p) for p in csv_files], header=True), airports)
     events = events.persist(StorageLevel.DISK_ONLY)
     try:
+        baselines = compute_unimpeded_taxi_baselines(events, feature_df, splits, airports)
+        # Materialize the small lookup once for both the join and the published reference.
+        baseline_rows = baselines.orderBy("Origin", "taxi_snapshot").collect()
+        baseline_lookup = spark.createDataFrame(baseline_rows, baselines.schema)
         feature_df = add_recent_delays(
             add_cutoffs(feature_df, airports),
             events,
             manifest["rolling_window_minutes"],
         )
+        feature_df = (feature_df.withColumn(
+            "taxi_snapshot",
+            F.when(F.col("split") == "train", F.date_format("FlightDate", "yyyy-MM")).otherwise("evaluation"),
+        ).join(F.broadcast(baseline_lookup), ["Origin", "taxi_snapshot"], "left")
+          .withColumn(TAXI_SURGE, F.col(TAXI_MEAN) - F.coalesce("unimpeded_taxi_minutes",
+                                                               F.lit(TAXI_BASELINE_FALLBACK_MINUTES)))
+          .drop("taxi_snapshot", "unimpeded_taxi_minutes"))
         feature_df = add_holidays(feature_df, splits["train"]["start_date"], splits["test"]["end_date"])
         feature_df = feature_df.persist(StorageLevel.DISK_ONLY)
 
@@ -240,7 +254,9 @@ def build_features(
                 })
             summary_records.append(record)
 
-        write_json(gold_dir / "_features.json", manifest)
+        baseline_path = gold_dir / TAXI_BASELINE_FILE
+        write_json(baseline_path, [row.asDict() for row in baseline_rows])
+        write_json(gold_dir / "_features.json", {**manifest, "taxi_baselines_sha256": sha256(baseline_path)})
         summary_pd = pd.DataFrame(summary_records)
         if publish_results:
             update_results({"bts": {"splits": records(summary_pd)}}, results_dir)

@@ -21,19 +21,20 @@ Accurate pre-departure flight delay forecasting poses significant data science c
 2. **Cascading Network Disruptions**: Delays do not occur in isolation. An incoming aircraft arriving late at a gate propagates downstream delays across subsequent flights on that physical airframe (aircraft rotation).
 3. **Data Engineering Scale**: Joining multi-gigabyte continuous flight schedules with hourly weather readings across hundreds of US airports exceeds standard in-memory Pandas workflows, demanding distributed memory management, custom temporal bucket joins, and out-of-core execution.
 
-**Our Objective**: Build a mathematically rigorous, leakage-free comparative ablation study across four progressive feature regimes to quantify the precise predictive lift of **flight schedules**, **origin weather**, **destination weather**, and **upstream aircraft rotation**.
+**Our Objective**: Measure the incremental predictive value of BTS flight features, origin weather, destination weather, aircraft rotation, and en-route aviation weather using chronological validation.
 
 ---
 
 ## Modeling and Feature Ablation Tiers
 
-The pipeline evaluates four progressive model tiers on identical flight cohorts using out-of-time evaluation:
+The pipeline evaluates five progressive model tiers on identical validation cohorts:
 
 ```
 [ Tier 1: BTS Baseline ]
        │  • Carrier, Origin, Dest, Scheduled Departure & Arrival Hours, Day of Week, Distance
        │  • Cyclical Month Encoding (MonthSin, MonthCos) & US Federal Holiday Proximity
        │  • 2-Hour Rolling Airport Delay Rates (Completed Dep/Arr Congestion Histories)
+       │  • Origin taxi-out mean, observation count, and surge above the airport's training baseline
        ▼
 [ Tier 2: + Origin Weather ]
        │  • Surface Temperature, Dew Point, Relative Humidity, Pressure, Wind Speed & Gusts
@@ -44,8 +45,12 @@ The pipeline evaluates four progressive model tiers on identical flight cohorts 
        │  • Full parallel suite of meteorological features at arrival airport at scheduled departure
        ▼
 [ Tier 4: + Aircraft Rotation Mechanics ]
-          • Prior Flight Arrival Delay of the same physical aircraft (Tail Number tracking)
-          • Scheduled Ground Turnaround Buffer & Operational Availability Flags
+       │  • Prior Flight Arrival Delay of the same physical aircraft (Tail Number tracking)
+       │  • Scheduled Ground Turnaround Buffer & Operational Availability Flags
+       ▼
+[ Tier 5: + TAF and Convective SIGMET ]
+          • Destination forecasts valid at scheduled arrival
+          • Active advisory overlap along the route corridor
 ```
 
 * **Core Estimator**: Binomial Logistic Regression via L-BFGS optimization (`regParam=0.01`, $L_2$ Ridge penalty, `maxIter=100`, `tol=1e-6`).
@@ -55,6 +60,8 @@ The pipeline evaluates four progressive model tiers on identical flight cohorts 
   * **Train Cohort**: `2024-01-01` to `2024-09-30` (~4.2M flights)
   * **Validation Cohort**: `2024-10-01` to `2024-11-30` (~1.2M flights)
   * **Test Holdout**: `2024-12-01` to `2025-01-31` (Frozen out-of-time evaluation)
+
+The BTS stage computes taxi-out surge as the mean taxi time of other flights in the two-hour window ending 15 minutes before scheduled departure, minus the origin airport's 15th-percentile taxi time. It uses verified wheels-off clocks and caps individual observations at 120 minutes. Training uses earlier training months for the baseline. Validation and test share a frozen training baseline. When an airport has no baseline, the feature uses 12 minutes. Gold keeps missing window measurements null and records the observed taxi count. The model fills missing rolling inputs with zero.
 
 ---
 
@@ -146,13 +153,24 @@ python -m pytest
 ## Execution Commands
 
 ### Run Complete End-to-End Pipeline
-Executes data verification, builds Gold datasets, fits all four model tiers, optimizes decision thresholds, and reports comparative ablation metrics on validation data:
+Verifies inputs, downloads the public IEM archives, and fits and validates all five tiers. TAF + SIGMET uses the Tier 4 predictions from the same invocation.
 
 ```bash
 python pipeline/main.py
 ```
 
 ### Run Sub-Workflows & Specific Configurations
+
+The explicit `--include-enroute` command also runs the full five-tier comparison:
+
+```bash
+python pipeline/main.py --include-enroute
+```
+
+This mode downloads public IEM raw TAF bulletins for the top 50 training destinations and domestic convective SIGMET polygons. It caches checksummed archives under `data/bronze/taf/` and `data/bronze/sigmets/`, and writes processed Silver and cohort-preserving `data/gold/enroute/RUN_ID/`. Train and validation use rotation Gold. Test enrichment uses the existing weather-only test Gold because the rotation experiment has no test cohort. The command publishes validation metrics only, including Tier 4 versus en-route PR-AUC, F1, precision, recall and false alarms at both operating points. The direct TAF and nearby-station coverage and the route overlap are reported as modeled features based on public archive coverage.
+
+TAF forecasts must be issued by departure and valid at scheduled arrival. The deterioration feature subtracts the destination ceiling observed by departure. SIGMET features use advisories active at scheduled departure and a buffered great-circle corridor approximation. The report is saved under `models/enroute/RUN_ID/validation_comparison.json`.
+
 * **BTS Baseline Only** (Skip weather ingestion):
   ```bash
   python pipeline/main.py --bts-only
@@ -160,6 +178,10 @@ python pipeline/main.py
 * **Origin Weather Comparison**:
   ```bash
   python pipeline/main.py --origin-weather
+  ```
+* **Three-Tier Weather Comparison**:
+  ```bash
+  python pipeline/main.py --destination-weather
   ```
 * **Include Gradient-Boosted Trees (GBT) Challenger**:
   ```bash

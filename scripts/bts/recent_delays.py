@@ -14,13 +14,22 @@ from pandas.tseries.holiday import USFederalHolidayCalendar
 from pyspark.sql import DataFrame, Row, Window, functions as F
 
 from scripts.origin_weather.build_features import local_cutoff
-from scripts.origin_weather.download import project_path, reference_matches
+from scripts.origin_weather.download import project_path, reference_matches, sha256
 
 ROLLING_FEATURES = [
     f"{role}_{measurement}_2h"
     for role in ("origin_departure", "destination_arrival")
     for measurement in ("delay_rate", "mean_delay_minutes", "count")
 ]
+TAXI_MEAN, TAXI_SURGE, TAXI_COUNT = (
+    "origin_departure_mean_taxi_out_2h", "origin_departure_taxi_out_surge_2h", "origin_departure_taxi_out_count_2h",
+)
+TAXI_FEATURES = [TAXI_MEAN, TAXI_SURGE, TAXI_COUNT]
+ROLLING_FEATURES += TAXI_FEATURES
+TAXI_BASELINE_FILE = "_taxi_out_baselines.json"
+TAXI_AVAILABILITY_LAG_MINUTES = 15
+TAXI_BASELINE_FALLBACK_MINUTES = 12.0
+MAX_TAXI_MINUTES = 120.0
 HOLIDAY_FEATURES = [
     "is_federal_holiday",
     "is_day_before_federal_holiday",
@@ -31,6 +40,7 @@ EVENT_COLUMNS = [
     "FlightDate", "Reporting_Airline", "Flight_Number_Reporting_Airline", "Origin", "Dest",
     "CRSDepTime", "CRSElapsedTime", "DepTime", "DepDelay", "ArrTime", "ArrDelay", "Diverted",
 ]
+BTS_EVENT_COLUMNS = [*EVENT_COLUMNS, "TaxiOut", "WheelsOff", "Cancelled"]
 
 
 def feature_policy(root: Union[str, Path], config: dict[str, Any]) -> dict[str, Any]:
@@ -47,7 +57,7 @@ def feature_policy(root: Union[str, Path], config: dict[str, Any]) -> dict[str, 
             raise ValueError(f"Reference changed: {name}")
 
     return {
-        "version": 1,
+        "version": 2,
         "rolling_window_minutes": window,
         "event_availability": "immediate",
         "delay_threshold_minutes": 15,
@@ -55,6 +65,14 @@ def feature_policy(root: Union[str, Path], config: dict[str, Any]) -> dict[str, 
         "columns": FEATURES,
         "splits": config["splits"],
         "reference_files": sources["files"],
+        "taxi_out": {
+            "availability": "verified wheels-off plus assumed reporting lag",
+            "availability_lag_minutes": TAXI_AVAILABILITY_LAG_MINUTES,
+            "max_observation_minutes": MAX_TAXI_MINUTES,
+            "fallback_baseline_minutes": TAXI_BASELINE_FALLBACK_MINUTES,
+            "baseline_percentile": 0.15,
+            "baseline": "expanding prior training months for train; frozen training baseline for validation and test",
+        },
     }
 
 
@@ -91,9 +109,12 @@ def features_current(root: Union[str, Path], config: dict[str, Any]) -> bool:
     """Check whether BTS Gold datasets exist and match the current feature manifest."""
     gold = Path(root) / "data/gold/bts"
     try:
+        recorded = json.loads((gold / "_features.json").read_text())
         return (
-            all((gold / split / "_SUCCESS").exists() for split in config["splits"])
-            and json.loads((gold / "_features.json").read_text()) == feature_manifest(root, config)
+            isinstance(recorded, dict)
+            and all((gold / split / "_SUCCESS").exists() for split in config["splits"])
+            and recorded.pop("taxi_baselines_sha256") == sha256(gold / TAXI_BASELINE_FILE)
+            and recorded == feature_manifest(root, config)
         )
     except (KeyError, OSError, ValueError):
         return False
@@ -217,13 +238,13 @@ def event_clocks(row: Row, airports: dict[str, list[dict[str, Any]]]) -> tuple[O
 def build_events(raw: DataFrame, airports: dict[str, list[dict[str, Any]]]) -> DataFrame:
     """Extract and validate completed departure and arrival events from raw BTS data.
 
-    Returns DataFrame with columns: [flight_id, role, airport, event_seconds, delay_minutes].
+    Taxi events are timed at verified wheels-off, independently of gate departure events.
     """
-    missing = sorted(set(EVENT_COLUMNS) - set(raw.columns))
+    missing = sorted(set(BTS_EVENT_COLUMNS) - set(raw.columns))
     if missing:
         raise ValueError(f"BTS event columns missing: {missing}; acquire complete BTS CSVs.")
 
-    source = raw.select(*[F.trim(F.col(c)).alias(c) for c in EVENT_COLUMNS])
+    source = raw.select(*[F.trim(F.col(c)).alias(c) for c in BTS_EVENT_COLUMNS])
     source = source.filter(F.col("CRSDepTime").rlike(r"^\d{1,4}$"))
     for identifier in ("Reporting_Airline", "Flight_Number_Reporting_Airline", "Origin", "Dest"):
         source = source.filter(F.col(identifier).isNotNull() & (F.col(identifier) != ""))
@@ -236,27 +257,51 @@ def build_events(raw: DataFrame, airports: dict[str, list[dict[str, Any]]]) -> D
         F.concat_ws("_", "FlightDate", "Reporting_Airline", "Flight_Number_Reporting_Airline", "Origin", "Dest", "CRSDepTime")
     )
 
-    convert = F.udf(lambda row: event_clocks(row, airports), "departure string, arrival string")
-    source = source.withColumn("clocks", convert(F.struct(*EVENT_COLUMNS)))
+    def clocks(row):
+        departure, arrival = event_clocks(row, airports)
+        taxi = valid_delay(row.TaxiOut)
+        if departure and taxi is not None and taxi > 0 and valid_delay(row.Cancelled) == 0:
+            try:
+                wheels_off = datetime.fromisoformat(departure[:-1]) + timedelta(minutes=taxi)
+                if clock_matches(wheels_off, row.WheelsOff, event_zone(airports, row.Origin, wheels_off)):
+                    return departure, arrival, wheels_off.isoformat() + "Z", min(taxi, MAX_TAXI_MINUTES)
+            except (OverflowError, ValueError):
+                pass
+        return departure, arrival, None, None
 
-    events = []
-    for role, airport, delay in (("departure", "Origin", "DepDelay"), ("arrival", "Dest", "ArrDelay")):
-        events.append(
-            source.select(
-                "flight_id",
+    convert = F.udf(clocks, "departure string, arrival string, taxi string, taxi_minutes double")
+    source = source.withColumn("clocks", convert(F.struct(*BTS_EVENT_COLUMNS)))
+
+    event_columns = []
+    for role, airport, minutes in (
+        ("departure", "Origin", "DepDelay"), ("arrival", "Dest", "ArrDelay"), ("taxi", "Origin", "clocks.taxi_minutes"),
+    ):
+        event_time = F.to_timestamp(f"clocks.{role}")
+        if role == "taxi":
+            event_time = F.ceil(event_time.cast("double"))
+        event_columns.append(
+            F.struct(
                 F.col(airport).alias("airport"),
                 F.lit(role).alias("role"),
-                F.to_timestamp(f"clocks.{role}").cast("long").alias("event_seconds"),
-                F.col(delay).cast("double").alias("delay_minutes"),
-            ).filter("event_seconds is not null")
+                event_time.cast("long").alias("event_seconds"),
+                F.col(minutes).cast("double").alias("minutes"),
+            )
         )
+    events = (source.select("flight_id", F.explode(F.array(*event_columns)).alias("event"))
+              .select("flight_id", "event.*").where("event_seconds is not null"))
 
     # Group duplicate records and reject any conflicting event clocks
-    grouped = events[0].unionByName(events[1]).groupBy("flight_id", "role").agg(
-        F.min(F.struct("airport", "event_seconds", "delay_minutes")).alias("event"),
-        F.max(F.struct("airport", "event_seconds", "delay_minutes")).alias("last_event"),
+    grouped = events.groupBy("flight_id", "role").agg(
+        F.min(F.struct("airport", "event_seconds", "minutes")).alias("event"),
+        F.max(F.struct("airport", "event_seconds", "minutes")).alias("last_event"),
     )
-    return grouped.filter(F.col("event") == F.col("last_event")).select("flight_id", "role", "event.*")
+    agrees = F.col("event") == F.col("last_event")
+    conflicting_departure = F.max(F.when((F.col("role") == "departure") & ~agrees, 1).otherwise(0)).over(
+        Window.partitionBy("flight_id")
+    )
+    return (grouped.withColumn("conflicting_departure", conflicting_departure)
+            .where(agrees & ((F.col("role") != "taxi") | (F.col("conflicting_departure") == 0)))
+            .select("flight_id", "role", "event.*"))
 
 
 def add_cutoffs(flights: DataFrame, airports: dict[str, list[dict[str, Any]]]) -> DataFrame:
@@ -288,17 +333,19 @@ def add_recent_delays(flights: DataFrame, events: DataFrame, window_minutes: int
         "flight_id", "Origin", "Dest", F.col("_cutoff").cast("long").alias("event_seconds")
     )
     query_rows = []
-    for airport, role in (("Origin", "departure"), ("Dest", "arrival")):
+    for airport, role in (("Origin", "departure"), ("Dest", "arrival"), ("Origin", "taxi")):
         query_rows.append(
             queries.select(
                 "flight_id",
                 F.col(airport).alias("airport"),
                 F.lit(role).alias("role"),
-                "event_seconds",
-                F.lit(None).cast("double").alias("delay_minutes"),
+                (F.col("event_seconds") - (TAXI_AVAILABILITY_LAG_MINUTES * 60 if role == "taxi" else 0)).alias(
+                    "event_seconds"
+                ),
+                F.lit(None).cast("double").alias("minutes"),
             )
         )
-    query_rows = query_rows[0].unionByName(query_rows[1]).filter("event_seconds is not null")
+    query_rows = query_rows[0].unionByName(query_rows[1]).unionByName(query_rows[2]).filter("event_seconds is not null")
 
     # 2. Attach flight's own event timestamp if present to enable self-exclusion
     own = events.select(
@@ -306,7 +353,7 @@ def add_recent_delays(flights: DataFrame, events: DataFrame, window_minutes: int
         "airport",
         "role",
         F.col("event_seconds").alias("own_seconds"),
-        F.col("delay_minutes").alias("own_delay"),
+        F.col("minutes").alias("own_minutes"),
     )
     query_rows = query_rows.join(own, ["flight_id", "airport", "role"], "left")
 
@@ -315,31 +362,34 @@ def add_recent_delays(flights: DataFrame, events: DataFrame, window_minutes: int
     timeline = query_rows.unionByName(event_rows, allowMissingColumns=True)
 
     # 4. Compute rolling count, delayed count, and total delay over lookback window [-120min + 1s, 0s]
-    window = Window.partitionBy("airport", "role").orderBy("event_seconds").rangeBetween(
-        -window_minutes * 60 + 1, 0
-    )
+    ordered = Window.partitionBy("airport", "role").orderBy("event_seconds")
+    window = ordered.rangeBetween(-window_minutes * 60 + 1, 0)
+    taxi_window = ordered.rangeBetween(-window_minutes * 60, 0)
+    taxi = F.col("role") == "taxi"
+    count = F.count("minutes")
+    total = F.sum(F.greatest("minutes", F.lit(0.0)))
     stats = timeline.select(
         "*",
-        F.count("delay_minutes").over(window).alias("n"),
-        F.sum((F.col("delay_minutes") >= 15).cast("int")).over(window).alias("delayed"),
-        F.sum(F.greatest("delay_minutes", F.lit(0.0))).over(window).alias("total_delay"),
+        F.when(taxi, count.over(taxi_window)).otherwise(count.over(window)).alias("n"),
+        F.sum((F.col("minutes") >= 15).cast("int")).over(window).alias("delayed"),
+        F.when(taxi, total.over(taxi_window)).otherwise(total.over(window)).alias("total_minutes"),
     )
     stats = stats.filter("flight_id is not null")
 
     # 5. Subtract own event from window totals if it completed within the lookback window
     own_in_window = F.coalesce(
-        (F.col("own_seconds") > F.col("event_seconds") - window_minutes * 60)
+        (F.col("own_seconds") >= F.col("event_seconds") - window_minutes * 60 + F.when(taxi, 0).otherwise(1))
         & (F.col("own_seconds") <= F.col("event_seconds")),
         F.lit(False),
     )
     stats = stats.withColumn("n", F.col("n") - own_in_window.cast("int"))
     stats = stats.withColumn(
         "delayed",
-        F.coalesce("delayed", F.lit(0)) - F.when(own_in_window & (F.col("own_delay") >= 15), 1).otherwise(0),
+        F.coalesce("delayed", F.lit(0)) - F.when(own_in_window & (F.col("own_minutes") >= 15), 1).otherwise(0),
     )
     stats = stats.withColumn(
-        "total_delay",
-        F.col("total_delay") - F.when(own_in_window, F.greatest("own_delay", F.lit(0.0))).otherwise(0.0),
+        "total_minutes",
+        F.col("total_minutes") - F.when(own_in_window, F.greatest("own_minutes", F.lit(0.0))).otherwise(0.0),
     )
 
     # 6. Aggregate rolling features for origin departure and destination arrival
@@ -347,12 +397,42 @@ def add_recent_delays(flights: DataFrame, events: DataFrame, window_minutes: int
     for role, prefix in (("departure", "origin_departure"), ("arrival", "destination_arrival")):
         for value, name in (
             (F.when(F.col("n") > 0, F.col("delayed") / F.col("n")), "delay_rate"),
-            (F.when(F.col("n") > 0, F.col("total_delay") / F.col("n")), "mean_delay_minutes"),
+            (F.when(F.col("n") > 0, F.col("total_minutes") / F.col("n")), "mean_delay_minutes"),
             (F.col("n"), "count"),
         ):
             expressions.append(F.max(F.when(F.col("role") == role, value)).alias(f"{prefix}_{name}_2h"))
 
+    expressions += [
+        F.max(F.when(taxi & (F.col("n") > 0), F.col("total_minutes") / F.col("n"))).alias(TAXI_MEAN),
+        F.max(F.when(taxi, F.col("n"))).alias(TAXI_COUNT),
+    ]
     return flights.join(stats.groupBy("flight_id").agg(*expressions), "flight_id", "left").drop("_cutoff")
+
+
+def compute_unimpeded_taxi_baselines(
+    events: DataFrame, flights: DataFrame, splits: dict, airports: dict,
+) -> DataFrame:
+    """Fit trailing-month training snapshots and a frozen evaluation reference."""
+    train = splits["train"]
+    months = pd.period_range(train["start_date"], train["end_date"], freq="M")
+    snapshots = [(str(month), month.start_time.date()) for month in months[1:]]
+    snapshots.append(("evaluation", date.fromisoformat(splits["val"]["start_date"])))
+    bounds = []
+    for airport in airports:
+        for key, day in snapshots:
+            cutoff, _ = local_cutoff(day, "0000", airport_zone(airports, airport, day))
+            if cutoff is not None:
+                bounds.append((airport, key, day, int(cutoff.replace(tzinfo=timezone.utc).timestamp())))
+    dates = flights.sparkSession.createDataFrame(
+        bounds, "airport string, taxi_snapshot string, first_day date, bound_seconds long",
+    )
+    training = flights.where("split = 'train'").select("flight_id", "FlightDate")
+    eligible = events.where("role = 'taxi'").join(training, "flight_id")
+    return (eligible.join(F.broadcast(dates), "airport")
+            .where((F.col("FlightDate") < F.col("first_day"))
+                   & (F.col("event_seconds") + TAXI_AVAILABILITY_LAG_MINUTES * 60 < F.col("bound_seconds")))
+            .groupBy(F.col("airport").alias("Origin"), "taxi_snapshot")
+            .agg(F.percentile_approx("minutes", 0.15).alias("unimpeded_taxi_minutes")))
 
 
 def add_holidays(flights: DataFrame, start_date: str, end_date: str) -> DataFrame:

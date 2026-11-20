@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.results import update_results
 from scripts.progress import stage as progress_stage
 from scripts.aircraft_rotation import run as rotation
+from scripts.enroute_weather import run as enroute
 from scripts.bts import clean as bts_clean, download as bts_download
 from scripts.bts import (
     evaluate as bts_evaluate,
@@ -32,17 +33,28 @@ from pyspark.sql import functions as F
 ROTATION = bts_train.ROTATION_FEATURE_SET
 COMBINED_WEATHER = "bts_origin_destination_weather"
 ABLATION_METRICS = ("pr_auc", "roc_auc", "precision", "recall", "f1", "accuracy")
+DESTINATION_RUNS = "models/dw"
+LEGACY_DESTINATION_RUNS = "models/destination_weather_comparison"
+DESTINATION_MODEL_DIRS = {
+    "bts": "bts",
+    "bts_origin_weather": "origin",
+    COMBINED_WEATHER: "both",
+    ROTATION: "rot",
+}
 
 
 def compare_predictions(spark, result_dir, split="validation", context=None,
-                        variants=("bts", "bts_origin_weather"), training_prevalence=None, summaries=None):
+                        variants=("bts", "bts_origin_weather"), training_prevalence=None, summaries=None,
+                        variant_dirs=None):
     if tuple(variants) not in (("bts", "bts_origin_weather"), bts_train.FEATURE_SETS, bts_train.ALL_FEATURE_SETS):
         raise ValueError("Use an ordered origin, destination, or aircraft rotation comparison.")
     frames = {}
     counts = {}
     for variant in variants:
-        frame = spark.read.parquet(str(result_dir / variant / f"{split}_predictions"))
+        directory = variant_dirs[variant] if variant_dirs is not None else variant
+        frame = spark.read.parquet(str(result_dir / directory / f"{split}_predictions"))
         count = frame.count()
+        # Verify that every prediction table has distinct, non-null flight IDs before comparison.
         if (
             frame.select("flight_id").distinct().count() != count
             or frame.filter("flight_id is null").limit(1).count()
@@ -55,9 +67,11 @@ def compare_predictions(spark, result_dir, split="validation", context=None,
     for variant, frame in frames.items():
         if variant == "bts":
             continue
+        # Enforce bidirectional cohort equality to ensure all models are compared on the exact same flights.
         if (baseline.select(identity).exceptAll(frame.select(identity)).limit(1).count()
                 or frame.select(identity).exceptAll(baseline.select(identity)).limit(1).count()):
             raise ValueError("Prediction cohorts differ.")
+    # Merge predictions side-by-side with feature-set prefixes for paired evaluation.
     paired = baseline.select(*identity, *[F.col(name).alias("bts_" + name) for name in ("p_delayed", "prediction", "threshold")])
     for variant, frame in frames.items():
         if variant == "bts":
@@ -72,6 +86,7 @@ def compare_predictions(spark, result_dir, split="validation", context=None,
     for variant, frame in frames.items():
         selected_model = summaries[variant]["selected_model"] if summaries is not None else None
         threshold = selected_model["best_threshold"] if selected_model is not None else frame.select("threshold").first().threshold
+        # Evaluate metrics at both the F1-optimized threshold and standard 0.50 operating point.
         for operating_point, value in (("selected", threshold), ("default_0_5", 0.5)):
             if selected_model is not None:
                 suffix = "selected_threshold" if operating_point == "selected" else "default_0_5"
@@ -108,6 +123,7 @@ def compare_predictions(spark, result_dir, split="validation", context=None,
             expressions.append("rotation_outcome_missing")
         context = context.select(*expressions)
         slices, covered = [], []
+        # Compute subgroup slice metrics inside Spark to avoid collecting full dataset into driver memory.
         for variant, frame in frames.items():
             scores = frame.join(context, "flight_id").cache()
             try:
@@ -118,6 +134,7 @@ def compare_predictions(spark, result_dir, split="validation", context=None,
                             scores, column, column
                         )
                     )
+                # Calculate metrics restricted to flights with confirmed weather reports for coverage sensitivity analysis.
                 subset = scores.filter("origin_weather_missing = 0" + (" and destination_weather_missing = 0" if "bts_origin_destination_weather" in variants else ""))
                 if subset.limit(1).count():
                     covered.append(
@@ -145,6 +162,7 @@ def compare_predictions(spark, result_dir, split="validation", context=None,
             if summaries is not None:
                 results[variant][split]["reference_baselines"][name] = summaries[variant]["reference_baselines"][name]
                 continue
+            # Cache dummy baseline evaluations across models to avoid redundant aggregations.
             if probability not in references:
                 references[probability] = bts_train.evaluate_predictions(
                     baseline.select("ArrDel15").withColumn("p_delayed", F.lit(probability))
@@ -155,6 +173,7 @@ def compare_predictions(spark, result_dir, split="validation", context=None,
             results[variant][split]["reference_baselines"][name] = metrics
         results[variant][split]["subgroups"] = [row for row in slices if row["variant"] == variant]
         results[variant][split]["covered_only"] = [row for row in covered if row["variant"] == variant]
+    # Calculate incremental performance deltas against each preceding baseline in the hierarchy.
     for index, variant in enumerate(variants):
         current = results[variant][split]["selected"]
         for reference in variants[:index]:
@@ -167,12 +186,13 @@ def compare_predictions(spark, result_dir, split="validation", context=None,
     return results
 
 
-def inference_hashes(models):
+def inference_hashes(models, variant_dirs=None, model_name="baseline_pipeline"):
+    names = bts_train.ALL_FEATURE_SETS if variant_dirs is None else variant_dirs.values()
     return {
         str(path.relative_to(models)): sha256(path)
-        for variant in bts_train.ALL_FEATURE_SETS
-        for path in sorted((models / variant).rglob("*"))
-        if path.is_file() and ("baseline_pipeline" in path.parts or path.name == "threshold.json")
+        for name in names
+        for path in sorted((models / name).rglob("*"))
+        if path.is_file() and (model_name in path.relative_to(models / name).parts or path.name == "threshold.json")
     }
 
 
@@ -182,12 +202,15 @@ def data_fingerprints(directory):
             for path in sorted(directory.rglob("*.parquet"))]
 
 
-def run_destination_weather(*, include_gbt=False, include_rotation=False):
+def run_destination_weather(*, include_gbt=False, include_rotation=False, include_enroute=False):
     start = time.monotonic()
     print("Starting pipeline: BTS + origin + destination weather"
           + (" + aircraft rotation (validation)" if include_rotation else " (validation)"), flush=True)
     settings, policy, config = load_config()
+    if include_enroute and not include_rotation:
+        raise ValueError("En-route weather requires the aircraft-rotation comparison.")
     print("Checking whether BTS features can be reused...", flush=True)
+    # Check if existing BTS Gold Parquet files match current source inputs to avoid redundant re-ingestion.
     if not features_current(ROOT, config):
         for step, title, stage in (
             ("Preparing BTS 1/3", "BTS Data Acquisition", bts_download.main),
@@ -199,19 +222,24 @@ def run_destination_weather(*, include_gbt=False, include_rotation=False):
                 return status
     else:
         print("Reusing BTS features because they match the current inputs and policy.", flush=True)
+    # Prepare origin and destination weather Gold cohorts, reusing cached tables if valid.
     with progress_stage("Stage: Prepare origin-weather features (validate cached data or rebuild)"):
         parent, _ = weather_features.main(publish_results=False)
     with progress_stage("Stage: Prepare destination-weather features"):
         gold, _ = destination_features.main(parent)
+    # Generate a unique timestamped run ID to guarantee isolated model artifact directories.
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "_" + uuid4().hex[:8]
-    models = ROOT / "models/destination_weather_comparison" / run_id
+    models = ROOT / DESTINATION_RUNS / run_id
     models.mkdir(parents=True)
     data_dirs = dict(zip(bts_train.FEATURE_SETS, (ROOT / "data/gold/bts", parent, gold)))
     variants = bts_train.ALL_FEATURE_SETS if include_rotation else bts_train.FEATURE_SETS
     spark = bts_transform.get_spark_session("destination_weather_comparison")
     try:
+        if include_enroute:
+            prepared_enroute = enroute.prepare(spark, ROOT, config, gold, run_id)
         summaries, timings = {}, {}
         rotation_metadata = None
+        # Prepare retrospective aircraft rotation predecessor linkage on validation flights if enabled.
         if include_rotation:
             references = settings["reference_directory"]
             raw_files = rotation.rotation_raw_files(ROOT, config)
@@ -221,16 +249,17 @@ def run_destination_weather(*, include_gbt=False, include_rotation=False):
             directory = models / "gold" if include_rotation else data_dirs[variant]
             started = time.monotonic()
             with progress_stage(f"Training {variant}: fixed settings and validation"):
-                summaries[variant] = bts_train.train(spark, directory, models / variant,
+                summaries[variant] = bts_train.train(spark, directory, models / DESTINATION_MODEL_DIRS[variant],
                     feature_set=variant, save_predictions=True, publish_results=False,
-                    include_gbt=include_gbt and variant != ROTATION)
+                    include_gbt=include_gbt and variant != ROTATION, model_name="model")
             timings[variant] = time.monotonic() - started
         prevalence = {variant: summary["reference_baselines"]["train_prevalence"]["training_prevalence"] for variant, summary in summaries.items()}
+        # Join predictions and compare validation metrics across all active feature sets.
         with progress_stage(f"Stage: Compare {len(variants)} models on validation"):
             comparison_gold = models / "gold" if include_rotation else gold
             updates = compare_predictions(spark, models,
                 context=spark.read.parquet(str(comparison_gold / "val")), variants=variants, training_prevalence=prevalence,
-                summaries=summaries)
+                summaries=summaries, variant_dirs=DESTINATION_MODEL_DIRS)
         comparison = [
             {"feature_set": variant, "training_rows": summaries[variant]["training_rows"],
              **updates[variant]["validation"]["selected"],
@@ -238,6 +267,7 @@ def run_destination_weather(*, include_gbt=False, include_rotation=False):
             for index, variant in enumerate(variants)
         ]
         with progress_stage("Stage: Save comparison manifest and publish results"):
+            # Verify input stability during the run before publishing the comparison manifest.
             if include_rotation and rotation.source_identity(ROOT, references, gold, raw_files) != inputs:
                 raise ValueError("Rotation inputs changed during the run.")
             metadata = json.loads((gold / "_metadata.json").read_text())
@@ -249,7 +279,7 @@ def run_destination_weather(*, include_gbt=False, include_rotation=False):
                 "thresholds": {variant: summary["selected_model"]["best_threshold"] for variant, summary in summaries.items()},
                 "data_metadata_sha256": {variant: sha256(path / "_metadata.json") for variant, path in data_dirs.items() if variant != "bts"},
                 "data_fingerprints": {variant: data_fingerprints(path) for variant, path in data_dirs.items()},
-                "inference_sha256": inference_hashes(models),
+                "inference_sha256": inference_hashes(models, DESTINATION_MODEL_DIRS, "model"),
                 "source_identity": metadata,
                 "code_sha256": {str(path.relative_to(ROOT)): sha256(path)
                                 for folder in (ROOT / "scripts", ROOT / "pipeline") for path in folder.rglob("*.py")},
@@ -269,6 +299,7 @@ def run_destination_weather(*, include_gbt=False, include_rotation=False):
             updates["bts_origin_destination_weather"].update(data=metadata, cleaning={key: metadata[key] for key in ("quality", "station_quality", "source_contract")})
             updates["bts_origin_weather"]["cleaning"] = updates["bts_origin_destination_weather"]["cleaning"]
             update_results(updates)
+            # Atomically flag the run directory as complete and valid for subsequent test evaluation.
             (models / "_SUCCESS").touch()
         import pandas as pd
 
@@ -277,6 +308,9 @@ def run_destination_weather(*, include_gbt=False, include_rotation=False):
                                       "precision", "recall", "f1", "accuracy"]]
               .to_string(index=False, float_format=lambda value: f"{value:.4f}"), flush=True)
         print(f"Validation report: {report}", flush=True)
+        if include_enroute:
+            report = enroute.fit(spark, ROOT, models, gold, prepared_enroute, summaries[ROTATION])
+            print(f"En-route validation report: {report}", flush=True)
         print(f"Pipeline completed in {time.monotonic() - start:.1f}s. Results: {models}", flush=True)
         return 0
     finally:
@@ -286,9 +320,16 @@ def run_destination_weather(*, include_gbt=False, include_rotation=False):
 def evaluate_destination_weather(run_id):
     from scripts.origin_weather.download import project_path
 
+    # Restrict run ID format to alphanumeric characters to prevent directory traversal.
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
         raise ValueError("Use the comparison directory name as RUN_ID.")
-    models = project_path(ROOT, "models/destination_weather_comparison/" + run_id)
+    models = project_path(ROOT, f"{DESTINATION_RUNS}/{run_id}")
+    variant_dirs = DESTINATION_MODEL_DIRS
+    model_name = "model"
+    if not models.exists():
+        models = project_path(ROOT, f"{LEGACY_DESTINATION_RUNS}/{run_id}")
+        variant_dirs = {variant: variant for variant in bts_train.ALL_FEATURE_SETS}
+        model_name = "baseline_pipeline"
     if not (models / "_SUCCESS").exists():
         raise ValueError("Only a completed frozen comparison can be test-evaluated.")
     current = json.loads((ROOT / "results/results.json").read_text())
@@ -297,7 +338,8 @@ def evaluate_destination_weather(run_id):
     run = json.loads((models / "run.json").read_text())
     if run["run_id"] != run_id or Path(run["models_dir"]).resolve() != models:
         raise ValueError("Frozen run identity changed.")
-    if inference_hashes(models) != run["inference_sha256"] or not run["inference_sha256"]:
+    # Cryptographically verify that frozen models and threshold files have not been modified.
+    if inference_hashes(models, variant_dirs, model_name) != run["inference_sha256"] or not run["inference_sha256"]:
         raise ValueError("Frozen model or threshold artifacts changed.")
     data_dirs = {}
     for variant in bts_train.FEATURE_SETS:
@@ -309,23 +351,26 @@ def evaluate_destination_weather(run_id):
         if variant != "bts" and sha256(path / "_metadata.json") != run["data_metadata_sha256"][variant]:
             raise ValueError("Frozen data metadata changed.")
         data_dirs[variant] = path
-    output = models / "test" / uuid4().hex
+    output = models / "test" / uuid4().hex[:16]
     spark = bts_transform.get_spark_session("destination_weather_test")
     try:
+        # Score each model pipeline on its held-out test split using frozen validation thresholds.
         for variant, data in data_dirs.items():
-            directory = models / variant
+            directory = models / variant_dirs[variant]
             threshold = json.loads((directory / "threshold.json").read_text())["threshold"]
             if threshold != run["thresholds"][variant]:
                 raise ValueError("Frozen threshold differs from run manifest.")
-            model = PipelineModel.load(str(directory / "baseline_pipeline"))
+            model = PipelineModel.load(str(directory / model_name))
             test = spark.read.parquet(str(data / "test"))
             if variant != "bts":
                 bts_train.validate_weather(test, "frozen test inputs", variant, require_values=False)
             scores = bts_train.predict(model, test, threshold)
             scores.select("flight_id", "FlightDate", "ArrDel15", "p_delayed", "prediction").withColumn(
-                "threshold", F.lit(threshold)).write.parquet(str(output / variant / "test_predictions"))
+                "threshold", F.lit(threshold)).write.parquet(str(output / variant_dirs[variant] / "test_predictions"))
         updates = compare_predictions(spark, output, "test",
-            context=spark.read.parquet(str(data_dirs["bts_origin_destination_weather"] / "test")), variants=bts_train.FEATURE_SETS, training_prevalence=run["training_prevalence"])
+            context=spark.read.parquet(str(data_dirs["bts_origin_destination_weather"] / "test")),
+            variants=bts_train.FEATURE_SETS, training_prevalence=run["training_prevalence"],
+            variant_dirs=variant_dirs)
         update_results(updates)
         (output / "_SUCCESS").touch()
         return 0
@@ -338,6 +383,7 @@ def run_origin_weather(*, include_gbt=False):
     print("Starting pipeline: BTS + origin weather (validation)", flush=True)
     _, _, config = load_config()
     print("Checking whether BTS features can be reused...", flush=True)
+    # Reuse existing BTS Gold if inputs and configuration have not changed.
     if not features_current(ROOT, config):
         for step, title, stage in STAGES[:3]:
             if run_stage(step, title, stage):
@@ -371,6 +417,7 @@ def run_origin_weather(*, include_gbt=False):
                     include_gbt=include_gbt,
                 )
             timings[variant] = time.monotonic() - started
+        # Compare BTS baseline against origin weather model on shared validation flights.
         with progress_stage("Stage: Compare both models on validation"):
             updates = compare_predictions(
                 spark, results, context=spark.read.parquet(str(gold / "val"))
@@ -420,12 +467,14 @@ def run_origin_weather(*, include_gbt=False):
 def evaluate_origin_weather(run_id):
     from scripts.origin_weather.download import project_path
 
+    # Restrict run ID format to alphanumeric characters to prevent directory traversal.
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
         raise ValueError("Use the comparison directory name as RUN_ID.")
     results = project_path(ROOT, "models/origin_weather_comparison/" + run_id)
     if not (results / "_SUCCESS").exists():
         raise ValueError("Only a completed, frozen comparison can be test-evaluated.")
     current = json.loads((ROOT / "results/results.json").read_text())
+    # Ensure current published results belong to this run before allowing test evaluation.
     if any(current.get(variant, {}).get("run_id") != run_id
            for variant in ("bts", "bts_origin_weather")):
         raise ValueError("Test evaluation requires the current comparison run; results have been replaced.")
@@ -521,9 +570,12 @@ def main(argv=None):
         help="Evaluate both frozen models on test; never tunes settings.",
     )
     mode.add_argument("--destination-weather", action="store_true", help="Run the three-model weather comparison on validation.")
+    mode.add_argument("--include-enroute", action="store_true", help="Compare TAF and SIGMET features against aircraft rotation.")
     mode.add_argument("--evaluate-destination-weather", metavar="RUN_ID", help="Score three frozen models on test.")
     parser.add_argument("--include-gbt", action="store_true", help="Also train gradient-boosted tree challengers for the non-rotation feature sets.")
     args = parser.parse_args(argv)
+    if args.include_enroute:
+        return run_destination_weather(include_gbt=args.include_gbt, include_rotation=True, include_enroute=True)
     if args.include_gbt and (args.evaluate_destination_weather or args.evaluate_origin_weather):
         parser.error("--include-gbt requires a training run")
     if args.evaluate_destination_weather:
@@ -532,8 +584,13 @@ def main(argv=None):
         return run_origin_weather(include_gbt=args.include_gbt)
     if args.evaluate_origin_weather:
         return evaluate_origin_weather(args.evaluate_origin_weather)
+    # The default runs the en-route comparison against the completed Tier 4 baseline.
     if not args.bts_only:
-        return run_destination_weather(include_gbt=args.include_gbt, include_rotation=not args.destination_weather)
+        if args.destination_weather:
+            return run_destination_weather(include_gbt=args.include_gbt, include_rotation=False)
+        return run_destination_weather(
+            include_gbt=args.include_gbt, include_rotation=True, include_enroute=True,
+        )
     total_start = time.monotonic()
     banner = "=" * 80
     print(f"\n{banner}")
@@ -541,6 +598,7 @@ def main(argv=None):
     print(f"{banner}")
 
     _, _, config = load_config()
+    # Skip acquisition, cleaning, and feature building if existing BTS Gold matches current inputs.
     if features_current(ROOT, config):
         print("Reusing BTS Gold; skipping acquisition, cleaning and feature construction.", flush=True)
         stages = STAGES[3:]

@@ -67,7 +67,9 @@ class DestinationTests(unittest.TestCase):
     def test_default_driver_runs_destination_workflow(self):
         with patch.object(pipeline, "run_destination_weather", return_value=0) as run, patch.object(pipeline, "run_stage") as legacy:
             self.assertEqual(pipeline.main([]), 0)
-            run.assert_called_once_with(include_gbt=False, include_rotation=True)
+            run.assert_called_once_with(
+                include_gbt=False, include_rotation=True, include_enroute=True,
+            )
             legacy.assert_not_called()
         with (patch.object(pipeline, "run_destination_weather") as run,
               patch.object(pipeline, "features_current", return_value=False),
@@ -187,28 +189,42 @@ class DestinationTests(unittest.TestCase):
                   patch.object(pipeline.rotation, "prepare_rotation", return_value={"coverage": []}) as prepare,
                   patch.object(train, "train", side_effect=lambda *args, **kwargs: dict(summary)) as fit,
                   patch.object(pipeline, "compare_predictions", return_value=updates) as compare,
-                  patch.object(pipeline, "update_results") as publish):
+                  patch.object(pipeline, "update_results") as publish,
+                  patch.object(pipeline.enroute, "prepare", return_value="prepared forecasts") as prepare_enroute,
+                  patch.object(pipeline.enroute, "fit") as fit_enroute):
                 session.return_value.version = "3.5.7"
                 self.assertEqual(pipeline.main([]), 0)
                 prepared_dir = prepare.call_args.args[-1]
                 self.assertEqual(prepare.call_args.args[-3], combined_gold)
                 self.assertEqual([call.kwargs["feature_set"] for call in fit.call_args_list], list(variants))
                 self.assertEqual({call.args[1] for call in fit.call_args_list}, {prepared_dir / "gold"})
+                self.assertEqual([call.args[2].name for call in fit.call_args_list],
+                                 ["bts", "origin", "both", "rot"])
+                self.assertTrue(all(call.kwargs["model_name"] == "model" for call in fit.call_args_list))
                 self.assertTrue(all(not call.kwargs["include_gbt"] for call in fit.call_args_list))
                 self.assertEqual(compare.call_args.kwargs["variants"], variants)
+                self.assertEqual(compare.call_args.kwargs["variant_dirs"], pipeline.DESTINATION_MODEL_DIRS)
                 self.assertEqual(set(publish.call_args.args[0]), set(variants))
+                prepare_enroute.assert_called_once_with(
+                    session.return_value, root, {"splits": {}}, combined_gold, prepared_dir.name,
+                )
+                fit_enroute.assert_called_once_with(
+                    session.return_value, root, prepared_dir, combined_gold, "prepared forecasts", summary,
+                )
                 session.return_value.stop.assert_called_once_with()
                 fit.side_effect = [summary, summary, summary, RuntimeError("fourth fit failed")]
                 compare.reset_mock()
                 publish.reset_mock()
+                fit_enroute.reset_mock()
                 with self.assertRaisesRegex(RuntimeError, "fourth fit failed"):
                     pipeline.main([])
                 compare.assert_not_called()
                 publish.assert_not_called()
+                fit_enroute.assert_not_called()
             report = json.loads((prepared_dir / "validation_comparison.json").read_text())
             self.assertEqual([row["feature_set"] for row in report["models"]], list(variants))
             self.assertEqual(
-                list((root / "models/destination_weather_comparison").glob("*/_SUCCESS")),
+                list((root / "models/dw").glob("*/_SUCCESS")),
                 [prepared_dir / "_SUCCESS"],
             )
 
@@ -233,22 +249,33 @@ class DestinationTests(unittest.TestCase):
                 session.assert_not_called()
 
     def test_frozen_evaluation_only_scores_saved_test_inputs(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                self.check_frozen_evaluation(legacy)
+
+    def check_frozen_evaluation(self, legacy):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            models = root / "models/destination_weather_comparison/frozen"
+            model_name = "baseline_pipeline" if legacy else "model"
+            models = root / ("models/destination_weather_comparison" if legacy else "models/dw") / "frozen"
+            variant_dirs = None if legacy else pipeline.DESTINATION_MODEL_DIRS
+            expected_models = []
             models.mkdir(parents=True)
             (models / "_SUCCESS").touch()
             dirs = {variant: root / "data/gold" / variant for variant in train.FEATURE_SETS}
             for variant, path in dirs.items():
                 path.mkdir(parents=True)
                 (path / "_metadata.json").write_text("{}")
-                model = models / variant
-                (model / "baseline_pipeline").mkdir(parents=True)
-                (model / "baseline_pipeline/part").write_text("frozen")
-                (model / "threshold.json").write_text('{"threshold": 0.6}')
+                model = models / (variant if legacy else variant_dirs[variant]) / model_name
+                expected_models.append(model)
+                model.mkdir(parents=True)
+                (model / "part").write_text("frozen")
+                (model.parent / "threshold.json").write_text('{"threshold": 0.6}')
+            hashes = pipeline.inference_hashes(models, variant_dirs, model_name)
+            self.assertEqual(len(hashes), 6)
             run = {"run_id": "frozen", "models_dir": str(models),
                    "data_dirs": {v: str(p) for v, p in dirs.items()},
-                   "inference_sha256": pipeline.inference_hashes(models),
+                   "inference_sha256": hashes,
                    "data_fingerprints": {v: [] for v in dirs},
                    "data_metadata_sha256": {v: download.sha256(p / "_metadata.json") for v, p in dirs.items() if v != "bts"},
                    "thresholds": {v: .6 for v in dirs}, "training_prevalence": {v: .25 for v in dirs}}
@@ -271,7 +298,11 @@ class DestinationTests(unittest.TestCase):
                   patch.object(pipeline, "compare_predictions", return_value={v: {"test": {}} for v in dirs}),
                   patch.object(pipeline, "update_results") as publish):
                 self.assertEqual(pipeline.evaluate_destination_weather("frozen"), 0)
-                self.assertEqual(load.call_count, 3)
+                self.assertEqual([Path(call.args[0]) for call in load.call_args_list], expected_models)
+                self.assertEqual(
+                    [Path(call.args[0]).parent.name for call in scores.write.parquet.call_args_list],
+                    [model.parent.name for model in expected_models],
+                )
                 fit.assert_not_called()
                 acquire.assert_not_called()
                 rematch.assert_not_called()
@@ -423,13 +454,15 @@ class DestinationSparkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             variants = train.ALL_FEATURE_SETS
+            variant_dirs = pipeline.DESTINATION_MODEL_DIRS
             for variant, probabilities in zip(variants, ([.9, .8, .2, .1], [.9, .1, .9, .1], [.9, .1, .9, .1], [.8, .2, .1, .1])):
                 scores = self.spark.createDataFrame([(str(i), date(2024, 10, 1), int(i % 2 == 0), p, int(p >= .5), .5) for i, p in enumerate(probabilities)], "flight_id string, FlightDate date, ArrDel15 int, p_delayed double, prediction int, threshold double")
-                scores.write.parquet(str(root / variant / "validation_predictions"))
+                scores.write.parquet(str(root / variant_dirs[variant] / "validation_predictions"))
             context = self.spark.createDataFrame([(str(i), "ORD", "LAX", 10, 0, int(i > 1), 2.0, None if i > 1 else 7.0) for i in range(4)],
                 "flight_id string, Origin string, Dest string, Month int, origin_weather_missing int, destination_weather_missing int, origin_wind_speed_ms double, destination_wind_speed_ms double")
             context = context.withColumn("rotation_outcome_missing", F.col("destination_weather_missing"))
-            result = pipeline.compare_predictions(self.spark, root, context=context, variants=variants, training_prevalence={v: .25 for v in variants})
+            result = pipeline.compare_predictions(self.spark, root, context=context, variants=variants,
+                                                  training_prevalence={v: .25 for v in variants}, variant_dirs=variant_dirs)
             combined = result["bts_origin_destination_weather"]["validation"]
             self.assertEqual(combined["deltas_vs_bts"]["f1"], .5)
             self.assertEqual(combined["deltas_vs_bts_origin_weather"]["f1"], 0)
@@ -442,6 +475,6 @@ class DestinationSparkTests(unittest.TestCase):
             self.assertIn("rotation_p_delayed", paired.columns)
             rotation = result[train.ROTATION_FEATURE_SET]["validation"]
             self.assertLess(rotation["deltas_vs_bts_origin_destination_weather"]["f1"], 0)
-            scores.withColumn("ArrDel15", F.lit(0)).write.mode("overwrite").parquet(str(root / train.ROTATION_FEATURE_SET / "validation_predictions"))
+            scores.withColumn("ArrDel15", F.lit(0)).write.mode("overwrite").parquet(str(root / "rot/validation_predictions"))
             with self.assertRaisesRegex(ValueError, "cohorts differ"):
-                pipeline.compare_predictions(self.spark, root, variants=variants)
+                pipeline.compare_predictions(self.spark, root, variants=variants, variant_dirs=variant_dirs)

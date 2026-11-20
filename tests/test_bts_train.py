@@ -25,7 +25,7 @@ class TrainingTests(unittest.TestCase):
     def flights(self):
         rows = [("AA" if i % 2 else "DL", "ORD", "LAX", i // 4 + 1, i % 7 + 1, i % 24,
                  (i + 3) % 24, 120.0 + i, 800.0 + i * 5, int(i % 3 == 0), date(2024, i // 4 + 1, i % 4 + 1)) for i in range(36)]
-        rows = [tuple(row[:9]) + (0.25, 8.0, 4.0, 0.5, 10.0, 6.0, 0, 0, 0) + tuple(row[9:]) for row in rows]
+        rows = [tuple(row[:9]) + (0.25, 8.0, 4.0, 0.5, 10.0, 6.0, 18.0, 5.0, 3, 0, 0, 0) + tuple(row[9:]) for row in rows]
         return self.spark.createDataFrame(rows, bts.INPUT_FEATURES + [bts.TARGET_COL, "FlightDate"]).coalesce(2)
 
     def test_evaluation_matches_hand_counts(self):
@@ -108,7 +108,7 @@ class TrainingTests(unittest.TestCase):
                   patch.object(bts.GBTClassifier, "fit", gbt_fit),
                   patch.object(bts, "LOGISTIC_PARAMS", logistic_params),
                   patch.object(bts, "GBT_PARAMS", tree_params)):
-                summary = bts.train(self.spark, gold, models, results, include_gbt=True)
+                summary = bts.train(self.spark, gold, models, results, include_gbt=True, model_name="model")
             self.assertEqual(len(classifier_fits), 1)
             self.assertEqual(len(gbt_fits), 1)
             self.assertEqual(set(reads), {str(gold / "train"), str(gold / "val")})
@@ -123,9 +123,9 @@ class TrainingTests(unittest.TestCase):
             self.assertEqual(summary["selected_model"]["reg_param"], logistic_params["regParam"])
             self.assertEqual(summary["selected_model"]["elastic_net_param"], logistic_params["elasticNetParam"])
             self.assertEqual(set(path.name for path in results.iterdir()), {"results.json"})
-            self.assertEqual(set(path.name for path in models.iterdir()), {"baseline_pipeline", "threshold.json", "gbt"})
+            self.assertEqual(set(path.name for path in models.iterdir()), {"model", "threshold.json", "gbt"})
             self.assertEqual(json.loads((results / "results.json").read_text())["bts"]["training"], summary)
-            saved = PipelineModel.load(str(models / "baseline_pipeline"))
+            saved = PipelineModel.load(str(models / "model"))
             classifier = saved.stages[-1]
             self.assertEqual(classifier.getRegParam(), logistic_params["regParam"])
             self.assertEqual(classifier.getElasticNetParam(), logistic_params["elasticNetParam"])
@@ -144,7 +144,7 @@ class TrainingTests(unittest.TestCase):
                 "preprocessor_fit", "classifier_fit", "validation", "save_model_and_threshold",
             })
             self.assertTrue(all(seconds >= 0 for seconds in challenger["timing_seconds"].values()))
-            tree = PipelineModel.load(str(models / "gbt/baseline_pipeline"))
+            tree = PipelineModel.load(str(models / "gbt/model"))
             self.assertEqual(tree.stages[-1].getMaxDepth(), challenger["max_depth"])
             tree_threshold = json.loads((models / "gbt/threshold.json").read_text())["threshold"]
             tree_metrics = bts.evaluate_predictions(bts.predict(tree, validation, tree_threshold))
