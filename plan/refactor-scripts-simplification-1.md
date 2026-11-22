@@ -108,7 +108,7 @@ This plan defines the step-by-step refactoring, simplification, cleanup, and doc
 - **FILE-005**: `scripts/bts/clean.py` - BTS CSV cleaning into Silver Parquet.
 - **FILE-006**: `scripts/bts/recent_delays.py` - rolling delay and holiday calendar feature builder.
 - **FILE-007**: `scripts/bts/build_features.py` - BTS schedule features and chronological split assignment.
-- **FILE-008**: `scripts/bts/train.py` - Logistic regression and GBT training and threshold selection.
+- **FILE-008**: `scripts/bts/train.py` - Logistic regression training and threshold selection.
 - **FILE-009**: `scripts/bts/evaluate.py` - Test evaluation and subgroup analysis.
 - **FILE-010**: `scripts/origin_weather/download.py` - Airport references and NOAA LCDv2 download.
 - **FILE-011**: `scripts/origin_weather/measurements.py` - LCDv2 measurement and token decoding.

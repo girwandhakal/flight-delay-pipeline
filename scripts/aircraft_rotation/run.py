@@ -23,7 +23,7 @@ from scripts.weather_cache import consumed, find_gold, logic_hash, resolve_stage
 
 from .build_features import (
     MAX_GAP_HOURS, OUTCOME_LAG_MINUTES, ROTATION_FLAGS, ROTATION_NUMERIC,
-    build_operations, build_rotation_links,
+    add_turnaround_shortfall, build_operations, build_rotation_links,
 )
 
 FEATURE_SET = "bts_origin_destination_weather"
@@ -143,7 +143,7 @@ def prepare_experiment(
             str(run_dir / "rotation_links")
         )
         numeric, flags = bts_train.weather_columns(FEATURE_SET)
-        splits = linked.select(
+        splits = add_turnaround_shortfall(linked, validation_bound).select(
             *IDENTITY, "split", "training_label_status", *bts_train.INPUT_FEATURES, *numeric, *flags,
             *ROTATION_NUMERIC, *ROTATION_FLAGS,
         )

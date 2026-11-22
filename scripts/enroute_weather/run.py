@@ -195,6 +195,7 @@ def fit(spark, root, rotation, weather_gold, prepared, baseline, rotation_gold):
     report = output / "validation_comparison.json"
     write_json(report, {
         "run_id": run_id, "parent_run_id": run_id, "validation": comparison, "coverage": coverage,
+        "algorithm_comparison": summary["algorithm_comparison"],
         "scope": "Same-cohort validation. Selected thresholds were tuned on this validation cohort.",
         "stations": prepared["stations"], "gold": str(gold),
         "selected_training_destination_share": prepared["selected_training_destination_share"],

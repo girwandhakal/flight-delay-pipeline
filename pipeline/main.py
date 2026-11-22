@@ -216,7 +216,7 @@ def prepare_bts(config, *, publish_results=True):
     return 0
 
 
-def run_destination_weather(*, include_gbt=False, include_rotation=False, include_enroute=False):
+def run_destination_weather(*, include_rotation=False, include_enroute=False):
     start = time.monotonic()
     print("Starting pipeline: BTS + origin + destination weather"
           + (" + aircraft rotation (validation)" if include_rotation else " (validation)"), flush=True)
@@ -257,7 +257,7 @@ def run_destination_weather(*, include_gbt=False, include_rotation=False, includ
             with progress_stage(f"Training {variant}: fixed settings and validation"):
                 summaries[variant] = bts_train.train(spark, directory, models / DESTINATION_MODEL_DIRS[variant],
                     feature_set=variant, save_predictions=True, publish_results=False,
-                    include_gbt=include_gbt and variant != ROTATION, model_name="model")
+                    model_name="model")
             timings[variant] = time.monotonic() - started
         prevalence = {variant: summary["reference_baselines"]["train_prevalence"]["training_prevalence"] for variant, summary in summaries.items()}
         # Join predictions and compare validation metrics across all active feature sets.
@@ -389,7 +389,7 @@ def evaluate_destination_weather(run_id):
         spark.stop()
 
 
-def run_origin_weather(*, include_gbt=False):
+def run_origin_weather():
     start = time.monotonic()
     print("Starting pipeline: BTS + origin weather (validation)", flush=True)
     _, _, config = load_config()
@@ -420,7 +420,6 @@ def run_origin_weather(*, include_gbt=False):
                     feature_set=variant,
                     save_predictions=True,
                     publish_results=False,
-                    include_gbt=include_gbt,
                 )
             timings[variant] = time.monotonic() - started
         # Compare BTS baseline against origin weather model on shared validation flights.
@@ -587,25 +586,20 @@ def main(argv=None):
     mode.add_argument("--destination-weather", action="store_true", help="Run the three-model weather comparison on validation.")
     mode.add_argument("--include-enroute", action="store_true", help="Compare TAF and SIGMET features against aircraft rotation.")
     mode.add_argument("--evaluate-destination-weather", metavar="RUN_ID", help="Score three frozen models on test.")
-    parser.add_argument("--include-gbt", action="store_true", help="Also train gradient-boosted tree challengers for the non-rotation feature sets.")
     args = parser.parse_args(argv)
     if args.include_enroute:
-        return run_destination_weather(include_gbt=args.include_gbt, include_rotation=True, include_enroute=True)
-    if args.include_gbt and (args.evaluate_destination_weather or args.evaluate_origin_weather):
-        parser.error("--include-gbt requires a training run")
+        return run_destination_weather(include_rotation=True, include_enroute=True)
     if args.evaluate_destination_weather:
         return evaluate_destination_weather(args.evaluate_destination_weather)
     if args.origin_weather:
-        return run_origin_weather(include_gbt=args.include_gbt)
+        return run_origin_weather()
     if args.evaluate_origin_weather:
         return evaluate_origin_weather(args.evaluate_origin_weather)
     # The default runs the en-route comparison against the completed Tier 4 baseline.
     if not args.bts_only:
         if args.destination_weather:
-            return run_destination_weather(include_gbt=args.include_gbt, include_rotation=False)
-        return run_destination_weather(
-            include_gbt=args.include_gbt, include_rotation=True, include_enroute=True,
-        )
+            return run_destination_weather(include_rotation=False)
+        return run_destination_weather(include_rotation=True, include_enroute=True)
     total_start = time.monotonic()
     banner = "=" * 80
     print(f"\n{banner}")
@@ -616,8 +610,6 @@ def main(argv=None):
     if prepare_bts(config):
         return 1
     for step, title, func in STAGES[3:]:
-        if args.include_gbt and func is bts_train.main:
-            func = partial(func, include_gbt=True)
         if run_stage(step, title, func) != 0:
             print(f"\n{banner}")
             print(f"PIPELINE STOPPED DUE TO FAILURE IN: {step} ({title})")

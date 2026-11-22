@@ -1,6 +1,7 @@
 """Test terminal forecast causality and convective corridor matching."""
 
 from datetime import date, datetime, timezone
+import json
 
 import pytest
 from pyspark.sql import functions as F
@@ -88,7 +89,7 @@ def test_schedule_uses_destination_local_arrival_and_rolls_service_date(spark):
 
 def test_enroute_command_and_vector_registration(monkeypatch):
     def complete(**kwargs):
-        assert kwargs == {"include_gbt": False, "include_rotation": True, "include_enroute": True}
+        assert kwargs == {"include_rotation": True, "include_enroute": True}
         return 0
 
     monkeypatch.setattr(pipeline, "run_destination_weather", complete)
@@ -129,3 +130,42 @@ def test_preprocessor_appends_enroute_columns_and_uses_training_only_medians(spa
     row = model.transform(data.where("id = 2")).first()
     assert row.dest_taf_ceiling_m_filled == 30.0
     assert row.enroute_sigmet_max_top_fl_filled == 0.0
+
+
+def test_enroute_reports_both_logistic_models_by_class(spark, tmp_path, monkeypatch):
+    weather, flags = train.weather_columns(train.ENROUTE_FEATURE_SET)
+    label = (F.col("id") % 3 == 0).cast("int")
+    data = spark.range(18).select(
+        *[F.lit("AA").alias(name) for name in train.CATEGORICAL_FEATURES],
+        F.lit(1).alias("Month"),
+        *[F.col("id").cast("double").alias(name) for name in train.NUMERIC_FEATURES],
+        *[F.lit(1.0).alias(name) for name in train.ROLLING_FEATURES + train.UPSTREAM_FEATURES
+          + weather + list(train.ROTATION_NUMERIC) + list(features.ENROUTE_NUMERIC)],
+        *[F.lit(0).alias(name) for name in train.HOLIDAY_FEATURES + flags
+          + list(train.ROTATION_FLAGS) + list(features.ENROUTE_FLAGS)],
+        F.col("id").cast("string").alias("flight_id"),
+        F.lit(date(2024, 1, 1)).alias("FlightDate"),
+        label.alias(train.TARGET_COL),
+    )
+    gold = tmp_path / "data/gold/enroute/test_generation"
+    data.where("cast(flight_id as int) < 12").write.parquet(str(gold / "train"))
+    validation = data.where("cast(flight_id as int) >= 12")
+    validation.write.parquet(str(gold / "val"))
+    rotation = tmp_path / "paired_run"
+    validation.select(*features.IDENTITY, F.lit(0.4).alias("p_delayed")).write.parquet(
+        str(rotation / "rot" / "validation_predictions")
+    )
+    monkeypatch.setattr(run, "prepare_gold", lambda *args: (gold, {}))
+    monkeypatch.setattr(train, "LOGISTIC_PARAMS", {**train.LOGISTIC_PARAMS, "maxIter": 1})
+    report = run.fit(spark, tmp_path, rotation, gold,
+                     {"inputs": {}, "stations": [], "selected_training_destination_share": 1.0},
+                     {"selected_model": {"best_threshold": 0.5}}, gold)
+    algorithms = json.loads(report.read_text())["algorithm_comparison"]
+    assert set(algorithms) == {"logistic_regression", train.WEIGHTED_LOGISTIC}
+    weighted_predictions = report.parent / "weighted_logistic" / "validation_predictions"
+    run.validate_cohort(validation, spark.read.parquet(str(weighted_predictions)), context="Weighted logistic validation")
+    for algorithm in algorithms.values():
+        scores = algorithm["validation_per_class_at_selected_threshold"]
+        counts = algorithm["validation_metrics_at_selected_threshold"]["confusion_matrix"]
+        assert set(scores) == {"delayed", "on_time"}
+        assert scores["on_time"]["recall"] == pytest.approx(counts["tn"] / (counts["tn"] + counts["fp"]))

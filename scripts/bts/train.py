@@ -16,7 +16,7 @@ from scripts.enroute_weather.build_features import ENROUTE_FLAGS, ENROUTE_NUMERI
 import pandas as pd
 from pyspark import StorageLevel
 from pyspark.ml import Pipeline, PipelineModel
-from pyspark.ml.classification import GBTClassifier, LogisticRegression
+from pyspark.ml.classification import LogisticRegression
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml.feature import Imputer, OneHotEncoder, SQLTransformer, StringIndexer, VectorAssembler
 from pyspark.ml.functions import vector_to_array
@@ -60,7 +60,8 @@ NUMERIC_FEATURES = ["CRSElapsedTime", "Distance"]
 INPUT_FEATURES = CATEGORICAL_FEATURES[:3] + ["Month"] + CATEGORICAL_FEATURES[3:] + NUMERIC_FEATURES + RECENT_CALENDAR_FEATURES
 TARGET_COL = "ArrDel15"
 LOGISTIC_PARAMS = {"regParam": 0.01, "elasticNetParam": 0.0, "maxIter": 100, "tol": 1e-6}
-GBT_PARAMS = {"maxDepth": 3, "maxIter": 50, "stepSize": 0.05, "seed": 42}
+WEIGHTED_LOGISTIC = "class_weighted_logistic_regression"
+CLASS_WEIGHT_COL = "class_weight"
 THRESHOLDS = [round(i * 0.05, 2) for i in range(1, 20)]
 
 
@@ -167,6 +168,13 @@ def confusion_metrics(tp: int, fp: int, tn: int, fn: int) -> dict[str, Any]:
         "accuracy": (tp + tn) / total if total > 0 else 0.0,
         "confusion_matrix": {"tp": tp, "fp": fp, "tn": tn, "fn": fn},
     }
+
+
+def per_class_metrics(delayed: dict[str, Any]) -> dict[str, dict[str, float]]:
+    counts = delayed["confusion_matrix"]
+    on_time = confusion_metrics(counts["tn"], counts["fn"], counts["tp"], counts["fp"])
+    return {label: {key: metrics[key] for key in ("precision", "recall", "f1")}
+            for label, metrics in (("delayed", delayed), ("on_time", on_time))}
 
 
 def evaluate_predictions(
@@ -282,7 +290,6 @@ def train(
     save_predictions: bool = False,
     publish_results: bool = True,
     *,
-    include_gbt: bool = False,
     model_name: str = "baseline_pipeline",
 ) -> dict[str, Any]:
     """Train and validate classification models on Gold feature sets.
@@ -294,8 +301,8 @@ def train(
     if feature_set not in TRAINING_FEATURE_SETS:
         raise ValueError(f"Unknown feature set: {feature_set}")
     include_rotation = feature_set in ROTATION_FEATURE_SETS
-    if include_rotation and (include_gbt or publish_results):
-        raise ValueError("Aircraft rotation and en-route weather require an isolated combined-weather logistic comparison.")
+    if include_rotation and publish_results:
+        raise ValueError("Aircraft rotation and en-route weather require an isolated combined-weather comparison.")
     if feature_set != "bts" and any(
         path is None for path in (gold_dir, models_dir)
     ):
@@ -376,28 +383,37 @@ def train(
             flush=True,
         )
 
-        estimators = [
-            ("logistic_regression", LogisticRegression(
-                featuresCol="features", labelCol=TARGET_COL, family="binomial",
-                standardization=True, **LOGISTIC_PARAMS)),
-        ]
-        if include_gbt:
-            estimators.append(("gradient_boosted_trees", GBTClassifier(
-                featuresCol="features", labelCol=TARGET_COL, **GBT_PARAMS)))
+        logistic = LogisticRegression(featuresCol="features", labelCol=TARGET_COL, family="binomial",
+                                      standardization=True, **LOGISTIC_PARAMS)
+        estimators = [("logistic_regression", logistic, models_dir)]
+        if 0 < prevalence < 1:
+            class_weights = {"on_time": 0.5 / (1 - prevalence), "delayed": 0.5 / prevalence}
+            estimators.append((WEIGHTED_LOGISTIC, logistic.copy({logistic.weightCol: CLASS_WEIGHT_COL}),
+                               models_dir / "weighted_logistic"))
+        else:
+            print("  Skipping class-weighted logistic regression because training has one class.", flush=True)
         algorithms = {}
-        for name, estimator in estimators:
+        for name, estimator, directory in estimators:
+            weighted = name == WEIGHTED_LOGISTIC
             label = f"{feature_set} / {name}"
             algorithm_timings = {}
-            print(f"  Fitting {name} on all training flights with fixed settings: "
-                  f"{LOGISTIC_PARAMS if name == 'logistic_regression' else GBT_PARAMS}", flush=True)
+            print(f"  Fitting {name} on all training flights with fixed settings: {LOGISTIC_PARAMS}", flush=True)
             print_progress(label, 0, 3)
-            with stage(f"{label}: fit preprocessing", timings=algorithm_timings, key="preprocessor_fit"):
-                preprocessor = build_preprocessor(
-                    feature_set, empty_enroute=empty_enroute,
-                ).fit(train_features)
+            # Both logistic models use the same fitted feature mapping.
+            if not weighted:
+                with stage(f"{label}: fit preprocessing", timings=algorithm_timings, key="preprocessor_fit"):
+                    preprocessor = build_preprocessor(
+                        feature_set, empty_enroute=empty_enroute,
+                    ).fit(train_features)
             print_progress(label, 1, 3)
             with stage(f"{label}: fit classifier", timings=algorithm_timings, key="classifier_fit"):
-                classifier = estimator.fit(preprocessor.transform(train_features))
+                fit_features = preprocessor.transform(train_features)
+                if weighted:
+                    fit_features = fit_features.withColumn(
+                        CLASS_WEIGHT_COL, F.when(F.col(TARGET_COL) == 1, class_weights["delayed"])
+                        .otherwise(class_weights["on_time"]),
+                    )
+                classifier = estimator.fit(fit_features)
                 selected_model = PipelineModel(stages=[*preprocessor.stages, classifier])
             print_progress(label, 2, 3)
             with stage(f"{label}: score validation and select threshold",
@@ -420,8 +436,6 @@ def train(
                                              for item in preprocessor.stages
                                              if hasattr(item, "surrogateDF")), {})
             print_progress(label, 3, 3)
-            # Keep a common logistic reference across weather variants; trees are a separate challenger.
-            directory = models_dir if name == "logistic_regression" else models_dir / "gbt"
             with stage(f"{label}: save model and threshold",
                        timings=algorithm_timings, key="save_model_and_threshold"):
                 directory.mkdir(parents=True, exist_ok=True)
@@ -436,20 +450,14 @@ def train(
                     (selected_scores.withColumn("prediction", (F.col("p_delayed") >= threshold).cast("int"))
                      .withColumn("threshold", F.lit(threshold))
                      .write.parquet(str(directory / "validation_predictions")))
-            if name == "logistic_regression":
-                model_params = {
-                    "reg_param": estimator.getRegParam(),
-                    "elastic_net_param": estimator.getElasticNetParam(),
-                    "max_iter": estimator.getMaxIter(),
-                    "tol": estimator.getTol(),
-                }
-            else:
-                model_params = {
-                    "max_depth": estimator.getMaxDepth(),
-                    "max_iter": estimator.getMaxIter(),
-                    "step_size": estimator.getStepSize(),
-                    "seed": estimator.getSeed(),
-                }
+            model_params = {
+                "reg_param": estimator.getRegParam(),
+                "elastic_net_param": estimator.getElasticNetParam(),
+                "max_iter": estimator.getMaxIter(),
+                "tol": estimator.getTol(),
+            }
+            if weighted:
+                model_params["class_weights"] = class_weights
             algorithms[name] = {
                 "algorithm": name,
                 **model_params,
@@ -458,6 +466,7 @@ def train(
                 "threshold_search": records(search_df),
                 "validation_metrics_at_selected_threshold": selected_metrics,
                 "validation_metrics_at_default_0_5": selected_default,
+                "validation_per_class_at_selected_threshold": per_class_metrics(selected_metrics),
                 "timing_seconds": algorithm_timings,
             }
             print(f"  {name}: validation PR-AUC={selected_default['pr_auc']}, "
@@ -492,7 +501,8 @@ def train(
             "tuning": {
                 "method": "fixed hyperparameters",
                 "search_performed": False,
-                "scope": "Each algorithm fitted once on all training rows; F1 thresholds selected on validation only; logistic regression remains the reference",
+                "scope": "Each algorithm is fitted once on all training rows. F1 thresholds use validation only. "
+                         "Unweighted logistic regression remains the reference.",
             },
             "reference_baselines": references,
         }
@@ -514,11 +524,11 @@ def train(
         train_features.unpersist(blocking=True)
 
 
-def main(*, include_gbt: bool = False) -> int:
+def main() -> int:
     """Run baseline training on BTS features and report validation performance."""
     spark = get_spark_session("bts_training")
     try:
-        summary = train(spark, include_gbt=include_gbt)
+        summary = train(spark)
         selected = summary["selected_model"]
         val_metrics = selected["validation_metrics_at_selected_threshold"]
         cm = val_metrics["confusion_matrix"]
@@ -546,6 +556,5 @@ def main(*, include_gbt: bool = False) -> int:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--include-gbt", action="store_true", help="Also train the gradient-boosted tree challenger.")
-    sys.exit(main(include_gbt=parser.parse_args().include_gbt))
+    argparse.ArgumentParser(description=__doc__).parse_args()
+    sys.exit(main())

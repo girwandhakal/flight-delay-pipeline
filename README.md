@@ -16,6 +16,8 @@ Each pipeline run checks its data dependencies before starting the corresponding
 
 Origin and destination weather use their requested NOAA station-years. Rotation uses destination train and validation, while en-route preparation also reads destination test schedules. TAF station selection, TAF Silver, and SIGMET Silver have separate caches. Replacing a verified TAF archive rebuilds its Silver table and en-route Gold while allowing rotation and SIGMET Silver to be reused.
 
+Tiers 4 and 5 include turnaround shortfall. It is the positive difference between typical ground time and the time from an observed prior arrival to the next scheduled departure. For each carrier and origin airport, the benchmark is the median of at least 20 historical turns lasting up to three hours. Training flights use the preceding UTC month. Validation uses the last training month, frozen before the validation boundary. The feature is marked missing when the arrival or benchmark is unavailable.
+
 Cache messages report hits, misses and elapsed lookup or preparation time. A completed `_stage.json` records the dependency key, output fingerprints, required sidecars and cold-build duration. A missing marker or a changed output triggers a fresh generation. Interrupted generations may remain on disk. Model fitting and explicit scoring retain their existing CLI behavior.
 
 ---
@@ -63,7 +65,6 @@ The pipeline evaluates five progressive model tiers on identical validation coho
 ```
 
 * **Core Estimator**: Binomial Logistic Regression via L-BFGS optimization (`regParam=0.01`, $L_2$ Ridge penalty, `maxIter=100`, `tol=1e-6`).
-* **Challenger Estimator**: Gradient-Boosted Trees (`GBTClassifier`, `maxDepth=3`, `maxIter=50`, `stepSize=0.05`).
 * **Decision Optimization**: Dynamically searches 19 candidate thresholds ($\tau \in [0.05, 0.95]$ in increments of $0.05$) on validation data to maximize $F_1$-score on imbalanced delays (~20% prevalence).
 * **Strict Temporal Splitting**:
   * **Train Cohort**: `2024-01-01` to `2024-09-30` (~4.2M flights)
@@ -86,7 +87,7 @@ A normal pipeline run rebuilds older BTS Gold and its weather descendants when t
 | **Distributed Engine** | **Apache Spark 3.5 / PySpark** | Large-scale parallel transformations, temporal bucket joins, and ML pipelines |
 | **Runtime & Language** | **Python 3.11 / Java 17** | Core pipeline logic, typing, and JVM Spark backend execution |
 | **Storage Architecture** | **Apache Parquet (Snappy)** | Partitioned, columnar Bronze $\to$ Silver $\to$ Gold Medallion storage |
-| **Machine Learning** | **Spark MLlib** | StringIndexer, OneHotEncoder, Imputer, VectorAssembler, LogisticRegression, GBT |
+| **Machine Learning** | **Spark MLlib** | StringIndexer, OneHotEncoder, Imputer, VectorAssembler, LogisticRegression |
 | **Data Sources** | **BTS TranStats / NOAA LCDv2** | US DOT on-time flight tables and hourly meteorological surface reports |
 | **Quality & Testing** | **Pytest / PySpark Fixtures** | 83 unit/integration tests verifying temporal causality, schemas, and math contracts |
 | **Environment** | **Conda / Hadoop 3.3 (winutils)** | Deterministic dependency isolation and cross-platform native I/O |
@@ -169,6 +170,8 @@ python -m pytest
 ### Run Complete End-to-End Pipeline
 Verifies inputs, downloads the public IEM archives, and fits and validates all five tiers. TAF + SIGMET uses the Tier 4 predictions from the same invocation.
 
+Each tier fits unweighted and class-weighted logistic regression on the same training flights. Weights use training prevalence and give delayed and on-time flights equal total weight. The existing tier comparison uses the unweighted model. Both models' validation metrics include precision, recall, and F1 for each class, with threshold sweeps under `training.algorithm_comparison` in `results/results.json`. The weighted model, threshold, and validation predictions are saved in the tier's `weighted_logistic/` directory.
+
 ```bash
 python pipeline/main.py
 ```
@@ -196,10 +199,6 @@ TAF forecasts must be issued by departure and valid at scheduled arrival. The de
 * **Three-Tier Weather Comparison**:
   ```bash
   python pipeline/main.py --destination-weather
-  ```
-* **Include Gradient-Boosted Trees (GBT) Challenger**:
-  ```bash
-  python pipeline/main.py --include-gbt
   ```
 * **Evaluate Frozen Models on Test Holdout**:
   ```bash

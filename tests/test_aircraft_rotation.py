@@ -9,7 +9,8 @@ from pyspark.sql import functions as F
 
 from scripts.aircraft_rotation import run
 from scripts.aircraft_rotation.build_features import (
-    RAW_COLUMNS, ROTATION_FLAGS, ROTATION_NUMERIC, build_operations, build_rotation_links,
+    MIN_TURN_HISTORY, RAW_COLUMNS, ROTATION_FLAGS, ROTATION_NUMERIC, TURNAROUND_MISSING,
+    TURNAROUND_SHORTFALL, add_turnaround_shortfall, build_operations, build_rotation_links,
 )
 from scripts.bts import train
 
@@ -62,26 +63,62 @@ def test_cutoff_ambiguity_and_direct_predecessor(spark):
         leg("2024-09-29", 17, "N7", "JFK", "ORD", "2330", "0030"),
         leg("2024-09-30", 18, "N7", "ORD", "JFK", "2230", "0130"),
     ]
+    legs[1].update(DepTime="2225", DepDelay="-5")
     parent = targets(spark, [
         (f"2024-09-30_AA_{flight}_ORD_JFK_2230", date(2024, 9, 30), "ORD", 0, "2024-10-01T03:30:00Z", "train")
         for flight in (2, 5, 8, 11, 13, 16, 18)
     ])
     result = {int(row.flight_id.split("_")[2]): row for row in build_rotation_links(
         parent, operations(spark, [*legs, legs[0]]), date(2024, 1, 3)
-    ).collect()}
+    ).withColumn("turn_available_epoch", F.col("_turn_available_utc").cast("long")).collect()}
     assert [(result[i].rotation_reason, result[i][ROTATION_NUMERIC[1]]) for i in (2, 5, 8, 11, 13)] == [
         ("usable", 15.0), ("prior_outcome_unavailable", None), ("prior_operation_ineligible", None),
         ("ambiguous_predecessor", None), ("ambiguous_target_or_timeline", None),
     ]
     assert result[2][ROTATION_NUMERIC[0]] == 30.0
+    assert result[2]._remaining_turn_minutes == 15.0
+    assert result[2]._observed_turn_minutes == 10.0
+    assert result[2].turn_available_epoch == datetime(2024, 10, 1, 3, 45, tzinfo=timezone.utc).timestamp()
     assert result[5][ROTATION_FLAGS[0]] == 0
     assert result[5][ROTATION_FLAGS[1]] == 1
+    assert result[5]._remaining_turn_minutes is None
     assert result[8].prior_flight_id == "2024-09-30_AA_7_JFK_ORD_2100"
     assert result[16].rotation_reason == "invalid_prior_outcome"
     assert result[16][ROTATION_NUMERIC[0]] == 30.0
     assert result[16][ROTATION_NUMERIC[1]] is None
     assert result[18].rotation_reason == "usable"
     assert result[18].prior_departure_gap_minutes == 1440.0
+
+
+def test_turnaround_shortfall_uses_only_available_training_history(spark):
+    bound = datetime(2024, 9, 30, 10, tzinfo=timezone.utc)
+    history = [
+        ("aug", "ORD", 35.0, "2024-08-14T12:00:00Z", "2024-08-14T10:00:00Z", MIN_TURN_HISTORY),
+        ("sep", "ORD", 50.0, "2024-09-14T12:00:00Z", "2024-09-14T10:00:00Z", MIN_TURN_HISTORY),
+        ("late", "ORD", 100.0, "2024-09-30T10:00:00Z", "2024-09-30T08:00:00Z", MIN_TURN_HISTORY + 1),
+        ("sparse", "JFK", 25.0, "2024-09-14T12:00:00Z", "2024-09-14T10:00:00Z", MIN_TURN_HISTORY - 1),
+    ]
+    rows = [(f"{prefix}{i}", "train", origin, duration, available, 20.0, cutoff)
+            for prefix, origin, duration, available, cutoff, count in history for i in range(count)]
+    rows.extend([
+        ("october", "val", "ORD", None, None, 20.0, "2024-10-01T10:00:00Z"),
+        ("november", "val", "ORD", None, None, 60.0, "2024-11-01T10:00:00Z"),
+        ("no_arrival", "val", "ORD", None, None, None, "2024-10-01T10:00:00Z"),
+        ("sparse_airport", "val", "JFK", None, None, 20.0, "2024-10-01T10:00:00Z"),
+    ])
+    linked = spark.createDataFrame(
+        rows, "flight_id string, split string, Origin string, _observed_turn_minutes double, "
+        "available string, _remaining_turn_minutes double, cutoff string",
+    ).withColumn("Reporting_Airline", F.lit("AA")).withColumn(
+        "_turn_available_utc", F.to_timestamp("available"),
+    ).withColumn("scheduled_departure_utc", F.to_timestamp("cutoff"))
+    result = {row.flight_id: (row[TURNAROUND_SHORTFALL], row[TURNAROUND_MISSING]) for row in
+              add_turnaround_shortfall(linked, bound).select("flight_id", TURNAROUND_SHORTFALL, TURNAROUND_MISSING).collect()}
+    assert len(result) == len(rows)
+    assert {name: result[name] for name in ("aug0", "sep0", "october", "november", "no_arrival", "sparse_airport")} == {
+        "aug0": (None, 1), "sep0": (15.0, 0), "october": (30.0, 0),
+        "november": (0.0, 0), "no_arrival": (None, 1), "sparse_airport": (None, 1),
+    }
 
 
 def test_paired_rotation_comparison(spark, tmp_path):
@@ -113,7 +150,7 @@ def test_paired_rotation_comparison(spark, tmp_path):
     w2, h1 = summary["arms"]["w2"], summary["arms"]["h1"]
     assert w2["training_rows"] == h1["training_rows"] == 3
     assert w2["validation_rows"] == h1["validation_rows"] == 4
-    assert h1["vector_dimension"] == w2["vector_dimension"] + 4
+    assert h1["vector_dimension"] == w2["vector_dimension"] + len(ROTATION_NUMERIC) + len(ROTATION_FLAGS)
     assert h1["input_columns"] == w2["input_columns"] + [*ROTATION_NUMERIC, *ROTATION_FLAGS]
     assert summary["completed_predecessor_validation_rows"] == 3
     assert set(summary["h1_minus_w2"]) == set(run.METRICS)
@@ -121,7 +158,7 @@ def test_paired_rotation_comparison(spark, tmp_path):
     gold = spark.read.parquet(str(tmp_path / "gold/val"))
     missing = model.transform(gold.where(F.col(ROTATION_FLAGS[1]) == 1)).first().features
     assert missing.size == h1["vector_dimension"]
-    assert list(missing)[-4:] == [60.0, 0.0, 0.0, 1.0]
+    assert list(missing)[-(len(ROTATION_NUMERIC) + len(ROTATION_FLAGS)):] == [60.0, 0.0, 0.0, 0.0, 1.0, 1.0]
 
 
 def test_publication_requires_unchanged_inputs(tmp_path):

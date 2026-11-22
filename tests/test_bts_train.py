@@ -80,17 +80,19 @@ class TrainingTests(unittest.TestCase):
             original_fit = bts.Pipeline.fit
             fit_dates = []
             original_classifier_fit = bts.LogisticRegression.fit
-            original_gbt_fit = bts.GBTClassifier.fit
             classifier_fits = []
-            gbt_fits = []
 
             def classifier_fit(estimator, dataset, *args, **kwargs):
-                classifier_fits.append(1)
+                classifier_fits.append(estimator.isSet(estimator.weightCol))
+                if estimator.isSet(estimator.weightCol):
+                    weight_col = estimator.getWeightCol()
+                    weights = {row[bts.TARGET_COL]: row[weight_col]
+                               for row in dataset.select(bts.TARGET_COL, weight_col).distinct().collect()}
+                    self.assertAlmostEqual(weights[0], 0.75)
+                    self.assertAlmostEqual(weights[1], 1.5)
+                else:
+                    self.assertNotIn(bts.CLASS_WEIGHT_COL, dataset.columns)
                 return original_classifier_fit(estimator, dataset, *args, **kwargs)
-
-            def gbt_fit(estimator, dataset, *args, **kwargs):
-                gbt_fits.append(1)
-                return original_gbt_fit(estimator, dataset, *args, **kwargs)
 
             def fit(pipeline, dataset, *args, **kwargs):
                 self.assertEqual(dataset.storageLevel, StorageLevel.DISK_ONLY)
@@ -101,21 +103,17 @@ class TrainingTests(unittest.TestCase):
                 return model
 
             logistic_params = {**bts.LOGISTIC_PARAMS, "maxIter": 1}
-            tree_params = {**bts.GBT_PARAMS, "maxDepth": 2, "maxIter": 2}
             with (patch.object(DataFrameReader, "parquet", read),
                   patch.object(bts.Pipeline, "fit", fit),
                   patch.object(bts.LogisticRegression, "fit", classifier_fit),
-                  patch.object(bts.GBTClassifier, "fit", gbt_fit),
-                  patch.object(bts, "LOGISTIC_PARAMS", logistic_params),
-                  patch.object(bts, "GBT_PARAMS", tree_params)):
-                summary = bts.train(self.spark, gold, models, results, include_gbt=True, model_name="model")
-            self.assertEqual(len(classifier_fits), 1)
-            self.assertEqual(len(gbt_fits), 1)
+                  patch.object(bts, "LOGISTIC_PARAMS", logistic_params)):
+                summary = bts.train(self.spark, gold, models, results)
+            self.assertEqual(classifier_fits, [False, True])
             self.assertEqual(set(reads), {str(gold / "train"), str(gold / "val")})
             self.assertEqual(summary["tuning"]["method"], "fixed hyperparameters")
             self.assertFalse(summary["tuning"]["search_performed"])
             self.assertNotIn("candidate_comparison", summary)
-            self.assertEqual(fit_dates, [(date(2024, 1, 1), date(2024, 9, 4))] * 2)
+            self.assertEqual(fit_dates, [(date(2024, 1, 1), date(2024, 9, 4))])
             self.assertEqual(summary["training_rows"], 36)
             self.assertEqual(summary["validation_rows"], 14)
             self.assertEqual(set(summary["reference_baselines"]), {"always_ontime", "always_delayed", "train_prevalence"})
@@ -123,9 +121,11 @@ class TrainingTests(unittest.TestCase):
             self.assertEqual(summary["selected_model"]["reg_param"], logistic_params["regParam"])
             self.assertEqual(summary["selected_model"]["elastic_net_param"], logistic_params["elasticNetParam"])
             self.assertEqual(set(path.name for path in results.iterdir()), {"results.json"})
-            self.assertEqual(set(path.name for path in models.iterdir()), {"model", "threshold.json", "gbt"})
+            self.assertEqual(set(summary["algorithm_comparison"]), {"logistic_regression", bts.WEIGHTED_LOGISTIC})
+            self.assertEqual(set(summary["timing_seconds"]), {"prepare_cohorts", "reference_baselines"})
+            self.assertEqual(set(path.name for path in models.iterdir()), {"baseline_pipeline", "threshold.json", "weighted_logistic"})
             self.assertEqual(json.loads((results / "results.json").read_text())["bts"]["training"], summary)
-            saved = PipelineModel.load(str(models / "model"))
+            saved = PipelineModel.load(str(models / "baseline_pipeline"))
             classifier = saved.stages[-1]
             self.assertEqual(classifier.getRegParam(), logistic_params["regParam"])
             self.assertEqual(classifier.getElasticNetParam(), logistic_params["elasticNetParam"])
@@ -136,33 +136,17 @@ class TrainingTests(unittest.TestCase):
             expected = summary["selected_model"]["validation_metrics_at_selected_threshold"]
             self.assertEqual(metrics["confusion_matrix"], expected["confusion_matrix"])
             self.assertAlmostEqual(metrics["f1"], expected["f1"])
-            challenger = summary["algorithm_comparison"]["gradient_boosted_trees"]
-            self.assertNotIn("internal_pr_auc", challenger)
-            self.assertEqual(challenger["max_depth"], tree_params["maxDepth"])
-            self.assertEqual(challenger["max_iter"], tree_params["maxIter"])
-            self.assertEqual(set(challenger["timing_seconds"]), {
-                "preprocessor_fit", "classifier_fit", "validation", "save_model_and_threshold",
-            })
-            self.assertTrue(all(seconds >= 0 for seconds in challenger["timing_seconds"].values()))
-            tree = PipelineModel.load(str(models / "gbt/model"))
-            self.assertEqual(tree.stages[-1].getMaxDepth(), challenger["max_depth"])
-            tree_threshold = json.loads((models / "gbt/threshold.json").read_text())["threshold"]
-            tree_metrics = bts.evaluate_predictions(bts.predict(tree, validation, tree_threshold))
-            self.assertEqual(tree_metrics["confusion_matrix"], challenger["validation_metrics_at_selected_threshold"]["confusion_matrix"])
+            weighted = summary["algorithm_comparison"][bts.WEIGHTED_LOGISTIC]
+            self.assertAlmostEqual(weighted["class_weights"]["on_time"], 0.75)
+            self.assertAlmostEqual(weighted["class_weights"]["delayed"], 1.5)
+            weighted_dir = models / "weighted_logistic"
+            weighted_model = PipelineModel.load(str(weighted_dir / "baseline_pipeline"))
+            weighted_threshold = json.loads((weighted_dir / "threshold.json").read_text())["threshold"]
+            weighted_metrics = bts.evaluate_predictions(bts.predict(weighted_model, validation, weighted_threshold))
+            self.assertEqual(weighted_metrics["confusion_matrix"],
+                             weighted["validation_metrics_at_selected_threshold"]["confusion_matrix"])
             published = json.loads((results / "results.json").read_text())["bts"]["validation"]
             self.assertEqual(published["selected"], expected)
-
-            default_models = root / "default"
-            with (patch.object(bts, "LOGISTIC_PARAMS", logistic_params),
-                  patch.object(bts, "GBTClassifier", side_effect=AssertionError("Unexpected GBT"))):
-                default = bts.train(self.spark, gold, default_models, results)
-            self.assertEqual(set(default["algorithm_comparison"]), {"logistic_regression"})
-            self.assertEqual(set(default_models.iterdir()), {
-                default_models / "baseline_pipeline", default_models / "threshold.json",
-            })
-            self.assertEqual(set(default["timing_seconds"]), {"prepare_cohorts", "reference_baselines"})
-            self.assertEqual(default["selected_model"], summary["selected_model"])
-            self.assertEqual(json.loads((results / "results.json").read_text())["bts"]["training"], default)
 
 
 if __name__ == "__main__":

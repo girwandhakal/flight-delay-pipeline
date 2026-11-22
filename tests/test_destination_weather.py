@@ -22,17 +22,17 @@ from scripts.weather_cache import resolve_stage
 
 
 class DestinationTests(unittest.TestCase):
-    def test_inference_hashes_include_tree_challenger_models_and_thresholds(self):
+    def test_inference_hashes_include_weighted_logistic_models_and_thresholds(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            model = root / "bts/gbt/baseline_pipeline/model"
+            model = root / "bts/weighted_logistic/baseline_pipeline/model"
             model.parent.mkdir(parents=True)
-            model.write_text("tree")
-            threshold = root / "bts/gbt/threshold.json"
+            model.write_text("logistic model")
+            threshold = root / "bts/weighted_logistic/threshold.json"
             threshold.write_text('{"threshold": 0.3}')
             original = pipeline.inference_hashes(root)
             self.assertEqual(set(original), {str(model.relative_to(root)), str(threshold.relative_to(root))})
-            model.write_text("changed tree")
+            model.write_text("changed logistic model")
             self.assertNotEqual(original, pipeline.inference_hashes(root))
             threshold.write_text('{"threshold": 0.4}')
             self.assertNotEqual(original[str(threshold.relative_to(root))],
@@ -69,7 +69,7 @@ class DestinationTests(unittest.TestCase):
         with patch.object(pipeline, "run_destination_weather", return_value=0) as run, patch.object(pipeline, "run_stage") as legacy:
             self.assertEqual(pipeline.main([]), 0)
             run.assert_called_once_with(
-                include_gbt=False, include_rotation=True, include_enroute=True,
+                include_rotation=True, include_enroute=True,
             )
             legacy.assert_not_called()
         with (patch.object(pipeline, "run_destination_weather") as run,
@@ -112,20 +112,14 @@ class DestinationTests(unittest.TestCase):
 
     def test_modes_and_feature_contract(self):
         with patch.object(pipeline, "run_destination_weather", return_value=0) as run, patch.object(pipeline, "evaluate_destination_weather", return_value=0) as evaluate:
-            self.assertEqual(pipeline.main(["--destination-weather", "--include-gbt"]), 0)
-            run.assert_called_once_with(include_gbt=True, include_rotation=False)
+            self.assertEqual(pipeline.main(["--destination-weather"]), 0)
+            run.assert_called_once_with(include_rotation=False)
             evaluate.assert_not_called()
             self.assertEqual(pipeline.main(["--evaluate-destination-weather", "frozen"]), 0)
             evaluate.assert_called_once_with("frozen")
         with patch.object(pipeline, "run_origin_weather", return_value=0) as run:
-            self.assertEqual(pipeline.main(["--origin-weather", "--include-gbt"]), 0)
-            run.assert_called_once_with(include_gbt=True)
-        with (patch.object(pipeline, "features_current", return_value=True),
-              patch.object(pipeline, "run_stage", return_value=0) as stage):
-            self.assertEqual(pipeline.main(["--bts-only", "--include-gbt"]), 0)
-            training = stage.call_args_list[0].args[2]
-            self.assertIs(training.func, train.main)
-            self.assertEqual(training.keywords, {"include_gbt": True})
+            self.assertEqual(pipeline.main(["--origin-weather"]), 0)
+            run.assert_called_once_with()
         self.assertEqual(len(destination.DESTINATION_WEATHER_NUMERIC), 27)
         self.assertEqual(len(destination.DESTINATION_WEATHER_FLAGS), 18)
         self.assertEqual(destination.DESTINATION_WEATHER_NUMERIC, [name.replace("origin_", "destination_", 1) for name in origin.WEATHER_NUMERIC])
@@ -202,7 +196,6 @@ class DestinationTests(unittest.TestCase):
                 self.assertEqual([call.args[2].name for call in fit.call_args_list],
                                  ["bts", "origin", "both", "rot"])
                 self.assertTrue(all(call.kwargs["model_name"] == "model" for call in fit.call_args_list))
-                self.assertTrue(all(not call.kwargs["include_gbt"] for call in fit.call_args_list))
                 self.assertEqual(compare.call_args.kwargs["variants"], variants)
                 self.assertEqual(compare.call_args.kwargs["variant_dirs"], pipeline.DESTINATION_MODEL_DIRS)
                 self.assertEqual(set(publish.call_args.args[0]), set(variants))

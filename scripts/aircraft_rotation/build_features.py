@@ -1,6 +1,6 @@
 """Link each flight to its immediate same-aircraft predecessor."""
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from pyspark.sql import DataFrame, Window, functions as F
@@ -10,25 +10,31 @@ from scripts.bts.recent_delays import (
 )
 
 
-ROTATION_NUMERIC = ("rotation_scheduled_turnaround_minutes", "rotation_prior_arrival_delay_minutes")
-ROTATION_FLAGS = ("rotation_link_missing", "rotation_outcome_missing")
+TURNAROUND_SHORTFALL = "rotation_turnaround_shortfall_minutes"
+TURNAROUND_MISSING = "rotation_turnaround_shortfall_missing"
+ROTATION_NUMERIC = ("rotation_scheduled_turnaround_minutes", "rotation_prior_arrival_delay_minutes", TURNAROUND_SHORTFALL)
+ROTATION_FLAGS = ("rotation_link_missing", "rotation_outcome_missing", TURNAROUND_MISSING)
 MAX_GAP_HOURS = 24
 OUTCOME_LAG_MINUTES = 15
+MAX_TYPICAL_TURN_MINUTES = 180
+MIN_TURN_HISTORY = 20
 RAW_COLUMNS = [*EVENT_COLUMNS, "Tail_Number", "CRSArrTime", "Cancelled"]
 KEY_COLUMNS = ["Reporting_Airline", "Flight_Number_Reporting_Airline", "Origin", "Dest"]
 
 
 def operation_clocks(
     row: Any, airports: dict,
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """Resolve scheduled departure, scheduled arrival, and actual arrival UTC clocks."""
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Resolve scheduled and actual departure and arrival UTC clocks."""
     scheduled, scheduled_arrival = scheduled_clocks(row, airports)
     if scheduled is None:
-        return None, None, None
+        return None, None, None, None
     departure, arrival = event_clocks(row, airports)
-    if not departure or not arrival or valid_delay(row.Cancelled) != 0:
+    if valid_delay(row.Cancelled) != 0:
+        departure = None
+    if not departure:
         arrival = None
-    return scheduled, scheduled_arrival, arrival
+    return scheduled, scheduled_arrival, arrival, departure
 
 
 def build_operations(raw: DataFrame, airports: list[dict[str, str]]) -> DataFrame:
@@ -58,12 +64,13 @@ def build_operations(raw: DataFrame, airports: list[dict[str, str]]) -> DataFram
     )
     clocks = F.udf(
         lambda row: operation_clocks(row, airports),
-        "scheduled string, scheduled_arrival string, arrival string",
+        "scheduled string, scheduled_arrival string, arrival string, departure string",
     )
     return operations.withColumn("clocks", clocks(F.struct(*EVENT_COLUMNS, "CRSArrTime", "Cancelled"))).select(
         "flight_id", "FlightDate", "tail", "Dest",
         F.to_timestamp("clocks.scheduled").alias("scheduled_utc"),
         F.to_timestamp("clocks.scheduled_arrival").alias("scheduled_arrival_utc"),
+        F.when(F.col("outcome_consistent"), F.to_timestamp("clocks.departure")).alias("actual_departure_utc"),
         F.when(F.col("outcome_consistent"), F.to_timestamp("clocks.arrival")).alias("actual_arrival_utc"),
         F.when(F.col("outcome_consistent"), F.col("ArrDelay").cast("double")).alias("arrival_delay"),
         F.when(F.col("outcome_consistent"), F.coalesce(
@@ -99,7 +106,8 @@ def build_rotation_links(
     )
     target_operations = operations.where("flight_id is not null").groupBy("flight_id").agg(
         F.count("*").alias("target_copies"),
-        F.first(F.struct("tail", "scheduled_utc", "actual_arrival_utc", "arrival_delay")).alias("target"),
+        F.first(F.struct("tail", "scheduled_utc", "actual_arrival_utc", "arrival_delay",
+                         "actual_departure_utc", "completed")).alias("target"),
     ).select(
         "flight_id", "target_copies",
         F.when(F.col("target_copies") == 1, F.col("target")).alias("target"),
@@ -148,6 +156,11 @@ def build_rotation_links(
     )
     linked = link_failure.isNull()
     usable = linked & outcome_failure.isNull()
+    prior_arrival = F.col("prior.actual_arrival_utc").cast("long")
+    actual_departure = F.col("target.actual_departure_utc")
+    historical_turn = linked & F.col("prior.completed") & F.col("target.completed")
+    # An early departure cannot contribute to the reference used on its own flight.
+    turn_available = F.greatest(actual_departure, cutoff) + F.expr(f"INTERVAL {OUTCOME_LAG_MINUTES} MINUTES")
     return rows.select(
         *parent.columns,
         F.when(linked, (cutoff.cast("double") - F.col("prior.scheduled_arrival_utc").cast("double")) / 60)
@@ -155,6 +168,9 @@ def build_rotation_links(
         F.when(usable, F.col("prior.arrival_delay")).alias(ROTATION_NUMERIC[1]),
         (~linked).cast("int").alias(ROTATION_FLAGS[0]),
         (~usable).cast("int").alias(ROTATION_FLAGS[1]),
+        F.when(usable, (cutoff.cast("long") - prior_arrival) / 60).alias("_remaining_turn_minutes"),
+        F.when(historical_turn, (actual_departure.cast("long") - prior_arrival) / 60).alias("_observed_turn_minutes"),
+        F.when(historical_turn & actual_departure.isNotNull(), turn_available).alias("_turn_available_utc"),
         F.coalesce(link_failure, outcome_failure, F.lit("usable")).alias("rotation_reason"),
         F.col("prior.flight_id").alias("prior_flight_id"),
         F.col("prior.scheduled_utc").alias("prior_scheduled_departure_utc"),
@@ -166,3 +182,31 @@ def build_rotation_links(
         .alias("label_available_utc"),
         ((F.col("target.arrival_delay") >= 15).cast("int") == F.col("ArrDel15")).alias("label_matches"),
     )
+
+
+def add_turnaround_shortfall(linked: DataFrame, validation_bound: datetime) -> DataFrame:
+    """Compare observed time left on the ground with a historical carrier-airport median."""
+    bound = F.lit(validation_bound).cast("timestamp")
+    cutoff = F.col("scheduled_departure_utc")
+    history_month = "_turn_history_month"
+    keys = ["Origin", "Reporting_Airline", history_month]
+    reference = (
+        linked.where((F.col("split") == "train") & (F.col("_turn_available_utc") < bound)
+                     & (F.col("_observed_turn_minutes") > 0)
+                     & (F.col("_observed_turn_minutes") <= MAX_TYPICAL_TURN_MINUTES))
+        .withColumn(history_month, F.trunc("_turn_available_utc", "month"))
+        .groupBy(*keys).agg(F.count("*").alias("_turn_samples"),
+                           F.percentile_approx("_observed_turn_minutes", 0.5).alias("_typical_turn_minutes"))
+        .where(F.col("_turn_samples") >= MIN_TURN_HISTORY).drop("_turn_samples")
+    )
+    # Training uses the previous UTC month. Validation freezes the last month at the training boundary.
+    month = F.when((F.col("split") == "val") & (cutoff >= bound),
+                   F.trunc(bound - F.expr("INTERVAL 1 SECOND"), "month")).otherwise(
+        F.add_months(F.trunc(cutoff, "month"), -1)
+    )
+    difference = F.col("_typical_turn_minutes") - F.col("_remaining_turn_minutes")
+    return (linked.withColumn(history_month, month).join(reference, keys, "left")
+            .withColumn(TURNAROUND_SHORTFALL, F.when(difference.isNotNull(), F.greatest(F.lit(0.0), difference)))
+            .withColumn(TURNAROUND_MISSING, F.col(TURNAROUND_SHORTFALL).isNull().cast("int"))
+            .drop(history_month, "_typical_turn_minutes", "_remaining_turn_minutes",
+                  "_observed_turn_minutes", "_turn_available_utc"))
