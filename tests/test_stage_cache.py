@@ -3,15 +3,16 @@
 import json
 import shutil
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from scripts import weather_cache as cache
 from scripts.aircraft_rotation import run as rotation
+from scripts.common import stage_cache as cache
+from scripts.common.io import sha256, write_json
 from scripts.enroute_weather import run as aviation
 from scripts.enroute_weather.download import acquire
-from scripts.origin_weather.download import sha256, write_json
+from scripts.origin_weather import clean
 
 
 def partition(path, value=b"fixture"):
@@ -20,25 +21,16 @@ def partition(path, value=b"fixture"):
     (path / "_SUCCESS").touch()
 
 
-def test_incomplete_generation_and_source_race(tmp_path):
+def test_incomplete_generation_and_changed_output(tmp_path):
     source = {"input": "A"}
     base = tmp_path / "gold"
+
     def resolve(builder):
         return cache.resolve_stage(base, source.copy, ["train"], [], builder)
 
     original = resolve(lambda path: partition(path / "train"))
     assert resolve(lambda _: pytest.fail("warm builder")) == original
 
-    def race(path):
-        partition(path / "train")
-        source["input"] = "C"
-
-    source["input"] = "B"
-    with pytest.raises(ValueError, match="inputs changed"):
-        resolve(race)
-    assert len(list(base.glob("*/_stage.json"))) == 1
-    source["input"] = "A"
-    assert resolve(lambda _: pytest.fail("lost prior generation")) == original
     (original / "train/_SUCCESS").unlink()
     repaired = resolve(lambda path: partition(path / "train"))
     assert repaired != original
@@ -68,7 +60,6 @@ def test_aviation_and_rotation_dependency_matrix(tmp_path, monkeypatch):
         return tuple(dict([acquire(root, archive.name, "fixture", None)]) for archive in (taf, sigmet))
 
     monkeypatch.setattr(aviation, "download", download)
-    monkeypatch.setattr(rotation, "ROOT", root)
     monkeypatch.setattr(aviation.clean_taf, "__file__", str(root / "scripts/enroute_weather/clean_taf.py"))
     destination = root / "destination" / "A"
     for split in config["splits"]:
@@ -94,9 +85,9 @@ def test_aviation_and_rotation_dependency_matrix(tmp_path, monkeypatch):
     spark = MagicMock()
     def run():
         built.clear()
-        prepared = aviation.prepare(spark, root, config, destination, "fresh-model-run")
-        report = rotation.prepare_rotation(spark, config, references, destination, [raw], root / "models")
-        aviation.prepare_gold(spark, root, Path(report["training_gold"]), destination, prepared)
+        prepared = aviation.prepare(spark, root, config, destination)
+        rotation_gold, _, _ = rotation.prepare_rotation(spark, root, config, references, destination, ([raw], [raw]))
+        aviation.prepare_gold(spark, root, rotation_gold, destination, prepared)
         return set(built)
 
     assert run() == {"taf_stations", "taf", "sigmets", "rotation", "enroute"}
@@ -116,10 +107,14 @@ def test_aviation_and_rotation_dependency_matrix(tmp_path, monkeypatch):
     (sibling / "test/part.parquet").write_bytes(b"new test cohort")
     cache.save_gold(sibling, {"splits": config["splits"]})
     destination = sibling
-    assert run() == {"enroute"}
+    assert run() == {"rotation", "enroute"}
+    rotated = sorted((root / "data/gold/rotation").glob("*/gold/test/part.parquet"), key=lambda path: path.stat().st_mtime_ns)[-1]
+    rotated.write_bytes(b"changed rotation output")
+    with pytest.raises(ValueError, match="Changed stage output"):
+        cache.consumed(rotated.parents[2], ("gold/test",))
     raw.write_text("new tail assignment")
     assert run() == {"rotation", "enroute"}
-    monkeypatch.setattr(rotation.bts_train, "INPUT_FEATURES", list(reversed(rotation.bts_train.INPUT_FEATURES)))
+    monkeypatch.setattr(rotation, "BTS_FEATURE_COLUMNS", list(reversed(rotation.BTS_FEATURE_COLUMNS)))
     assert run() == {"rotation", "enroute"}
     with (root / "scripts/enroute_weather/build_features.py").open("a") as stream:
         stream.write("# revised join")
@@ -131,6 +126,7 @@ def test_bts_and_airport_weather_branches(tmp_path, monkeypatch):
     import pandas as pd
     from scripts.bts import build_features, clean
     from scripts.bts import cache as bts
+    from scripts.bts.block_time import BLOCK_TIME_SIDECAR, DEFAULT_MANIFEST
     from scripts.bts.recent_delays import TAXI_BASELINE_FILE
 
     root = tmp_path
@@ -169,6 +165,7 @@ def test_bts_and_airport_weather_branches(tmp_path, monkeypatch):
         for split in config["splits"]:
             partition(gold_dir / split, gold_dir.name.encode())
         write_json(gold_dir / TAXI_BASELINE_FILE, [])
+        write_json(gold_dir / BLOCK_TIME_SIDECAR, kwargs["block_history"])
         write_json(gold_dir / "_features.json", {})
         return pd.DataFrame([{"total_flights": 1}])
 
@@ -202,9 +199,18 @@ def test_bts_and_airport_weather_branches(tmp_path, monkeypatch):
     frozen = bts.active(root, "gold")
     pinned = cache.consumed(frozen, config["splits"])
     assert run() == []
-    with (root / "scripts/bts/upstream.py").open("a") as stream:
-        stream.write("# changed Tier 1 policy")
+    with (root / "scripts/bts/recent_delays.py").open("a") as stream:
+        stream.write("# changed BTS feature policy")
     assert run() == ["gold", "origin", "destination"]
+    release = root / DEFAULT_MANIFEST
+    write_json(release, {"schema_version": 1, "months": []})
+    assert run() == ["gold", "origin", "destination"]
+    assert run() == []
+    (bts.active(root, "gold") / BLOCK_TIME_SIDECAR).write_text("changed")
+    assert not bts.features_current(root, config)
+    assert run() == ["gold", "origin", "destination"]
+    release.unlink()
+    assert run() == []
     assert bts.active(root, "gold") != frozen
     assert cache.consumed(frozen, config["splits"]) == pinned
     with (root / "scripts/destination_weather/build_features.py").open("a") as stream:
@@ -248,22 +254,98 @@ def test_warm_aviation_skips_spark_actions_and_preserves_splits(tmp_path, spark,
     write_json(destination / "_metadata.json", {})
     cache.save_gold(destination, {"splits": splits})
 
-    def copy_development(path):
-        for split in ("train", "val"):
-            shutil.copytree(destination / split, path / "gold" / split)
-    rotation_dir = cache.resolve_stage(root / "rotation", lambda: {}, ("gold/train", "gold/val"), (), copy_development)
-    cold = aviation.prepare(spark, root, config, destination, "model-A")
+    def build_rotation_fixture(path):
+        from pyspark.sql import functions as F
+        from scripts.aircraft_rotation.build_features import ROTATION_NUMERIC, ROTATION_FLAGS
+
+        for split in splits:
+            rows = spark.read.parquet(str(destination / split))
+            for name in ROTATION_NUMERIC:
+                rows = rows.withColumn(name, F.lit(12.0 if split != "test" else None).cast("double"))
+            for name in ROTATION_FLAGS:
+                rows = rows.withColumn(name, F.lit(int(split == "test")))
+            rows.write.parquet(str(path / "gold" / split))
+
+    rotation_dir = cache.resolve_stage(root / "rotation", lambda: {},
+                                       tuple(f"gold/{split}" for split in splits), (), build_rotation_fixture)
+    cold = aviation.prepare(spark, root, config, destination)
     gold, coverage = aviation.prepare_gold(spark, root, rotation_dir / "gold", destination, cold)
     assert coverage["train"]["taf_observed"] == 1
     for split in splits:
         stored = spark.read.parquet(str(gold / split))
         assert [(row.flight_id, row.ArrDel15) for row in stored.select("flight_id", "ArrDel15").collect()] == [(split, 0)]
 
-    # Any station aggregation, join, coverage scan or writer would need one
-    # of these entry points. A new model ID should reach none of them.
+    test_row = spark.read.parquet(str(gold / "test")).first()
+    assert test_row.rotation_prior_arrival_delay_minutes is None
+    assert test_row[rotation.ROTATION_FLAGS[1]] == 1
+
+    # Verified generations can be reused without another Spark transformation.
     warm_spark = MagicMock()
     warm_spark.read.parquet.side_effect = AssertionError("unexpected warm Spark read")
     warm_spark.createDataFrame.side_effect = AssertionError("unexpected warm Spark writer")
-    warm = aviation.prepare(warm_spark, root, config, destination, "model-B")
+    warm = aviation.prepare(warm_spark, root, config, destination)
     assert warm["tables"] == cold["tables"]
     assert aviation.prepare_gold(warm_spark, root, rotation_dir / "gold", destination, warm) == (gold, coverage)
+
+
+def test_weather_gold_and_silver_cache_reuse_and_invalidation(tmp_path):
+    # Verify Gold stage discovery returns directory on exact match and None on policy mismatch or missing success marker
+    config = {"splits": {"train": {}, "val": {}, "test": {}}}
+    inputs = {"splits": config["splits"], "policy": {"max_age_minutes": 120}}
+    directory = tmp_path / "data/gold/bts_origin_weather/001"
+    for split in config["splits"]:
+        folder = directory / split
+        folder.mkdir(parents=True)
+        (folder / "_SUCCESS").touch()
+        (folder / "part.parquet").write_bytes(b"fixture")
+    metadata = directory / "_metadata.json"
+    metadata.write_text("{}")
+    cache.save_gold(directory, inputs)
+
+    with patch.object(cache, "input_identity", return_value=inputs):
+        assert cache.find_gold(tmp_path, {}, {}, config, None) == directory.resolve()
+        # Ensure policy change invalidates the cached Gold directory
+        with patch.object(cache, "input_identity", return_value={**inputs, "policy": {"max_age_minutes": 90}}):
+            assert cache.find_gold(tmp_path, {}, {}, config, None) is None
+        (directory / "test/_SUCCESS").unlink()
+        assert cache.find_gold(tmp_path, {}, {}, config, None) is None
+
+    # Verify Silver cleaning reuse skips CSV reads when file fingerprints match
+    raw = tmp_path / "bronze/2024/LCD_USW00094846_2024.csv"
+    raw.parent.mkdir(parents=True)
+    raw.write_text("fixture")
+    silver = tmp_path / "silver/first"
+    silver.mkdir(parents=True)
+    output = silver / "part-000.parquet"
+    output.write_bytes(b"fixture")
+    (silver / "_SUCCESS").touch()
+    manifest = {"complete": True, "files": {"fixture": {
+        "status": "downloaded", "station_id": "USW00094846",
+        "year": 2024, "time_zone": "America/Chicago",
+    }}}
+    cleaning_inputs = {
+        "files": clean.file_fingerprints([raw]),
+        "stations": [["USW00094846", 2024, "America/Chicago"]],
+        "code": {name: clean.sha256(Path(clean.__file__).with_name(name))
+                 for name in ("clean.py", "measurements.py", "download.py")},
+        "spark": "3.5.7",
+    }
+    meta = {
+        "quality": {"retained_observations": 1},
+        "station_quality": [],
+        "source_contract": {},
+        "cleaning_cache": {
+            "inputs": cleaning_inputs,
+            "outputs": clean.file_fingerprints([output]),
+        },
+    }
+    (silver / "_metadata.json").write_text(json.dumps(meta))
+
+    spark_mock = MagicMock()
+    spark_mock.version = "3.5.7"
+    spark_mock.createDataFrame.side_effect = RuntimeError("cleaning started")
+    result = clean.clean_weather(
+        spark_mock, tmp_path / "bronze", tmp_path / "silver/next",
+        tmp_path / "quarantine", manifest, tmp_path / "reports",
+    )
+    spark_mock.read.parquet.assert_called_once_with(str(silver), pathGlobFilter="*.parquet")

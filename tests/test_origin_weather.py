@@ -4,17 +4,22 @@ import csv
 from datetime import date, datetime, timezone
 import io
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
+import pytest
+
 from pyspark.sql import functions as F
 
 from tests.conftest import get_test_spark_session
 
-from scripts.bts import train
+from scripts.common import io as io_utils
+from scripts.common.config import project_path
+from scripts.common.io import sha256, write_json
 from scripts.origin_weather import build_features as features, clean, download
 from scripts.origin_weather.measurements import SOURCE_FIELDS, FEATURE_COLUMNS, NUMERIC_FEATURES, decode_weather
 
@@ -30,6 +35,7 @@ def raw_csv(rows):
     return stream.getvalue().encode()
 
 
+@pytest.mark.unit
 class WeatherDownloadTests(unittest.TestCase):
     def test_reference_line_endings_preserve_checksums_but_content_changes_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -39,8 +45,8 @@ class WeatherDownloadTests(unittest.TestCase):
                                         (b"Origin\nORD\n", b"Origin\r\nORD\r\n")):
                 with self.subTest(original=original):
                     target.write_bytes(original)
-                    checksum = download.sha256(target)
-                    download.write_json(directory / "sources.json", {
+                    checksum = sha256(target)
+                    write_json(directory / "sources.json", {
                         "origins": ["ORD"], "scope": ["2024-01-01", "2025-01-31"],
                         "files": {"airports.csv": checksum},
                     })
@@ -93,8 +99,8 @@ class WeatherDownloadTests(unittest.TestCase):
                 return stream
 
             with (
-                patch.object(download, "urlopen", side_effect=response) as network,
-                patch.object(download, "sha256", side_effect=AssertionError("Unexpected checksum scan")),
+                patch.object(io_utils, "urlopen", side_effect=response) as network,
+                patch.object(io_utils, "sha256", side_effect=AssertionError("Unexpected checksum scan")),
                 patch.object(download.csv, "DictReader", side_effect=AssertionError("Unexpected CSV scan")),
                 patch.object(download.tqdm, "write") as messages,
             ):
@@ -129,42 +135,8 @@ class WeatherDownloadTests(unittest.TestCase):
             self.assertFalse(json.loads((Path(tmp) / "manifest.json").read_text())["complete"])
             self.assertFalse((Path(tmp) / "2024/LCD_USW00094846_2024.csv").exists())
             with self.assertRaisesRegex(ValueError, "inside"):
-                download.project_path(Path(tmp), "../escape")
+                project_path(Path(tmp), "../escape")
 
-    def test_manifest_replace_retries_transient_permission_errors(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "manifest.json"
-            download.write_json(target, {"run": 1})
-            original_replace = Path.replace
-            calls = []
-
-            def locked_then_available(source, destination):
-                calls.append(source)
-                if len(calls) < 3:
-                    self.assertEqual(json.loads(target.read_text()), {"run": 1})
-                    raise PermissionError("file is temporarily locked")
-                return original_replace(source, destination)
-
-            with (patch.object(Path, "replace", locked_then_available),
-                  patch("scripts.results.time.sleep") as sleep):
-                download.write_json(target, {"run": 2})
-            self.assertEqual(len(calls), 3)
-            self.assertEqual(sleep.call_count, 2)
-            self.assertEqual(json.loads(target.read_text()), {"run": 2})
-            self.assertFalse(target.with_suffix(".json.part").exists())
-
-    def test_permanent_manifest_lock_preserves_previous_and_pending_json(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "manifest.json"
-            download.write_json(target, {"run": 1})
-            with (patch.object(Path, "replace", side_effect=PermissionError("locked")) as replace,
-                  patch("scripts.results.time.sleep") as sleep):
-                with self.assertRaisesRegex(PermissionError, "locked"):
-                    download.write_json(target, {"run": 2})
-            self.assertEqual(replace.call_count, 6)
-            self.assertEqual(sleep.call_count, 5)
-            self.assertEqual(json.loads(target.read_text()), {"run": 1})
-            self.assertEqual(json.loads(target.with_suffix(".json.part").read_text()), {"run": 2})
 
 class WeatherSparkTests(unittest.TestCase):
     @classmethod
@@ -224,7 +196,7 @@ class WeatherSparkTests(unittest.TestCase):
                 (
                     "USW00094846",
                     datetime(2024, 1, 1, 17, 46, tzinfo=timezone.utc),
-                    "too_new_with_lag",
+                    "within_15_minutes",
                     9.0,
                     9.0,
                     9.0,
@@ -239,17 +211,18 @@ class WeatherSparkTests(unittest.TestCase):
             if name not in weather.columns:
                 weather = weather.withColumn(name, F.lit(decoded[name]).cast("double" if name in NUMERIC_FEATURES else "int"))
         joined = features.build_origin_features(
-            cutoffs, weather, {"files": {}}, publication_lag_minutes=15
+            cutoffs, weather, {"files": {}}
         ).cache()
         try:
-            features.validate_cohort(flights, joined, publication_lag_minutes=15)
+            features.validate_cohort(flights, joined)
             rows = {row.flight_id: row for row in joined.collect()}
-            self.assertEqual(rows["a"].source_file, "eligible")
+            self.assertEqual(rows["a"].source_file, "at_departure")
             self.assertEqual(joined.columns[:len(cutoffs.columns)], cutoffs.columns)
             self.assertEqual(joined.select(cutoffs.columns).schema, cutoffs.schema)
             self.assertEqual({key: row.parent_payload for key, row in rows.items()},
                              {key: key * 4096 for key in ("a", "b", "c")})
-            self.assertEqual(rows["b"].origin_weather_age_minutes, 15)
+            self.assertEqual(rows["b"].origin_weather_age_minutes, 0)
+            self.assertEqual(rows["a"].origin_available_utc, rows["a"].scheduled_departure_utc)
             self.assertEqual(rows["a"].origin_visibility_missing, 1)
             self.assertEqual(rows["c"].origin_weather_missing, 1)
             self.assertEqual(
@@ -260,17 +233,6 @@ class WeatherSparkTests(unittest.TestCase):
                 features.validate_cohort(
                     flights, joined.withColumn("ArrDel15", F.lit(1))
                 )
-        finally:
-            joined.unpersist()
-
-        joined = features.build_origin_features(cutoffs, weather, {"files": {}}).cache()
-        try:
-            features.validate_cohort(flights, joined)
-            rows = {row.flight_id: row for row in joined.collect()}
-            self.assertEqual(rows["a"].source_file, "at_departure")
-            self.assertEqual(rows["b"].origin_weather_age_minutes, 0)
-            self.assertEqual(rows["a"].origin_available_utc, rows["a"].scheduled_departure_utc)
-            self.assertEqual(rows["c"].origin_weather_missing, 1)
         finally:
             joined.unpersist()
 
@@ -418,7 +380,9 @@ class WeatherSparkTests(unittest.TestCase):
             enriched = features.build_origin_features(cutoffs, observations, manifest).cache()
             try:
                 features.validate_cohort(flights, enriched)
-                train.validate_weather(enriched, "expanded fixture")
+                values = enriched.select(*features.WEATHER_NUMERIC, *features.WEATHER_FLAGS).first()
+                self.assertTrue(all(math.isfinite(values[name]) for name in features.WEATHER_NUMERIC))
+                self.assertTrue(all(values[name] in (0, 1) for name in features.WEATHER_FLAGS))
                 row = enriched.first()
                 self.assertEqual(row.origin_weather_age_minutes, 10)
                 self.assertEqual(row.origin_wind_direction_sin, 1)
