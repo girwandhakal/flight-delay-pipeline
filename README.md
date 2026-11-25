@@ -150,7 +150,7 @@ The test suite is partitioned into fast pure-Python unit tests and Spark integra
 python pipeline/main.py
 ```
 
-The command prepares BTS and weather inputs, builds all three Gold splits, and selects each fitted model's threshold on validation. The unweighted model is the primary result. Each run saves `validation.json`, `run.json`, models, thresholds, and validation predictions under `models/flight_delay/RUN_ID`. The class-weighted model uses the same features and balances the total training weight of the two classes.
+The command prepares BTS and weather inputs, builds all three Gold splits, and selects each fitted model's threshold on validation. The unweighted model is the primary result. Each run saves `validation.json`, `run.json`, models, thresholds, and validation predictions under `models/flight_delay/RUN_ID`, and automatically prunes superseded or aborted cache directories after Stage 6 completes cleanly. The class-weighted model uses the same features and balances the total training weight of the two classes.
 
 ### Score the completed run on test
 

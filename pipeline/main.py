@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.aircraft_rotation import run as aircraft_rotation
 from scripts.bts import run as bts
+from scripts.common.cleanup import cleanup_workspace, format_cleanup_summary
 from scripts.common.context import PipelineContext
 from scripts.common.progress import DIVIDER
 from scripts.common.spark import spark_session
@@ -51,6 +52,9 @@ def main() -> int:
         enroute_weather.run(ctx)
         report = modeling.run(ctx)
 
+    summary = cleanup_workspace(ctx.root)
+    if summary.removed_dirs:
+        print(format_cleanup_summary(summary), flush=True)
     print_pipeline_summary(ctx, report, time.monotonic() - started)
     return 0
 

@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+import shutil
 from time import monotonic
 from typing import Any, Optional, Union
 from uuid import uuid4
@@ -278,19 +279,24 @@ def resolve_stage(base: Path, inputs, partitions, sidecars, build) -> Path:
     print(f"  [Cache MISS] {label} ({reason}) — building now...", flush=True)
     path = base / f"{prefix}-{uuid4().hex[:12]}"
     path.mkdir(parents=True, exist_ok=False)
-    provenance = build(path)
-    outputs = output_identity(path, partitions, sidecars)
-    write_json(
-        path / "_stage.json",
-        {
-            "key": key,
-            "contract": contract,
-            "outputs": outputs,
-            "reason": reason,
-            "seconds": monotonic() - started,
-            "provenance": provenance,
-        },
-    )
+    try:
+        provenance = build(path)
+        outputs = output_identity(path, partitions, sidecars)
+        write_json(
+            path / "_stage.json",
+            {
+                "key": key,
+                "contract": contract,
+                "outputs": outputs,
+                "reason": reason,
+                "seconds": monotonic() - started,
+                "provenance": provenance,
+            },
+        )
+    except BaseException:
+        # Remove partial build directories immediately so failed runs do not accumulate on disk.
+        shutil.rmtree(path, ignore_errors=True)
+        raise
     print(f"  [Cache BUILT] {label} in {monotonic() - started:.1f}s", flush=True)
     return path
 
