@@ -394,5 +394,57 @@ class WeatherSparkTests(unittest.TestCase):
             finally:
                 enriched.unpersist()
 
+    def test_per_station_year_silver_cache_reuses_shared_stations_and_validates_cohort(self):
+        values = dict(zip(SOURCE_FIELDS, [
+            "20", "4", "16.093", "0", "8", "090", "70", "-2", "1013.2",
+            "RA:02 |RA |RA", "CLR:00",
+        ]))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for station in ("USW00094846", "USW00014732"):
+                source = root / f"bronze/2024/LCD_{station}_2024.csv"
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_bytes(raw_csv([[
+                    station, "2024-01-01T17:50:00", "FM-15", "METAR KORD 011750Z",
+                    *[values[name] for name in SOURCE_FIELDS],
+                ]]))
+            origin_manifest = {
+                "complete": True,
+                "files": {"ord": {
+                    "station_id": "USW00094846", "year": 2024,
+                    "time_zone": "America/Chicago", "status": "downloaded",
+                }},
+            }
+            dest_manifest = {
+                "complete": True,
+                "files": {
+                    **origin_manifest["files"],
+                    "lga": {
+                        "station_id": "USW00014732", "year": 2024,
+                        "time_zone": "America/New_York", "status": "downloaded",
+                    },
+                },
+            }
+            first = clean.clean_weather(
+                self.spark, root / "bronze", root / "silver/s1", root / "quarantine/q1",
+                origin_manifest, root / "silver/s1",
+            )
+            self.assertEqual(first.count(), 1)
+            second = clean.clean_weather(
+                self.spark, root / "bronze", root / "silver/s2", root / "quarantine/q2",
+                dest_manifest, root / "silver/s2",
+            )
+            self.assertEqual(second.count(), 2)
+            # Only the newly added station should be quarantined/cleaned in the second run.
+            self.assertEqual(self.spark.read.parquet(str(root / "quarantine/q2")).count(), 0)
+
+            flights = self.spark.createDataFrame(
+                [("f1", date(2024, 1, 1), "ORD", "1200", "train", 0)],
+                "flight_id string, FlightDate date, Origin string, CRSDepTime string, split string, ArrDel15 int",
+            )
+            mutated = flights.withColumn("ArrDel15", F.lit(1))
+            with self.assertRaises(ValueError):
+                features.validate_cohort(flights, mutated)
+
 if __name__ == "__main__":
     unittest.main()

@@ -34,12 +34,12 @@ def get_spark_session(app_name: str = "flight_delay") -> SparkSession:
         # Ensure Spark workers can import the project scripts package.
         os.environ["PYTHONPATH"] = str(ROOT) + (os.pathsep + python_path if python_path else "")
     return (
-        SparkSession.builder.master("local[2]")
+        SparkSession.builder.master("local[4]")
         .appName(app_name)
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.driver.bindAddress", "127.0.0.1")
         .config("spark.driver.memory", "6g")
-        .config("spark.sql.shuffle.partitions", "64")
+        .config("spark.sql.shuffle.partitions", "32")
         .config("spark.sql.files.maxPartitionBytes", "32m")
         .config("spark.sql.parquet.columnarReaderBatchSize", "1024")
         .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "16m")

@@ -109,16 +109,33 @@ def build_flight_cutoffs(
         return utc.isoformat() + "Z" if utc else None, status
 
     convert = F.udf(convert_clock, "utc_clock string, origin_cutoff_status string")
+    # Deduplicate (FlightDate, CRSDepTime, origin_time_zone) keys before Python UDF evaluation.
+    cutoff_keys = (
+        joined.select("FlightDate", "CRSDepTime", "origin_time_zone")
+        .distinct()
+        .withColumn("cutoff", convert("FlightDate", "CRSDepTime", "origin_time_zone"))
+        .select(
+            F.col("FlightDate").alias("_k_date"),
+            F.col("CRSDepTime").alias("_k_clock"),
+            F.col("origin_time_zone").alias("_k_zone"),
+            "cutoff.*",
+        )
+    )
     return (
-        joined.withColumn(
-            "cutoff", convert("FlightDate", "CRSDepTime", "origin_time_zone")
+        joined.join(
+            cutoff_keys,
+            joined.FlightDate.eqNullSafe(cutoff_keys._k_date)
+            & joined.CRSDepTime.eqNullSafe(cutoff_keys._k_clock)
+            & joined.origin_time_zone.eqNullSafe(cutoff_keys._k_zone),
+            "left",
         )
         .select(
             *flights.columns,
             "origin_time_zone",
             "origin_station_id",
             "origin_mapping_method",
-            "cutoff.*",
+            "utc_clock",
+            "origin_cutoff_status",
         )
         .withColumn("scheduled_departure_utc", F.to_timestamp("utc_clock"))
         .drop("utc_clock")
@@ -312,31 +329,59 @@ def build_weather_features(
         if entry["status"] == "unavailable"
     }
 
-    def source_missing(station, cutoff, zone):
-        if not station or not cutoff or not zone:
-            return False
-        cutoff = datetime.fromisoformat(cutoff)
-        offset = timedelta(seconds=standard_offset(zone, cutoff.year))
-        start = (min(cutoff, cutoff + offset) - timedelta(minutes=max_age_minutes)).year
-        end = max(cutoff, cutoff + offset).year
-        return any((station, year) in unavailable for year in range(start, end + 1))
+    if unavailable:
+        def source_missing(station, cutoff, zone):
+            if not station or not cutoff or not zone:
+                return False
+            cutoff = datetime.fromisoformat(cutoff)
+            offset = timedelta(seconds=standard_offset(zone, cutoff.year))
+            start = (min(cutoff, cutoff + offset) - timedelta(minutes=max_age_minutes)).year
+            end = max(cutoff, cutoff + offset).year
+            return any((station, year) in unavailable for year in range(start, end + 1))
 
-    has_missing_source = F.udf(source_missing, T.BooleanType())
+        has_missing_source = F.udf(source_missing, T.BooleanType())
+        station_col = f"{prefix}_station_id"
+        zone_col = f"{prefix}_time_zone"
+        selected = selected.withColumn(
+            "_cutoff_str", F.date_format("scheduled_departure_utc", "yyyy-MM-dd'T'HH:mm:ss")
+        )
+        missing_keys = (
+            selected.filter(
+                F.col(observation).isNull()
+                & F.col("scheduled_departure_utc").isNotNull()
+                & F.col(station_col).isNotNull()
+            )
+            .select(station_col, "_cutoff_str", zone_col)
+            .distinct()
+            .withColumn("_source_missing", has_missing_source(station_col, "_cutoff_str", zone_col))
+            .select(
+                F.col(station_col).alias("_m_station"),
+                F.col("_cutoff_str").alias("_m_cutoff"),
+                F.col(zone_col).alias("_m_zone"),
+                "_source_missing",
+            )
+        )
+        selected = selected.join(
+            F.broadcast(missing_keys),
+            selected[station_col].eqNullSafe(missing_keys._m_station)
+            & selected["_cutoff_str"].eqNullSafe(missing_keys._m_cutoff)
+            & selected[zone_col].eqNullSafe(missing_keys._m_zone),
+            "left",
+        )
+        missing_source_col = F.coalesce(F.col("_source_missing"), F.lit(False))
+    else:
+        missing_source_col = F.lit(False)
+
     selected = selected.withColumn(
         f"{prefix}_weather_match_status",
         F.when(F.col(observation).isNotNull(), "matched")
         .when(F.col("scheduled_departure_utc").isNull(), "invalid_cutoff")
         .when(F.col(f"{prefix}_station_id").isNull(), "unmapped_airport")
-        .when(
-            has_missing_source(
-                f"{prefix}_station_id",
-                F.date_format("scheduled_departure_utc", "yyyy-MM-dd'T'HH:mm:ss"),
-                f"{prefix}_time_zone",
-            ),
-            "source_unavailable",
-        )
+        .when(missing_source_col, "source_unavailable")
         .otherwise("no_eligible_report"),
     )
+    if unavailable:
+        selected = selected.drop("_cutoff_str", "_m_station", "_m_cutoff", "_m_zone", "_source_missing")
     return selected
 
 
@@ -354,9 +399,15 @@ def validate_cohort(
             raise ValueError("Flight IDs must be nonnull and unique.")
 
     columns = original.columns
+    # Unique IDs allow a single-pass merge-join instead of two full-table exceptAll shuffles.
+    parent_rows = original.select("flight_id", F.struct(*columns).alias("_parent"))
+    enriched_rows = enriched.select("flight_id", F.struct(*columns).alias("_enriched"))
     if (
-        original.select(columns).exceptAll(enriched.select(columns)).limit(1).count()
-        or enriched.select(columns).exceptAll(original.select(columns)).limit(1).count()
+        parent_rows.hint("merge")
+        .join(enriched_rows, "flight_id", "full")
+        .filter(~F.col("_parent").eqNullSafe(F.col("_enriched")))
+        .limit(1)
+        .count()
     ):
         raise ValueError("Weather enrichment changed the BTS cohort or predictors.")
 

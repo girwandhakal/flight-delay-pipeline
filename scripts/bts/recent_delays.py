@@ -246,7 +246,28 @@ def add_cutoffs(flights: DataFrame, airports: dict[str, list[dict[str, Any]]]) -
         return instant.isoformat() + "Z" if instant else None
 
     convert = F.udf(cutoff, "string")
-    return flights.withColumn("_cutoff", F.to_timestamp(convert("FlightDate", "CRSDepTime", "Origin")))
+    # Deduplicate schedule keys before Python UDF serialization, preserving null-safe matches.
+    keys = (
+        flights.select("FlightDate", "CRSDepTime", "Origin")
+        .distinct()
+        .withColumn("_cutoff", F.to_timestamp(convert("FlightDate", "CRSDepTime", "Origin")))
+        .select(
+            F.col("FlightDate").alias("_k_date"),
+            F.col("CRSDepTime").alias("_k_clock"),
+            F.col("Origin").alias("_k_origin"),
+            "_cutoff",
+        )
+    )
+    return (
+        flights.join(
+            keys,
+            flights.FlightDate.eqNullSafe(keys._k_date)
+            & flights.CRSDepTime.eqNullSafe(keys._k_clock)
+            & flights.Origin.eqNullSafe(keys._k_origin),
+            "left",
+        )
+        .drop("_k_date", "_k_clock", "_k_origin")
+    )
 
 
 def add_recent_delays(flights: DataFrame, events: DataFrame, window_minutes: int = 120) -> DataFrame:

@@ -123,7 +123,20 @@ def build_rotation_gold(
             identity = [*IDENTITY, "split"]
             before = parent.where("split != 'train'").select(*identity)
             after = splits.where("split != 'train'").select(*identity)
-            if before.exceptAll(after).limit(1).count() or after.exceptAll(before).limit(1).count():
+            after_stats = after.agg(
+                F.count("*").alias("rows"), F.countDistinct("flight_id").alias("ids")
+            ).first()
+            if after_stats.rows != after_stats.ids:
+                raise ValueError("Rotation changed validation or test flight identity.")
+            before_rows = before.select("flight_id", F.struct(*identity).alias("_before"))
+            after_rows = after.select("flight_id", F.struct(*identity).alias("_after"))
+            if (
+                before_rows.hint("merge")
+                .join(after_rows, "flight_id", "full")
+                .filter(~F.col("_before").eqNullSafe(F.col("_after")))
+                .limit(1)
+                .count()
+            ):
                 raise ValueError("Rotation changed validation or test flight identity.")
             recovery_coverage = {}
             for split, status in (("train", "eligible"), ("val", "scoring"), ("test", "scoring")):
@@ -174,15 +187,26 @@ def prepare_rotation(
 
     def build(directory):
         airports = load_airports(references)
-        development_raw = spark.read.option("header", True).csv([str(path) for path in development])
-        extended_raw = spark.read.option("header", True).csv([str(path) for path in extended])
-        weather = spark.read.parquet(*(str(parent / split) for split in SPLITS)).select(*projection)
-        report = build_rotation_gold(
-            weather, build_operations(development_raw, airports), build_operations(extended_raw, airports),
-            directory, first_reliable_date, validation_bound,
+        development_names = sorted({path.name for path in development})
+        # Read all 13 extended CSVs once and isolate the 11-month development subset by filename.
+        extended_tagged = (
+            spark.read.option("header", True)
+            .csv([str(path) for path in extended])
+            .withColumn("_source_name", F.element_at(F.split(F.input_file_name(), "/"), -1))
+            .persist(StorageLevel.DISK_ONLY)
         )
-        write_json(directory / "coverage.json", report)
-        return {"destination": str(parent)}
+        try:
+            development_raw = extended_tagged.filter(F.col("_source_name").isin(development_names)).drop("_source_name")
+            extended_raw = extended_tagged.drop("_source_name")
+            weather = spark.read.parquet(*(str(parent / split) for split in SPLITS)).select(*projection)
+            report = build_rotation_gold(
+                weather, build_operations(development_raw, airports), build_operations(extended_raw, airports),
+                directory, first_reliable_date, validation_bound,
+            )
+            write_json(directory / "coverage.json", report)
+            return {"destination": str(parent)}
+        finally:
+            extended_tagged.unpersist(blocking=True)
 
     partitions = (*(f"gold/{split}" for split in SPLITS), "rotation_links")
     with stage("Resolve or build rotation Gold"):

@@ -73,10 +73,26 @@ def attach_schedule(parent: DataFrame, schedule: DataFrame, airports: dict) -> D
     keys = parent.select("flight_id", "FlightDate", "Origin", "Dest", "CRSElapsedTime").join(
         schedule.select("flight_id", "CRSDepTime", "CRSArrTime"), "flight_id", "left"
     )
-    return keys.withColumn("clock", clock(F.struct(*fields))).select("flight_id", "clock.*").select(
-        "flight_id", "lat1", "lon1", "lat2", "lon2", "conus",
-        F.to_timestamp("dep").cast("long").alias("cutoff"),
-        F.to_timestamp("arr").cast("long").alias("arrival"), "station",
+    # Deduplicate schedule tuples before Python airport/clock resolution.
+    unique_schedules = (
+        keys.select(*fields)
+        .distinct()
+        .withColumn("clock", clock(F.struct(*fields)))
+        .select(
+            *[F.col(name).alias(f"_k_{name}") for name in fields],
+            "clock.*",
+        )
+    )
+    join_cond = keys[fields[0]].eqNullSafe(unique_schedules[f"_k_{fields[0]}"])
+    for name in fields[1:]:
+        join_cond = join_cond & keys[name].eqNullSafe(unique_schedules[f"_k_{name}"])
+    return (
+        keys.join(unique_schedules, join_cond, "left")
+        .select(
+            "flight_id", "lat1", "lon1", "lat2", "lon2", "conus",
+            F.to_timestamp("dep").cast("long").alias("cutoff"),
+            F.to_timestamp("arr").cast("long").alias("arrival"), "station",
+        )
     )
 
 

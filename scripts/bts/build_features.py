@@ -208,7 +208,22 @@ def build_features(
             feature_df = feature_df.persist(StorageLevel.DISK_ONLY)
 
             actual = feature_df.select(*identity)
-            if expected.exceptAll(actual).limit(1).count() or actual.exceptAll(expected).limit(1).count():
+            for frame in (expected, actual):
+                id_stats = frame.agg(
+                    F.count("*").alias("rows"),
+                    F.countDistinct("flight_id").alias("ids"),
+                ).first()
+                if id_stats.rows != id_stats.ids:
+                    raise ValueError("BTS enrichment changed flight identity, label or split.")
+            expected_rows = expected.select("flight_id", F.struct(*identity).alias("_expected"))
+            actual_rows = actual.select("flight_id", F.struct(*identity).alias("_actual"))
+            if (
+                expected_rows.hint("merge")
+                .join(actual_rows, "flight_id", "full")
+                .filter(~F.col("_expected").eqNullSafe(F.col("_actual")))
+                .limit(1)
+                .count()
+            ):
                 raise ValueError("BTS enrichment changed flight identity, label or split.")
         coverage = [
             row.asDict() for row in feature_df.groupBy(
@@ -233,6 +248,19 @@ def build_features(
         (gold_dir / "_features.json").unlink(missing_ok=True)
         summary_records = []
         with stage("Write BTS Gold train/val/test Parquet splits"):
+            # Compute all three split summaries in a single groupBy pass over feature_df.
+            aggregates = [
+                F.count("*").alias("total_flights"),
+                F.min("FlightDate").alias("min_date"),
+                F.max("FlightDate").alias("max_date"),
+            ]
+            if publish_results:
+                aggregates.append(F.count(F.when(F.col("ArrDel15") == 1, 1)).alias("delayed_flights"))
+            stats_by_split = {
+                row["split"]: row
+                for row in feature_df.groupBy("split").agg(*aggregates).collect()
+            }
+
             # Save partitioned Parquet datasets directly for each chronological split
             for split_name in ["train", "val", "test"]:
                 split_df = feature_df.filter(F.col("split") == split_name)
@@ -240,25 +268,16 @@ def build_features(
                 dest_split_dir.mkdir(parents=True, exist_ok=True)
                 split_df.drop("_snapshot", "_block_reason", "_block_samples").write.mode("overwrite").parquet(str(dest_split_dir))
 
-                # Calculate split summary in one pass
-                aggregates = [
-                    F.count("*").alias("total_flights"),
-                    F.min("FlightDate").alias("min_date"),
-                    F.max("FlightDate").alias("max_date"),
-                ]
-                if publish_results:
-                    aggregates.append(F.count(F.when(F.col("ArrDel15") == 1, 1)).alias("delayed_flights"))
-
-                stats = split_df.agg(*aggregates).first()
-                total_flights = stats["total_flights"]
+                stats = stats_by_split.get(split_name)
+                total_flights = stats["total_flights"] if stats else 0
                 record = {
                     "split": split_name,
-                    "start_date": str(stats["min_date"]),
-                    "end_date": str(stats["max_date"]),
+                    "start_date": str(stats["min_date"]) if stats else "None",
+                    "end_date": str(stats["max_date"]) if stats else "None",
                     "total_flights": total_flights,
                 }
                 if publish_results:
-                    delayed_flights = stats["delayed_flights"]
+                    delayed_flights = stats["delayed_flights"] if stats else 0
                     record.update({
                         "on_time_flights": total_flights - delayed_flights,
                         "delayed_flights": delayed_flights,

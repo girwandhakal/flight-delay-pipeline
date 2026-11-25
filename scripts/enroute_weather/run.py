@@ -26,8 +26,16 @@ def validate_cohort(original, enriched, *, context):
         stats = frame.agg(F.count("*").alias("rows"), F.countDistinct("flight_id").alias("ids")).first()
         if not stats.rows or stats.rows != stats.ids:
             raise ValueError(f"{context} requires nonempty cohorts with nonnull, unique flight IDs.")
-    original, enriched = original.select(*IDENTITY), enriched.select(*IDENTITY)
-    if original.exceptAll(enriched).limit(1).count() or enriched.exceptAll(original).limit(1).count():
+    # Unique IDs allow a single-pass merge-join instead of two full-table exceptAll shuffles.
+    before_rows = original.select("flight_id", F.struct(*IDENTITY).alias("_before"))
+    after_rows = enriched.select("flight_id", F.struct(*IDENTITY).alias("_after"))
+    if (
+        before_rows.hint("merge")
+        .join(after_rows, "flight_id", "full")
+        .filter(~F.col("_before").eqNullSafe(F.col("_after")))
+        .limit(1)
+        .count()
+    ):
         raise ValueError(f"{context} enrichment changed the cohort.")
 
 

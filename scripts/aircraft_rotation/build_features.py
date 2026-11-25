@@ -65,7 +65,21 @@ def build_operations(raw: DataFrame, airports: list[dict[str, str]]) -> DataFram
         lambda row: operation_clocks(row, airports),
         "scheduled string, scheduled_arrival string, arrival string, departure string",
     )
-    return operations.withColumn("clocks", clocks(F.struct(*EVENT_COLUMNS, "CRSArrTime", "Cancelled"))).select(
+    clock_fields = [*EVENT_COLUMNS, "CRSArrTime", "Cancelled"]
+    # Deduplicate clock-input tuples before Python UDF evaluation, preserving null-safe joins.
+    unique_clocks = (
+        operations.select(*clock_fields)
+        .distinct()
+        .withColumn("clocks", clocks(F.struct(*clock_fields)))
+        .select(
+            *[F.col(name).alias(f"_k_{name}") for name in clock_fields],
+            "clocks",
+        )
+    )
+    join_cond = operations[clock_fields[0]].eqNullSafe(unique_clocks[f"_k_{clock_fields[0]}"])
+    for name in clock_fields[1:]:
+        join_cond = join_cond & operations[name].eqNullSafe(unique_clocks[f"_k_{name}"])
+    return operations.join(unique_clocks, join_cond, "left").select(
         "flight_id", "FlightDate", "tail", "Dest",
         F.to_timestamp("clocks.scheduled").alias("scheduled_utc"),
         F.to_timestamp("clocks.scheduled_arrival").alias("scheduled_arrival_utc"),

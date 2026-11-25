@@ -94,12 +94,33 @@ def build_destination_cutoffs(
         resolve,
         "destination_station_id string, destination_time_zone string, destination_mapping_method string",
     )
-    scheduled_utc_formatted = F.date_format("scheduled_departure_utc", "yyyy-MM-dd'T'HH:mm:ss")
-    return (
-        flights.withColumn(
-            "_destination_mapping", lookup("Dest", scheduled_utc_formatted)
+    with_str = flights.withColumn(
+        "_scheduled_utc_str", F.date_format("scheduled_departure_utc", "yyyy-MM-dd'T'HH:mm:ss")
+    )
+    # Deduplicate (Dest, scheduled_departure_utc) keys before Python timezone/station lookup.
+    dest_keys = (
+        with_str.select("Dest", "_scheduled_utc_str")
+        .distinct()
+        .withColumn("_destination_mapping", lookup("Dest", "_scheduled_utc_str"))
+        .select(
+            F.col("Dest").alias("_k_dest"),
+            F.col("_scheduled_utc_str").alias("_k_utc"),
+            "_destination_mapping.*",
         )
-        .select(*flights.columns, "_destination_mapping.*")
+    )
+    return (
+        with_str.join(
+            dest_keys,
+            with_str.Dest.eqNullSafe(dest_keys._k_dest)
+            & with_str._scheduled_utc_str.eqNullSafe(dest_keys._k_utc),
+            "left",
+        )
+        .select(
+            *flights.columns,
+            "destination_station_id",
+            "destination_time_zone",
+            "destination_mapping_method",
+        )
     )
 
 
