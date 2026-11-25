@@ -110,7 +110,7 @@ def test_main_publishes_validation(tmp_path, monkeypatch):
     trainer.assert_called_once()
     assert spark.stop.call_count == 2
 
-    # Publication failure must preserve existing results.json and remove the _SUCCESS marker.
+    # Publication failure must delete the aborted run directory while preserving existing results and prior run.
     bts_run.side_effect = None
     monkeypatch.setattr(
         pipeline.PipelineContext,
@@ -129,8 +129,81 @@ def test_main_publishes_validation(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="publication failed"):
         pipeline.main()
     assert current.read_bytes() == saved
+    assert not (tmp_path / run.RUNS_DIR / "test_run_002").exists()
+    assert list((tmp_path / run.RUNS_DIR).iterdir()) == [report.parent]
     assert list((tmp_path / run.RUNS_DIR).glob("*/_SUCCESS")) == [report.parent / "_SUCCESS"]
     assert spark.stop.call_count == 3
+
+
+@pytest.mark.unit
+def test_model_retention_rollback_and_legacy_cleanup(tmp_path, monkeypatch):
+    config = {"splits": SPLITS}
+    spark = Mock()
+
+    def build_fake_gold(directory):
+        for split in SPLITS:
+            partition = directory / split
+            partition.mkdir()
+            (partition / "_SUCCESS").touch()
+            (partition / "part.parquet").write_bytes(b"fixture")
+        return {}
+
+    enroute_gold = resolve_stage(tmp_path / run.GOLD_DIR, lambda: {}, tuple(SPLITS), (), build_fake_gold)
+
+    def fit(_spark, _gold, output, _splits):
+        model = output / "model"
+        model.mkdir()
+        (model / "metadata").write_text("fixture")
+        (output / "threshold.json").write_text('{"threshold": 0.25}')
+        selected = {
+            "best_threshold": 0.25,
+            "validation_metrics_at_selected_threshold": {"f1": 0.54},
+            "validation_metrics_at_default_0_5": {"f1": 0.44},
+        }
+        return {
+            "selected_model": selected,
+            "input_columns": [],
+            "block_time": {},
+            "algorithm_comparison": {"logistic_regression": {**selected, "models_dir": str(output)}},
+        }
+
+    models_root = tmp_path / "models"
+    models_root.mkdir(parents=True, exist_ok=True)
+    (models_root / ".gitkeep").write_text("")
+    (models_root / "custom_keep").mkdir()
+    for name in run.LEGACY_MODEL_DIRS:
+        legacy = models_root / name / "old_run"
+        legacy.mkdir(parents=True)
+        (legacy / "weights.bin").write_bytes(b"legacy")
+
+    # Refuse legacy cleanup before any active completed flight_delay run exists.
+    with pytest.raises(ValueError, match="active flight_delay run"):
+        run.prune_legacy_models(tmp_path, require_active_run=True)
+    for name in run.LEGACY_MODEL_DIRS:
+        assert (models_root / name).is_dir()
+
+    # Roll back partial run_dir when training fails mid-run.
+    monkeypatch.setattr(train, "train", Mock(side_effect=RuntimeError("fit failed")))
+    with pytest.raises(RuntimeError, match="fit failed"):
+        run.train_and_publish(spark, tmp_path, "run_fail", enroute_gold, SPLITS, {}, SOURCES)
+    assert not (tmp_path / run.RUNS_DIR / "run_fail").exists()
+    assert (models_root / "dw").is_dir()
+
+    # First successful run removes legacy dirs and keeps only run_001.
+    monkeypatch.setattr(train, "train", Mock(side_effect=fit))
+    run.train_and_publish(spark, tmp_path, "run_001", enroute_gold, SPLITS, {}, SOURCES)
+    assert [p.name for p in (tmp_path / run.RUNS_DIR).iterdir()] == ["run_001"]
+    assert (models_root / ".gitkeep").is_file()
+    assert (models_root / "custom_keep").is_dir()
+    for name in run.LEGACY_MODEL_DIRS:
+        assert not (models_root / name).exists()
+
+    # Second successful run replaces run_001 with run_002, leaving strictly one subfolder.
+    run.train_and_publish(spark, tmp_path, "run_002", enroute_gold, SPLITS, {}, SOURCES)
+    assert [p.name for p in (tmp_path / run.RUNS_DIR).iterdir()] == ["run_002"]
+    assert json.loads((tmp_path / "results/results.json").read_text())[run.RESULT_KEY]["run_id"] == "run_002"
+    with pytest.raises(ValueError):
+        run.prune_model_runs(tmp_path, "../escape")
 
 
 def test_full_feature_fit_and_frozen_test_score(spark, tmp_path, monkeypatch, full_feature_rows):

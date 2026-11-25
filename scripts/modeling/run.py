@@ -1,6 +1,9 @@
 """Publish a completed training run, validation report, and human-readable summary."""
 
+import json
 from pathlib import Path
+import re
+import shutil
 from typing import Any
 
 from scripts.common.config import project_path
@@ -15,6 +18,94 @@ from . import train
 RESULT_KEY = "flight_delay"
 RUNS_DIR = Path("models") / RESULT_KEY
 GOLD_DIR = Path("data/gold/enroute")
+LEGACY_MODEL_DIRS = (
+    "bts",
+    "class_weight_comparison",
+    "destination_weather_comparison",
+    "dw",
+    "enroute",
+    "origin_weather_comparison",
+    "tier5_tree_comparison",
+)
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Return total regular-file bytes under a directory without following symlinks."""
+    total = 0
+    for item in path.rglob("*"):
+        if not item.is_symlink() and item.is_file():
+            try:
+                total += item.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _safe_prune_entry(candidate: Path, expected_parent: Path) -> int:
+    """Validate containment, refuse symlinks, and remove an obsolete model entry."""
+    if candidate.is_symlink():
+        raise ValueError(f"Refusing symlinked model path: {candidate}")
+    resolved_parent = expected_parent.resolve()
+    resolved_candidate = candidate.resolve()
+    if resolved_candidate.parent != resolved_parent or not resolved_candidate.is_relative_to(resolved_parent):
+        raise ValueError(f"Refusing path outside {expected_parent}: {candidate}")
+    if candidate.is_dir():
+        freed = _dir_size_bytes(candidate)
+        shutil.rmtree(candidate)
+        return freed
+    freed = candidate.stat().st_size
+    candidate.unlink()
+    return freed
+
+
+def prune_model_runs(root: Path, keep_run_id: str) -> list[Path]:
+    """Delete all superseded or incomplete runs under models/flight_delay except keep_run_id."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", keep_run_id):
+        raise ValueError("Use the saved directory name as keep_run_id.")
+    runs_root = project_path(root, RUNS_DIR)
+    if not runs_root.exists():
+        return []
+    removed: list[Path] = []
+    for candidate in sorted(runs_root.iterdir()):
+        if candidate.name == keep_run_id:
+            continue
+        _safe_prune_entry(candidate, runs_root)
+        removed.append(candidate)
+    return removed
+
+
+def prune_legacy_models(root: Path, *, require_active_run: bool = True) -> list[Path]:
+    """Remove allowlisted pre-refactor directories under models/ once an active run exists."""
+    models_root = project_path(root, "models")
+    if not models_root.exists():
+        return []
+    if require_active_run:
+        results_path = project_path(root, "results/results.json")
+        if not results_path.is_file():
+            raise ValueError("Legacy model cleanup requires results/results.json with an active flight_delay run.")
+        current = json.loads(results_path.read_text(encoding="utf-8")).get(RESULT_KEY, {})
+        active_run_id = current.get("run_id") if isinstance(current, dict) else None
+        if not isinstance(active_run_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", active_run_id):
+            raise ValueError("Legacy model cleanup requires a valid active flight_delay run_id.")
+        if not (project_path(root, RUNS_DIR / active_run_id) / "_SUCCESS").is_file():
+            raise ValueError(f"Legacy model cleanup requires completed run {active_run_id}.")
+
+    removed: list[Path] = []
+    for name in LEGACY_MODEL_DIRS:
+        candidate = models_root / name
+        if candidate.exists() or candidate.is_symlink():
+            _safe_prune_entry(candidate, models_root)
+            removed.append(candidate)
+    return removed
+
+
+def _entry_size_bytes(path: Path) -> int:
+    """Return total regular-file bytes for a file or directory without following symlinks."""
+    if path.is_symlink():
+        return 0
+    if not path.is_dir():
+        return path.stat().st_size
+    return _dir_size_bytes(path)
 
 
 def gold_identity(gold: Path, splits: tuple[str, ...]) -> dict:
@@ -100,57 +191,57 @@ def train_and_publish(
     """Train once, save artifacts and manifests, and publish validation results."""
     run_dir = project_path(root, RUNS_DIR / run_id)
     run_dir.mkdir(parents=True, exist_ok=False)
-    gold = gold.resolve()
-    if gold.parent != project_path(root, GOLD_DIR):
-        raise ValueError("Training Gold must be under the en-route Gold directory.")
-
-    partition_names = ("train", "val", "test")
-    identity = gold_identity(gold, partition_names)
-    summary = train.train(spark, gold, run_dir, splits)
-
-    variants = {}
-    for name, algorithm in summary["algorithm_comparison"].items():
-        directory = Path(algorithm["models_dir"]).relative_to(run_dir)
-        model = (directory / "model").as_posix()
-        threshold = (directory / "threshold.json").as_posix()
-        variants[name] = {
-            "model": model,
-            "threshold_file": threshold,
-            "threshold": algorithm["best_threshold"],
-            "sha256": inference_hashes(run_dir, model, threshold),
-        }
-
-    selected = summary["selected_model"]
-    validation = {
-        "selected": {
-            **selected["validation_metrics_at_selected_threshold"],
-            "threshold": selected["best_threshold"],
-        },
-        "common_0_5": selected["validation_metrics_at_default_0_5"],
-    }
-    report = run_dir / "validation.json"
-    write_json(report, {
-        "run_id": run_id,
-        "validation": validation,
-        "coverage": coverage,
-        "algorithm_comparison": summary["algorithm_comparison"],
-        "block_time": summary["block_time"],
-        "scope": "Thresholds were selected on this validation cohort.",
-    })
-    manifest = run_dir / "run.json"
-    write_json(manifest, {
-        "run_id": run_id,
-        "splits": splits,
-        "gold": gold.relative_to(root.resolve()).as_posix(),
-        "gold_identity": identity,
-        "input_columns": summary["input_columns"],
-        "sources": sources,
-        "variants": variants,
-    })
-
     marker = run_dir / "_SUCCESS"
-    marker.touch(exist_ok=False)
     try:
+        gold = gold.resolve()
+        if gold.parent != project_path(root, GOLD_DIR):
+            raise ValueError("Training Gold must be under the en-route Gold directory.")
+
+        partition_names = ("train", "val", "test")
+        identity = gold_identity(gold, partition_names)
+        summary = train.train(spark, gold, run_dir, splits)
+
+        variants = {}
+        for name, algorithm in summary["algorithm_comparison"].items():
+            directory = Path(algorithm["models_dir"]).relative_to(run_dir)
+            model = (directory / "model").as_posix()
+            threshold = (directory / "threshold.json").as_posix()
+            variants[name] = {
+                "model": model,
+                "threshold_file": threshold,
+                "threshold": algorithm["best_threshold"],
+                "sha256": inference_hashes(run_dir, model, threshold),
+            }
+
+        selected = summary["selected_model"]
+        validation = {
+            "selected": {
+                **selected["validation_metrics_at_selected_threshold"],
+                "threshold": selected["best_threshold"],
+            },
+            "common_0_5": selected["validation_metrics_at_default_0_5"],
+        }
+        report = run_dir / "validation.json"
+        write_json(report, {
+            "run_id": run_id,
+            "validation": validation,
+            "coverage": coverage,
+            "algorithm_comparison": summary["algorithm_comparison"],
+            "block_time": summary["block_time"],
+            "scope": "Thresholds were selected on this validation cohort.",
+        })
+        manifest = run_dir / "run.json"
+        write_json(manifest, {
+            "run_id": run_id,
+            "splits": splits,
+            "gold": gold.relative_to(root.resolve()).as_posix(),
+            "gold_identity": identity,
+            "input_columns": summary["input_columns"],
+            "sources": sources,
+            "variants": variants,
+        })
+
+        marker.touch(exist_ok=False)
         update_results({RESULT_KEY: {
             "run_id": run_id,
             "run_sha256": sha256(manifest),
@@ -159,8 +250,26 @@ def train_and_publish(
             "coverage": coverage,
         }}, root / "results")
     except BaseException:
-        marker.unlink()
+        # Remove aborted run artifacts so only complete runs remain in models/flight_delay/.
+        marker.unlink(missing_ok=True)
+        shutil.rmtree(run_dir, ignore_errors=True)
         raise
+
+    # Measure obsolete bytes before pruning so one concise summary line can report space freed.
+    runs_root = project_path(root, RUNS_DIR)
+    models_root = project_path(root, "models")
+    obsolete_bytes = sum(
+        _entry_size_bytes(path) for path in runs_root.iterdir() if path.name != run_id
+    ) + sum(
+        _entry_size_bytes(models_root / name)
+        for name in LEGACY_MODEL_DIRS
+        if (models_root / name).exists()
+    )
+    removed = [*prune_model_runs(root, run_id), *prune_legacy_models(root, require_active_run=True)]
+    if removed:
+        noun = "directory" if len(removed) == 1 else "directories"
+        size_text = f"{obsolete_bytes / (1024 ** 3):.2f} GB" if obsolete_bytes >= 1024 ** 3 else f"{obsolete_bytes / (1024 ** 2):.1f} MB"
+        print(f"  Pruned {len(removed)} obsolete model {noun} ({size_text} reclaimed).", flush=True)
 
     print(format_classification_report(run_id, summary["algorithm_comparison"], split="VALIDATION"), flush=True)
     return report
