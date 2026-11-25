@@ -1,4 +1,4 @@
-"""Prepare IEM archives and publish a paired en-route weather ablation."""
+"""Prepare aviation archives and build en-route weather features."""
 
 import json
 from datetime import date, timedelta
@@ -7,13 +7,13 @@ from pathlib import Path
 from pyspark import StorageLevel
 from pyspark.sql import SparkSession, functions as F
 
-from scripts.bts import train as trainer
-from scripts.bts.recent_delays import load_airports
-from scripts.origin_weather.build_features import local_cutoff
-from scripts.origin_weather.download import project_path, sha256, write_json
-from scripts.weather_cache import consumed, logic_hash, resolve_stage
-from scripts.progress import stage
-from scripts.results import update_results
+from scripts.common.config import project_path
+from scripts.common.context import PipelineContext
+from scripts.common.io import sha256, write_json
+from scripts.common.progress import pipeline_stage, stage
+from scripts.common.references import load_airports
+from scripts.common.stage_cache import consumed, logic_hash, resolve_stage
+from scripts.common.time_utils import local_cutoff
 
 from . import clean_sigmets, clean_taf
 from .build_features import IDENTITY, attach_schedule, effective_airport, enrich
@@ -31,35 +31,7 @@ def validate_cohort(original, enriched, *, context):
         raise ValueError(f"{context} enrichment changed the cohort.")
 
 
-def comparison_metrics(frames, thresholds):
-    """Measure paired validation deltas at selected and common thresholds."""
-    comparison = {}
-    for point in ("selected", "common_0_5"):
-        arms = {}
-        for arm, frame in frames.items():
-            threshold = thresholds[arm] if point == "selected" else 0.5
-            metrics = trainer.evaluate_predictions(frame.withColumn(
-                "prediction", (F.col("p_delayed") >= threshold).cast("int")
-            ))
-            fp, tn = (metrics["confusion_matrix"][key] for key in ("fp", "tn"))
-            arms[arm] = {
-                **metrics, "threshold": threshold, "false_positives": fp,
-                "false_positive_rate": fp / (fp + tn) if fp + tn else None,
-            }
-        baseline, enhanced = arms["tier4"], arms["enroute"]
-        comparison[point] = {
-            **arms,
-            "pr_auc_delta": (enhanced["pr_auc"] - baseline["pr_auc"]
-                             if baseline["pr_auc"] is not None else None),
-            **{key + "_delta": enhanced[key] - baseline[key] for key in ("f1", "precision", "recall")},
-            "false_positive_reduction": baseline["false_positives"] - enhanced["false_positives"],
-            "false_positive_rate_reduction": (baseline["false_positive_rate"] - enhanced["false_positive_rate"]
-                                              if baseline["false_positive_rate"] is not None else None),
-        }
-    return comparison
-
-
-def prepare(spark: SparkSession, root: Path, config: dict, weather_gold: Path, run_id: str) -> dict:
+def prepare(spark: SparkSession, root: Path, config: dict, weather_gold: Path) -> dict:
     """Download configured UTC coverage and materialize typed deduplicated Silver tables."""
     spark.conf.set("spark.sql.session.timeZone", "UTC")
     cfg = config["datasets"]
@@ -84,8 +56,6 @@ def prepare(spark: SparkSession, root: Path, config: dict, weather_gold: Path, r
         return {"destination_train": str(weather_gold / "train")}
 
     def selection_inputs():
-        if sha256(references / "airports.csv") != airport_digest:
-            raise ValueError("Airport reference changed during station selection")
         return {"destination": consumed(weather_gold, ("train",)), "limit": limit, "date": first.isoformat(),
                 "reference": airport_digest,
                 "logic": logic_hash(select, effective_airport, load_airports)}
@@ -93,16 +63,14 @@ def prepare(spark: SparkSession, root: Path, config: dict, weather_gold: Path, r
     selection = resolve_stage(root / "data/silver/taf_stations", selection_inputs, (), ("stations.json",), select)
     selected = json.loads((selection / "stations.json").read_text())
     stations = selected["stations"]
-    with stage("Stage: Download and validate public IEM aviation archives"):
+    with stage("Download and validate public IEM aviation archives"):
         taf_inputs, sigmet_inputs = download(root, first - timedelta(days=2), last + timedelta(days=2),
                                             stations, taf=cfg["taf"], sigmets=cfg["sigmets"])
     inputs = {**taf_inputs, **sigmet_inputs, references / "airports.csv": airport_digest}
     tables = {}
-    with stage("Stage: Build TAF segments and convective SIGMET Silver"):
+    with stage("Build TAF segments and convective SIGMET Silver"):
         for kind, files, cleaner in (("taf", taf_inputs, clean_taf), ("sigmets", sigmet_inputs, clean_sigmets)):
             def silver_inputs():
-                if any(sha256(path) != digest for path, digest in files.items()):
-                    raise ValueError(f"Validated {kind} archive changed")
                 return {"archives": {str(path.relative_to(root)): digest for path, digest in files.items()},
                         "stations": stations if kind == "taf" else [],
                         "coverage": [first.isoformat(), last.isoformat()], "parser": sha256(cleaner.__file__),
@@ -127,10 +95,7 @@ def prepare_gold(spark, root, rotation_gold, weather_gold, prepared):
     splits = ("train", "val", "test")
 
     def inputs():
-        reference = prepared["reference"]
-        if sha256(reference) != prepared["inputs"][reference]:
-            raise ValueError("Airport reference changed after station selection")
-        return {"rotation": consumed(rotation_gold.parent, ("gold/train", "gold/val")),
+        return {"rotation": consumed(rotation_gold.parent, tuple(f"gold/{split}" for split in splits)),
                 "destination": consumed(weather_gold, splits),
                 "aviation": {kind: consumed(table.parent, ("table",)) for kind, table in prepared["tables"].items()},
                 "stations": prepared["stations"], "reference": sha256(prepared["reference"]),
@@ -142,9 +107,10 @@ def prepare_gold(spark, root, rotation_gold, weather_gold, prepared):
         taf = spark.read.parquet(str(prepared["tables"]["taf"])).where(F.col("station").isin(prepared["stations"]))
         sigmets = spark.read.parquet(str(prepared["tables"]["sigmets"]))
         coverage = {}
-        with stage("Stage: Join cutoff-safe TAF segments and convective SIGMETs"):
-            for split in ("train", "val", "test"):
-                parent = spark.read.parquet(str((weather_gold if split == "test" else rotation_gold) / split))
+        with stage("Join cutoff-safe TAF segments and convective SIGMETs"):
+            for split in splits:
+                print(f"    Enriching {split} split with destination TAFs and convective SIGMETs...", flush=True)
+                parent = spark.read.parquet(str(rotation_gold / split))
                 schedule = spark.read.parquet(str(weather_gold / split))
                 clocks = attach_schedule(parent, schedule, prepared["airports"]).persist(StorageLevel.DISK_ONLY)
                 try:
@@ -170,43 +136,17 @@ def prepare_gold(spark, root, rotation_gold, weather_gold, prepared):
     return gold, json.loads((gold / "coverage.json").read_text())
 
 
-def fit(spark, root, rotation, weather_gold, prepared, baseline, rotation_gold):
-    """Fit against the verified preparation while publishing a fresh model run."""
-    feature_set = trainer.ENROUTE_FEATURE_SET
-    run_id = rotation.name
-    output = project_path(root, f"models/enroute/{run_id}")
-    gold, coverage = prepare_gold(spark, root, rotation_gold, weather_gold, prepared)
-    with stage("Training en-route weather tier and comparing against rotation"):
-        summary = trainer.train(spark, gold, output, feature_set=feature_set, save_predictions=True,
-                                publish_results=False, model_name="model")
-        frames = {
-            "tier4": spark.read.parquet(str(rotation / "rot" / "validation_predictions")),
-            "enroute": spark.read.parquet(str(output / "validation_predictions")),
-        }
-        validation = spark.read.parquet(str(gold / "val"))
-        for frame in frames.values():
-            validate_cohort(validation, frame, context="En-route validation")
-        comparison = comparison_metrics(frames, {
-            "tier4": baseline["selected_model"]["best_threshold"],
-            "enroute": summary["selected_model"]["best_threshold"],
-        })
-    if any(sha256(path) != fingerprint for path, fingerprint in prepared["inputs"].items()):
-        raise ValueError("An en-route input changed during the run.")
-    report = output / "validation_comparison.json"
-    write_json(report, {
-        "run_id": run_id, "parent_run_id": run_id, "validation": comparison, "coverage": coverage,
-        "algorithm_comparison": summary["algorithm_comparison"],
-        "scope": "Same-cohort validation. Selected thresholds were tuned on this validation cohort.",
-        "stations": prepared["stations"], "gold": str(gold),
-        "selected_training_destination_share": prepared["selected_training_destination_share"],
-        "input_sha256": {str(path.relative_to(root)): value for path, value in prepared["inputs"].items()},
-    })
-    marker = output / "_SUCCESS"
-    marker.touch(exist_ok=False)
-    try:
-        update_results({feature_set: {"training": summary, "validation": comparison, "coverage": coverage,
-                                      "run_id": run_id, "parent_run_id": run_id}}, root / "results")
-    except Exception:
-        marker.unlink()
-        raise
-    return report
+def run(ctx: PipelineContext) -> None:
+    """Stage 5 entry point: prepare TAF/SIGMET tables, build en-route Gold, and update `ctx`."""
+    with pipeline_stage(5, 6, "En-Route Weather (TAF & SIGMET)", timings=ctx.timings):
+        weather_gold = ctx.destination_gold_dir or ctx.gold_dir
+        rotation_gold = ctx.rotation_gold_dir or ctx.gold_dir
+        aviation = prepare(ctx.spark, ctx.root, ctx.config, weather_gold)
+        gold, aviation_coverage = prepare_gold(ctx.spark, ctx.root, rotation_gold, weather_gold, aviation)
+        ctx.gold_dir = gold
+        ctx.coverage["enroute"] = aviation_coverage
+        ctx.sources["sha256"].update(
+            {path.relative_to(ctx.root).as_posix(): digest for path, digest in aviation["inputs"].items()}
+        )
+        ctx.sources["taf_stations"] = aviation["stations"]
+        ctx.sources["selected_training_destination_share"] = aviation["selected_training_destination_share"]

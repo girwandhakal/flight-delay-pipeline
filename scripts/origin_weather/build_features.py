@@ -10,8 +10,14 @@ from zoneinfo import ZoneInfo
 from pyspark.sql import DataFrame, SparkSession, Window, functions as F, types as T
 
 from scripts.bts.cache import active
-from scripts.results import records, update_results
-from .download import ROOT, load_config, standard_offset, write_json
+from scripts.common.config import ROOT, load_config
+from scripts.common.io import write_json
+from scripts.common.progress import stage as progress_stage
+from scripts.common.results import records, update_results
+from scripts.common.spark import get_spark_session
+from scripts.common.stage_cache import find_gold, input_identity, save_gold, scoped_manifest
+from scripts.common.time_utils import local_cutoff
+from .download import standard_offset
 from .measurements import NUMERIC_FEATURES, MISSING_FLAGS, INDICATOR_FLAGS, FEATURE_COLUMNS
 
 WEATHER_NUMERIC = [*NUMERIC_FEATURES, "origin_weather_age_minutes"]
@@ -59,35 +65,6 @@ def load_references(
         )):
             raise ValueError("Station mapping lacks a valid airport interval.")
     return airports, mappings
-
-
-def local_cutoff(
-    flight_date: Optional[date],
-    clock: Optional[Union[int, str]],
-    zone: Optional[str],
-) -> tuple[Optional[datetime], str]:
-    """Convert local scheduled departure time to UTC, rejecting DST ambiguity or gaps."""
-    if flight_date is None or clock is None or not zone:
-        return None, "invalid_cutoff"
-    spelling = str(clock).strip()
-    if not spelling.isdigit() or len(spelling) > 4:
-        return None, "invalid_cutoff"
-    hours, minutes = divmod(int(spelling), 100)
-    if not (0 <= hours < 24 and 0 <= minutes < 60) and (hours, minutes) != (24, 0):
-        return None, "invalid_cutoff"
-    local = datetime.combine(flight_date, datetime.min.time()) + timedelta(
-        hours=hours, minutes=minutes
-    )
-    zone_info = ZoneInfo(zone)
-    candidates = set()
-    for fold in (0, 1):
-        utc = local.replace(tzinfo=zone_info, fold=fold).astimezone(timezone.utc)
-        if utc.astimezone(zone_info).replace(tzinfo=None) == local:
-            candidates.add(utc)
-    # A DST gap or repeated clock has no uniquely defensible departure instant.
-    if len(candidates) != 1:
-        return None, "invalid_cutoff"
-    return candidates.pop().replace(tzinfo=None), "valid"
 
 
 def build_flight_cutoffs(
@@ -215,10 +192,9 @@ def build_origin_features(
     observations: DataFrame,
     manifest: dict[str, Any],
     max_age_minutes: int = 120,
-    publication_lag_minutes: int = 0,
 ) -> DataFrame:
     """Enrich flight cutoffs with origin weather observations matching the configured time policy."""
-    return build_weather_features(cutoffs, observations, manifest, max_age_minutes, publication_lag_minutes)
+    return build_weather_features(cutoffs, observations, manifest, max_age_minutes)
 
 
 def build_weather_features(
@@ -226,15 +202,14 @@ def build_weather_features(
     observations: DataFrame,
     manifest: dict[str, Any],
     max_age_minutes: int = 120,
-    publication_lag_minutes: int = 0,
     prefix: str = "origin",
 ) -> DataFrame:
-    """Match the latest eligible weather observation within policy age/lag to each flight."""
+    """Match the latest eligible weather observation within the maximum age to each flight."""
     validate_prefix(prefix)
     observation = "observation_utc" if prefix == "origin" else "destination_observation_utc"
     source = "source_file" if prefix == "origin" else "destination_source_file"
-    if not 0 <= publication_lag_minutes <= max_age_minutes or max_age_minutes <= 0:
-        raise ValueError("Invalid weather age/lag.")
+    if max_age_minutes <= 0:
+        raise ValueError("Invalid maximum weather age.")
     missing = set(FEATURE_COLUMNS) - set(observations.columns)
     if missing:
         raise ValueError("Weather features are outdated; rebuild origin-weather Silver with all 11 fields.")
@@ -256,13 +231,7 @@ def build_weather_features(
                     )
                     / 3600
                 ).cast("long"),
-                F.floor(
-                    (
-                        F.col("scheduled_departure_utc").cast("long")
-                        - publication_lag_minutes * 60
-                    )
-                    / 3600
-                ).cast("long"),
+                F.floor(F.col("scheduled_departure_utc").cast("long") / 3600).cast("long"),
             )
         ),
     ).alias("flights")
@@ -277,7 +246,6 @@ def build_weather_features(
         & (
             F.col("weather.observation_utc")
             <= F.col("flights.scheduled_departure_utc")
-            - F.expr(f"INTERVAL {publication_lag_minutes} MINUTES")
         )
     )
     # Keep cohort-scale matches partitioned rather than broadcasting them on the driver.
@@ -326,8 +294,7 @@ def build_weather_features(
         )
         .withColumn(
             f"{prefix}_available_utc",
-            F.col(observation)
-            + F.expr(f"INTERVAL {publication_lag_minutes} MINUTES"),
+            F.col(observation),
         )
         .withColumn(
             f"{prefix}_weather_missing", F.col(observation).isNull().cast("int")
@@ -377,7 +344,6 @@ def validate_cohort(
     original: DataFrame,
     enriched: DataFrame,
     max_age_minutes: int = 120,
-    publication_lag_minutes: int = 0,
 ) -> None:
     """Verify that weather enrichment preserved flight identities, count, and predictor values."""
     for frame in (original, enriched):
@@ -406,29 +372,32 @@ def validate_cohort(
     if (
         enriched.filter(
             (F.col("origin_weather_age_minutes") > max_age_minutes)
-            | (F.col("origin_weather_age_minutes") < publication_lag_minutes)
+            | (F.col("origin_weather_age_minutes") < 0)
         )
         .limit(1)
         .count()
     ):
-        raise ValueError("Selected weather violates age/lag bounds.")
+        raise ValueError("Selected weather violates age bounds.")
 
 
-def main(publish_results: bool = True) -> tuple[Path, Path]:
+def main(
+    publish_results: bool = True,
+    spark: Optional[SparkSession] = None,
+    bts_files: Optional[dict[str, Any]] = None,
+) -> tuple[Path, Path]:
     """Execute end-to-end origin weather enrichment pipeline on BTS Gold cohorts."""
-    from scripts.weather_cache import find_gold, input_identity, save_gold, scoped_manifest
-    from scripts.progress import stage as progress_stage
-    from scripts.bts.build_features import get_spark_session
     from .clean import clean_weather
     from .download import download_weather, prepare_references
 
     settings, policy, config = load_config()
-    cached = find_gold(ROOT, settings, policy, config)
+    cached = find_gold(ROOT, settings, policy, config, bts_files=bts_files)
     if cached is not None:
         if publish_results:
             update_results({"bts_origin_weather": {"data": json.loads((cached / "_metadata.json").read_text())}})
         return cached, cached
-    spark = get_spark_session("origin_weather_features")
+    owns_spark = spark is None
+    if owns_spark:
+        spark = get_spark_session("origin_weather_features")
     try:
         flights = spark.read.parquet(
             *[str(active(ROOT, "gold") / name) for name in config["splits"]]
@@ -447,7 +416,7 @@ def main(publish_results: bool = True) -> tuple[Path, Path]:
             manifest = download_weather(requests, settings["output_directory"])
             scope = sorted({f"{year}/LCD_{station}_{year}.csv" for station, year, _ in requests})
             manifest = scoped_manifest(manifest, scope)
-        cache_inputs = input_identity(ROOT, settings, policy, config, scope=scope)
+        cache_inputs = input_identity(ROOT, settings, policy, config, scope=scope, bts_files=bts_files)
         build_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         gold = ROOT / "data/gold/bts_origin_weather" / build_id
         report = ROOT / "data/silver/weather" / build_id
@@ -495,15 +464,14 @@ def main(publish_results: bool = True) -> tuple[Path, Path]:
                     "bts_input_files": bts_fingerprints(),
                 },
             )
-            if input_identity(ROOT, settings, policy, config, scope=scope) != cache_inputs:
-                raise ValueError("Weather inputs changed while building origin Gold.")
             save_gold(gold, cache_inputs)
             if publish_results:
                 update_results({"bts_origin_weather": {"data": json.loads((gold / "_metadata.json").read_text())}})
         return gold, gold
     finally:
         spark.catalog.clearCache()
-        spark.stop()
+        if owns_spark:
+            spark.stop()
 
 
 if __name__ == "__main__":

@@ -7,8 +7,8 @@ import re
 import subprocess
 from urllib.parse import urlencode
 
-from scripts.origin_weather.download import fetch, sha256, write_json
-from scripts.results import replace_file
+from scripts.common.io import fetch, sha256, write_json
+from scripts.common.results import replace_file
 
 from . import clean_sigmets, clean_taf
 
@@ -51,7 +51,7 @@ def download(root: Path, start, end, stations: list[str], *, taf: dict, sigmets:
     from datetime import timedelta
     from hashlib import sha256 as hash_text
 
-    from scripts.origin_weather.download import project_path
+    from scripts.common.config import project_path
 
     if not stations or any(not re.fullmatch(r"[A-Z][A-Z0-9]{3}", station) for station in stations):
         raise ValueError("TAF requests require safe four-character ICAO station codes.")

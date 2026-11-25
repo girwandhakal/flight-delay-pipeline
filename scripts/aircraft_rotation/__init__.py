@@ -1,1 +1,1 @@
-"""Isolated retrospective aircraft-rotation comparison."""
+"""Prepare aircraft rotation features."""

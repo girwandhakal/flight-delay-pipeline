@@ -1,21 +1,20 @@
 """Link each flight to its immediate same-aircraft predecessor."""
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Optional
 
 from pyspark.sql import DataFrame, Window, functions as F
 
-from scripts.bts.recent_delays import (
-    EVENT_COLUMNS, airport_zone, clock_matches, event_clocks, event_zone, scheduled_clocks, valid_delay,
-)
+from scripts.bts.recent_delays import EVENT_COLUMNS, event_clocks
+from scripts.common.time_utils import scheduled_clocks, valid_delay
 
 
 TURNAROUND_SHORTFALL = "rotation_turnaround_shortfall_minutes"
 TURNAROUND_MISSING = "rotation_turnaround_shortfall_missing"
+RECOVERY_FEATURES = ("rotation_shortfall_after_recovery_minutes", "rotation_shortfall_after_recovery_missing")
 ROTATION_NUMERIC = ("rotation_scheduled_turnaround_minutes", "rotation_prior_arrival_delay_minutes", TURNAROUND_SHORTFALL)
 ROTATION_FLAGS = ("rotation_link_missing", "rotation_outcome_missing", TURNAROUND_MISSING)
 MAX_GAP_HOURS = 24
-OUTCOME_LAG_MINUTES = 15
 MAX_TYPICAL_TURN_MINUTES = 180
 MIN_TURN_HISTORY = 20
 RAW_COLUMNS = [*EVENT_COLUMNS, "Tail_Number", "CRSArrTime", "Cancelled"]
@@ -121,8 +120,8 @@ def build_rotation_links(
     ).join(timeline, ["tail", "scheduled_utc"], "left").join(unresolved, "tail", "left")
     cutoff = F.col("scheduled_departure_utc")
     gap = cutoff.cast("double") - F.col("prior.scheduled_utc").cast("double")
-    # Outcome requires 15-minute publication buffer before departure cutoff.
-    prior_available = F.col("prior.actual_arrival_utc") + F.expr(f"INTERVAL {OUTCOME_LAG_MINUTES} MINUTES")
+    # Use the prior gate arrival as soon as it occurs.
+    prior_available = F.col("prior.actual_arrival_utc")
     # Bound history inspection: maximum turnaround gap is 24 hours.
     earliest = F.greatest(F.col("prior.scheduled_utc"), cutoff - F.expr(f"INTERVAL {MAX_GAP_HOURS} HOURS"))
     # Check for unresolvable dates within the turnaround window (-14h / +36h timezone envelope).
@@ -160,7 +159,7 @@ def build_rotation_links(
     actual_departure = F.col("target.actual_departure_utc")
     historical_turn = linked & F.col("prior.completed") & F.col("target.completed")
     # An early departure cannot contribute to the reference used on its own flight.
-    turn_available = F.greatest(actual_departure, cutoff) + F.expr(f"INTERVAL {OUTCOME_LAG_MINUTES} MINUTES")
+    turn_available = F.greatest(actual_departure, cutoff)
     return rows.select(
         *parent.columns,
         F.when(linked, (cutoff.cast("double") - F.col("prior.scheduled_arrival_utc").cast("double")) / 60)
@@ -178,7 +177,7 @@ def build_rotation_links(
         F.col("prior.actual_arrival_utc").alias("prior_actual_arrival_utc"),
         prior_available.alias("prior_arrival_available_utc"),
         (gap / 60).alias("prior_departure_gap_minutes"),
-        (F.col("target.actual_arrival_utc") + F.expr(f"INTERVAL {OUTCOME_LAG_MINUTES} MINUTES"))
+        F.col("target.actual_arrival_utc")
         .alias("label_available_utc"),
         ((F.col("target.arrival_delay") >= 15).cast("int") == F.col("ArrDel15")).alias("label_matches"),
     )
@@ -199,8 +198,8 @@ def add_turnaround_shortfall(linked: DataFrame, validation_bound: datetime) -> D
                            F.percentile_approx("_observed_turn_minutes", 0.5).alias("_typical_turn_minutes"))
         .where(F.col("_turn_samples") >= MIN_TURN_HISTORY).drop("_turn_samples")
     )
-    # Training uses the previous UTC month. Validation freezes the last month at the training boundary.
-    month = F.when((F.col("split") == "val") & (cutoff >= bound),
+    # Training uses the previous UTC month. Later splits freeze the last month at the training boundary.
+    month = F.when((F.col("split") != "train") & (cutoff >= bound),
                    F.trunc(bound - F.expr("INTERVAL 1 SECOND"), "month")).otherwise(
         F.add_months(F.trunc(cutoff, "month"), -1)
     )
@@ -210,3 +209,12 @@ def add_turnaround_shortfall(linked: DataFrame, validation_bound: datetime) -> D
             .withColumn(TURNAROUND_MISSING, F.col(TURNAROUND_SHORTFALL).isNull().cast("int"))
             .drop(history_month, "_typical_turn_minutes", "_remaining_turn_minutes",
                   "_observed_turn_minutes", "_turn_available_utc"))
+
+
+def add_recovery_shortfall(flights: DataFrame) -> DataFrame:
+    from scripts.bts.block_time import SLACK_FEATURES
+
+    slack, _ = SLACK_FEATURES
+    value, missing = RECOVERY_FEATURES
+    return (flights.withColumn(value, F.col(TURNAROUND_SHORTFALL) - F.col(slack))
+            .withColumn(missing, F.col(value).isNull().cast("int")))

@@ -7,28 +7,15 @@ from typing import Any, Union
 
 from pyspark.sql import DataFrame, SparkSession, Window, functions as F, types as T
 
-from scripts.results import records, update_results
-from .download import (
-    ROOT,
-    REPORTS,
-    load_config,
-    standard_offset,
-    sha256,
-    write_json,
-)
+from scripts.common.config import ROOT, load_config
+from scripts.common.io import file_fingerprints, sha256, write_json
+from scripts.common.results import records, update_results
+from scripts.common.spark import get_spark_session
+from .download import REPORTS, standard_offset
 from .measurements import (
     SOURCE_FIELDS, NUMERIC_FEATURES, MISSING_FLAGS, INDICATOR_FLAGS,
     FEATURE_COLUMNS, UNITS, decode_weather,
 )
-
-
-def file_fingerprints(paths: list[Path]) -> list[dict[str, Any]]:
-    """Capture file sizes and modification timestamps to detect changes without full hashing."""
-    return [
-        {"path": str(path.resolve()), "bytes": path.stat().st_size,
-         "modified_ns": path.stat().st_mtime_ns}
-        for path in sorted(paths)
-    ]
 
 
 def clean_weather(
@@ -82,9 +69,12 @@ def clean_weather(
             continue
         clean = spark.read.parquet(str(candidate.parent), pathGlobFilter="*.parquet")
         write_json(Path(report_dir) / "_metadata.json", metadata)
-        print(f"Reusing cleaned weather Silver from {candidate.parent} because inputs and cleaning code match.", flush=True)
+        print(
+            f"  Reusing cached weather Silver ({candidate.parent.name}) because inputs and cleaning code match.",
+            flush=True,
+        )
         return clean
-    print("Cleaning weather because no complete matching Silver dataset was found.", flush=True)
+    print("  Cleaning raw NOAA weather CSVs (no matching cached Silver found).", flush=True)
     paths = [
         str(
             Path(bronze_dir)
@@ -270,8 +260,6 @@ def clean_weather(
 
 def main() -> int:
     """Clean and validate raw Bronze weather data into Silver observation tables."""
-    from scripts.bts.build_features import get_spark_session
-
     settings, _, _ = load_config()
     manifest = json.loads((settings["output_directory"] / "manifest.json").read_text())
     build_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")

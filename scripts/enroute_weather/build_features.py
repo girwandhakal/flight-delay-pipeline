@@ -4,7 +4,7 @@ from math import acos, atan2, ceil, cos, degrees, hypot, radians, sin
 
 from pyspark.sql import DataFrame, Window, functions as F
 
-from scripts.aircraft_rotation.build_features import scheduled_clocks
+from scripts.common.time_utils import scheduled_clocks
 
 
 TAF_FLAGS = ("dest_taf_is_ifr", "dest_taf_thunderstorm", "dest_taf_freezing_precip", "dest_taf_wind_shear")
