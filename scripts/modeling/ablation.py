@@ -1,18 +1,19 @@
 """Run the controlled feature-set ablation study (RQ2) on the pinned Gold cohort."""
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
-from typing import Any
+import time
+from typing import Any, Optional
 
 from pyspark import StorageLevel
 from pyspark.ml import PipelineModel
-from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
+from pyspark.ml.classification import LogisticRegression
 from pyspark.sql import functions as F
 
 from scripts.common.config import project_path
 from scripts.common.context import PipelineContext
-from scripts.common.io import fs_path
-from scripts.common.progress import DIVIDER, pipeline_stage, stage
+from scripts.common.progress import DIVIDER, stage
 from scripts.common.results import update_results
 from scripts.enroute_weather.build_features import ENROUTE_NUMERIC
 
@@ -20,6 +21,66 @@ from . import train
 
 ABLATION_RESULT_KEY = "ablation"
 GOLD_DIR = Path("data/gold/enroute")
+
+
+def _resolve_gold_dir(ctx: PipelineContext) -> Path:
+    """Resolve the active Gold generation directory containing train, val, and test splits."""
+    candidates: list[Path] = []
+    if ctx.gold_dir is not None:
+        candidates.append(ctx.gold_dir)
+
+    results_path = project_path(ctx.root, "results/results.json")
+    if results_path.is_file():
+        active_run = json.loads(results_path.read_text(encoding="utf-8")).get("flight_delay", {}).get("run_id")
+        if isinstance(active_run, str) and active_run:
+            manifest_path = project_path(ctx.root, f"models/flight_delay/{active_run}/run.json")
+            if manifest_path.is_file():
+                manifest_gold = json.loads(manifest_path.read_text(encoding="utf-8")).get("gold")
+                if isinstance(manifest_gold, str) and manifest_gold:
+                    candidates.append(project_path(ctx.root, manifest_gold))
+
+    gold_root = project_path(ctx.root, GOLD_DIR)
+    if gold_root.exists():
+        completed = sorted(gold_root.glob("*/_SUCCESS"), key=lambda p: p.stat().st_mtime, reverse=True)
+        candidates.extend(marker.parent for marker in completed)
+    candidates.append(gold_root)
+
+    for candidate in candidates:
+        if all((candidate / split).exists() for split in ("train", "val", "test")):
+            return candidate
+    raise FileNotFoundError(
+        f"Missing Gold train/val/test splits under {gold_root}. Run `python pipeline/main.py` first to build Gold data."
+    )
+
+
+def _extract_phase1_full_metrics(root: Path, run_id: str) -> Optional[dict[str, Any]]:
+    """Reuse Phase 1 full-feature metrics for class_weighted_logistic_regression when run_id matches."""
+    results_path = project_path(root, "results/results.json")
+    if not results_path.is_file():
+        return None
+    fd = json.loads(results_path.read_text(encoding="utf-8")).get("flight_delay", {})
+    if fd.get("run_id") != run_id:
+        return None
+
+    training = fd.get("training", {})
+    algo_val = training.get("algorithm_comparison", {}).get(train.WEIGHTED_LOGISTIC)
+    algo_test = fd.get("test", {}).get("models", {}).get(train.WEIGHTED_LOGISTIC)
+    if not isinstance(algo_val, dict) or not isinstance(algo_test, dict):
+        return None
+
+    return {
+        "vector_dimension": training.get("vector_dimension"),
+        "algorithms": {
+            train.WEIGHTED_LOGISTIC: {
+                "best_threshold": algo_val["best_threshold"],
+                "validation_metrics_at_selected_threshold": algo_val["validation_metrics_at_selected_threshold"],
+                "validation_metrics_at_default_0_5": algo_val["validation_metrics_at_default_0_5"],
+                "test_metrics_at_selected_threshold": algo_test["metrics_at_selected_threshold"],
+                "test_metrics_at_default_0_5": algo_test["metrics_at_default_0_5"],
+                "reused_from_run_id": run_id,
+            }
+        },
+    }
 
 
 def _score_split(model: PipelineModel, split_df, threshold: float) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -84,19 +145,14 @@ def run_ablation(ctx: PipelineContext) -> dict[str, Any]:
     if spark is None:
         raise RuntimeError("PipelineContext.spark must be initialized before running ablation.")
 
-    gold_dir = project_path(ctx.root, GOLD_DIR)
-    for split in ("train", "val", "test"):
-        split_dir = gold_dir / split
-        if not split_dir.exists():
-            raise FileNotFoundError(
-                f"Missing Gold split at {split_dir}. Run `python pipeline/main.py` first to build Gold data."
-            )
+    gold_dir = _resolve_gold_dir(ctx)
+    phase1_full = _extract_phase1_full_metrics(ctx.root, ctx.run_id)
 
-    with pipeline_stage("Controlled feature ablation study (RQ2)", ctx=ctx, key="ablation"):
+    with stage("Controlled feature ablation study (RQ2)", timings=ctx.timings, key="ablation"):
         required_cols = [*train.INPUT_COLUMNS, "flight_id", "FlightDate"]
-        train_df = spark.read.parquet(fs_path(gold_dir / "train")).select(*required_cols).persist(StorageLevel.MEMORY_AND_DISK)
-        val_df = spark.read.parquet(fs_path(gold_dir / "val")).select(*required_cols).persist(StorageLevel.MEMORY_AND_DISK)
-        test_df = spark.read.parquet(fs_path(gold_dir / "test")).select(*required_cols).persist(StorageLevel.MEMORY_AND_DISK)
+        train_df = spark.read.parquet(str(gold_dir / "train")).select(*required_cols).persist(StorageLevel.MEMORY_AND_DISK)
+        val_df = spark.read.parquet(str(gold_dir / "val")).select(*required_cols).persist(StorageLevel.MEMORY_AND_DISK)
+        test_df = spark.read.parquet(str(gold_dir / "test")).select(*required_cols).persist(StorageLevel.MEMORY_AND_DISK)
 
         try:
             with stage("Load Gold cohorts and compute prevalence"):
@@ -112,51 +168,41 @@ def run_ablation(ctx: PipelineContext) -> dict[str, Any]:
                 featuresCol="features", labelCol=train.TARGET_COL, family="binomial",
                 standardization=True, **train.LOGISTIC_PARAMS,
             )
-            estimators: list[tuple[str, Any]] = [("logistic_regression", logistic)]
-            if 0 < prevalence < 1:
-                class_weights = {"on_time": 0.5 / (1 - prevalence), "delayed": 0.5 / prevalence}
-                estimators.append((train.WEIGHTED_LOGISTIC, logistic.copy({logistic.weightCol: train.CLASS_WEIGHT_COL})))
-            else:
-                class_weights = {}
-            estimators.append((
-                train.RANDOM_FOREST,
-                RandomForestClassifier(featuresCol="features", labelCol=train.TARGET_COL, **train.RANDOM_FOREST_PARAMS),
-            ))
+            if not 0 < prevalence < 1:
+                raise ValueError("Class-weighted logistic regression requires both target classes in training.")
+            class_weights = {"on_time": 0.5 / (1 - prevalence), "delayed": 0.5 / prevalence}
+            estimators: list[tuple[str, Any]] = [
+                (train.WEIGHTED_LOGISTIC, logistic.copy({logistic.weightCol: train.CLASS_WEIGHT_COL})),
+            ]
 
             feature_groups_out: dict[str, Any] = {}
+            group_timings: dict[str, float] = {}
             for group_name in train.ABLATION_GROUPS:
+                if group_name == "full" and phase1_full is not None:
+                    print("\n  [Ablation] Feature group: full (reusing Phase 1 metrics)", flush=True)
+                    feature_groups_out[group_name] = phase1_full
+                    group_timings[group_name] = 0.0
+                    continue
+
+                group_start = time.monotonic()
                 print(f"\n  [Ablation] Feature group: {group_name}", flush=True)
                 algorithms_out: dict[str, Any] = {}
-                logistic_preprocessor = None
                 vector_dimension = None
 
                 for algo_name, estimator in estimators:
-                    weighted = algo_name == train.WEIGHTED_LOGISTIC
-                    is_tree = algo_name == train.RANDOM_FOREST
-                    if algo_name == "logistic_regression":
-                        logistic_preprocessor = train.build_preprocessor(
-                            empty_enroute=empty_enroute, one_hot=True, feature_group=group_name,
-                        ).fit(train_df)
-                        active_preprocessor = logistic_preprocessor
-                    elif is_tree:
-                        active_preprocessor = train.build_preprocessor(
-                            empty_enroute=empty_enroute, one_hot=False, feature_group=group_name,
-                        ).fit(train_df)
-                    else:
-                        active_preprocessor = logistic_preprocessor
+                    active_preprocessor = train.build_preprocessor(
+                        empty_enroute=empty_enroute, one_hot=True, feature_group=group_name,
+                    ).fit(train_df)
 
-                    fit_features = active_preprocessor.transform(train_df)
-                    if weighted:
-                        fit_features = fit_features.withColumn(
-                            train.CLASS_WEIGHT_COL,
-                            F.when(F.col(train.TARGET_COL) == 1, class_weights["delayed"])
-                            .otherwise(class_weights["on_time"]),
-                        )
+                    fit_features = active_preprocessor.transform(train_df).withColumn(
+                        train.CLASS_WEIGHT_COL,
+                        F.when(F.col(train.TARGET_COL) == 1, class_weights["delayed"])
+                        .otherwise(class_weights["on_time"]),
+                    )
                     classifier = estimator.fit(fit_features)
                     model = PipelineModel(stages=[*active_preprocessor.stages, classifier])
 
-                    if algo_name == "logistic_regression":
-                        vector_dimension = active_preprocessor.transform(val_df.limit(1)).first()["features"].size
+                    vector_dimension = active_preprocessor.transform(val_df.limit(1)).first()["features"].size
 
                     val_scores = (
                         train.predict(model, val_df)
@@ -190,8 +236,10 @@ def run_ablation(ctx: PipelineContext) -> dict[str, Any]:
                         flush=True,
                     )
 
+                group_timings[group_name] = round(time.monotonic() - group_start, 2)
                 feature_groups_out[group_name] = {
                     "vector_dimension": vector_dimension,
+                    "timing_seconds": group_timings[group_name],
                     "algorithms": algorithms_out,
                 }
 
@@ -199,10 +247,12 @@ def run_ablation(ctx: PipelineContext) -> dict[str, Any]:
                 "run_id": ctx.run_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "gold_dir": str(gold_dir),
+                "reused_phase1_full": phase1_full is not None,
                 "cohorts": {"train_rows": train_rows, "val_rows": val_rows, "test_rows": test_rows},
+                "timing_seconds": group_timings,
                 "feature_groups": feature_groups_out,
             }
-            results_path = update_results(project_path(ctx.root, "results"), ABLATION_RESULT_KEY, payload)
+            results_path = update_results({ABLATION_RESULT_KEY: payload}, project_path(ctx.root, "results"))
             print_ablation_summary(payload, results_path)
             return payload
         finally:

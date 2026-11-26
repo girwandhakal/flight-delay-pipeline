@@ -14,12 +14,12 @@ from scripts.bts import run as bts
 from scripts.common.benchmark import run_benchmark_suite
 from scripts.common.cleanup import cleanup_workspace, format_cleanup_summary
 from scripts.common.context import PipelineContext
-from scripts.common.progress import DIVIDER
+from scripts.common.progress import DIVIDER, stage
 from scripts.common.results import record_stage_timings
 from scripts.common.spark import spark_session
 from scripts.destination_weather import run as destination_weather
 from scripts.enroute_weather import run as enroute_weather
-from scripts.modeling import ablation, feature_importance, run as modeling
+from scripts.modeling import ablation, evaluate, feature_importance, run as modeling
 from scripts.origin_weather import run as origin_weather
 
 
@@ -51,33 +51,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Execute the flight-delay pipeline or the controlled ablation study."""
-    args = parse_args(argv)
-    started = time.monotonic()
-    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    ctx = PipelineContext.create()
-
-    print(DIVIDER, flush=True)
-    mode_label = (
-        "SYSTEMS BENCHMARK SUITE (ISSUE #4)"
-        if args.benchmark
-        else "ABLATION STUDY (RQ2)" if args.ablation else "FLIGHT DELAY PREDICTION PIPELINE"
-    )
-    print(f"{mode_label} | Run ID: {ctx.run_id}", flush=True)
-    print(f"Started at: {started_at}", flush=True)
-    print(DIVIDER, flush=True)
-
-    if args.benchmark:
-        run_benchmark_suite()
-        return 0
-
-    if args.ablation:
-        with spark_session("flight_delay_ablation") as spark:
-            ctx.spark = spark
-            ablation.run_ablation(ctx)
-        return 0
-
+def _run_phase1(ctx: PipelineContext, *, run_ablation: bool = False) -> Path:
+    """Run Phase 1 (data prep, training, RQ3 feature importance, test eval) and optional RQ2 ablation."""
     with spark_session("flight_delay") as spark:
         ctx.spark = spark
         bts.run(ctx)
@@ -87,6 +62,47 @@ def main(argv: list[str] | None = None) -> int:
         enroute_weather.run(ctx)
         report = modeling.run(ctx)
         feature_importance.run(ctx)
+        evaluate.run(ctx)
+        if run_ablation:
+            ablation.run_ablation(ctx)
+    ctx.spark = None
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Execute Phase 1 and optional Phase 2 (benchmarks) / Phase 3 (ablation) by CLI flags."""
+    args = parse_args(argv)
+    started = time.monotonic()
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    ctx = PipelineContext.create()
+
+    modes = ["PHASE 1 (PIPELINE & EVALUATION)"]
+    if args.benchmark:
+        modes.append("PHASE 2 (BENCHMARKS)")
+    if args.ablation:
+        modes.append("PHASE 3 (ABLATION)")
+
+    print(DIVIDER, flush=True)
+    print(f"{' -> '.join(modes)} | Run ID: {ctx.run_id}", flush=True)
+    print(f"Started at: {started_at}", flush=True)
+    print(DIVIDER, flush=True)
+
+    # Run Phase 3 in the same default Spark session when --benchmark is not requested.
+    report = _run_phase1(ctx, run_ablation=args.ablation and not args.benchmark)
+
+    if args.benchmark:
+        with stage("Systems Benchmark Suite (Issue #4)", timings=ctx.timings, key="benchmark"):
+            run_benchmark_suite(
+                config=ctx.config,
+                results_dir=ctx.root / "results",
+                gold_dir=ctx.gold_dir,
+            )
+
+    if args.benchmark and args.ablation:
+        with spark_session("flight_delay_ablation") as spark:
+            ctx.spark = spark
+            ablation.run_ablation(ctx)
+        ctx.spark = None
 
     summary = cleanup_workspace(ctx.root)
     if summary.removed_dirs:

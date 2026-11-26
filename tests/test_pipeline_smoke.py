@@ -82,6 +82,8 @@ def test_main_publishes_validation(tmp_path, monkeypatch):
     dest_run = Mock(side_effect=lambda ctx: setattr(ctx, "destination_gold_dir", tmp_path / "destination"))
     rot_run = Mock(side_effect=lambda ctx: setattr(ctx, "rotation_gold_dir", tmp_path / "rotation"))
     enroute_run = Mock(side_effect=lambda ctx: setattr(ctx, "gold_dir", gold))
+    fi_run = Mock()
+    eval_run = Mock()
 
     monkeypatch.setattr(pipeline.PipelineContext, "create", staticmethod(make_context))
     monkeypatch.setattr(pipeline, "spark_session", fake_spark_session)
@@ -90,9 +92,11 @@ def test_main_publishes_validation(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline.destination_weather, "run", dest_run)
     monkeypatch.setattr(pipeline.aircraft_rotation, "run", rot_run)
     monkeypatch.setattr(pipeline.enroute_weather, "run", enroute_run)
+    monkeypatch.setattr(pipeline.feature_importance, "run", fi_run)
+    monkeypatch.setattr(pipeline.evaluate, "run", eval_run)
     monkeypatch.setattr(train, "train", trainer)
 
-    assert pipeline.main() == 0
+    assert pipeline.main([]) == 0
     report, = (tmp_path / run.RUNS_DIR).glob("*/validation.json")
     assert list((tmp_path / "models").iterdir()) == [tmp_path / run.RUNS_DIR]
     assert (report.parent / "_SUCCESS").is_file()
@@ -101,12 +105,14 @@ def test_main_publishes_validation(tmp_path, monkeypatch):
     saved = current.read_bytes()
     assert list(json.loads(saved)) == [run.RESULT_KEY]
     trainer.assert_called_once_with(spark, gold, report.parent, SPLITS)
+    fi_run.assert_called_once()
+    eval_run.assert_called_once()
     spark.stop.assert_called_once()
 
     # Early stage failure must stop downstream stages while still cleaning up Spark.
     bts_run.side_effect = RuntimeError("bts failed")
     with pytest.raises(RuntimeError, match="bts failed"):
-        pipeline.main()
+        pipeline.main([])
     origin_run.assert_called_once()
     trainer.assert_called_once()
     assert spark.stop.call_count == 2
@@ -128,7 +134,7 @@ def test_main_publishes_validation(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(run, "update_results", Mock(side_effect=OSError("publication failed")))
     with pytest.raises(OSError, match="publication failed"):
-        pipeline.main()
+        pipeline.main([])
     assert current.read_bytes() == saved
     assert not (tmp_path / run.RUNS_DIR / "test_run_002").exists()
     assert list((tmp_path / run.RUNS_DIR).iterdir()) == [report.parent]
@@ -267,3 +273,87 @@ def test_full_feature_fit_and_frozen_test_score(spark, tmp_path, monkeypatch, fu
     published = json.loads((tmp_path / "results/results.json").read_text())
     assert published[run.RESULT_KEY]["test"] == summary
     assert published["historical"]["test"] == {"f1": 0.1}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("argv", "expect_benchmark", "expect_ablation", "expected_sessions"),
+    [
+        ([], False, False, ["flight_delay"]),
+        (["--benchmark"], True, False, ["flight_delay"]),
+        (["--ablation"], False, True, ["flight_delay"]),
+        (["--benchmark", "--ablation"], True, True, ["flight_delay", "flight_delay_ablation"]),
+    ],
+)
+def test_pipeline_four_flag_combinations(
+    tmp_path, monkeypatch, argv, expect_benchmark, expect_ablation, expected_sessions
+):
+    """Verify Phase 1, Phase 2 (benchmark), Phase 3 (ablation), and Spark session lifecycle across all 4 modes."""
+    sessions_opened: list[str] = []
+    call_order: list[str] = []
+    spark = Mock()
+
+    @contextmanager
+    def fake_spark_session(app_name="flight_delay"):
+        sessions_opened.append(app_name)
+        call_order.append(f"spark_enter:{app_name}")
+        try:
+            yield spark
+        finally:
+            spark.stop()
+            call_order.append(f"spark_exit:{app_name}")
+
+    gold_dir = tmp_path / "data" / "gold" / "enroute" / "gen_001"
+    gold_dir.mkdir(parents=True)
+    report_path = tmp_path / "models" / "flight_delay" / "run_001" / "validation.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text("{}")
+
+    def make_context():
+        return PipelineContext(
+            root=tmp_path,
+            config={"splits": SPLITS, "benchmark": {"workers": ["local[2]"], "data_fractions": [1.0], "fixed_worker_for_size_scaling": "local[2]", "seed": 42}},
+            settings={"reference_directory": tmp_path},
+            run_id="run_001",
+            sources={"sha256": {}},
+        )
+
+    monkeypatch.setattr(pipeline.PipelineContext, "create", staticmethod(make_context))
+    monkeypatch.setattr(pipeline, "spark_session", fake_spark_session)
+    monkeypatch.setattr(pipeline.bts, "run", lambda ctx: call_order.append("bts"))
+    monkeypatch.setattr(pipeline.origin_weather, "run", lambda ctx: call_order.append("origin_weather"))
+    monkeypatch.setattr(pipeline.destination_weather, "run", lambda ctx: call_order.append("destination_weather"))
+    monkeypatch.setattr(pipeline.aircraft_rotation, "run", lambda ctx: call_order.append("aircraft_rotation"))
+    monkeypatch.setattr(
+        pipeline.enroute_weather,
+        "run",
+        lambda ctx: (setattr(ctx, "gold_dir", gold_dir), call_order.append("enroute_weather")),
+    )
+    monkeypatch.setattr(pipeline.modeling, "run", lambda ctx: (call_order.append("modeling"), report_path)[1])
+    monkeypatch.setattr(pipeline.feature_importance, "run", lambda ctx: call_order.append("feature_importance"))
+    monkeypatch.setattr(pipeline.evaluate, "run", lambda ctx: call_order.append("evaluate"))
+
+    bench_mock = Mock(side_effect=lambda **kwargs: call_order.append("benchmark"))
+    ablation_mock = Mock(side_effect=lambda ctx: call_order.append("ablation"))
+    monkeypatch.setattr(pipeline, "run_benchmark_suite", bench_mock)
+    monkeypatch.setattr(pipeline.ablation, "run_ablation", ablation_mock)
+
+    assert pipeline.main(argv) == 0
+    assert sessions_opened == expected_sessions
+    assert spark.stop.call_count == len(expected_sessions)
+    assert bench_mock.called is expect_benchmark
+    assert ablation_mock.called is expect_ablation
+
+    if expect_benchmark:
+        assert call_order.index("spark_exit:flight_delay") < call_order.index("benchmark")
+        assert bench_mock.call_args.kwargs["gold_dir"] == gold_dir
+    if expect_benchmark and expect_ablation:
+        assert call_order.index("benchmark") < call_order.index("spark_enter:flight_delay_ablation")
+        assert call_order.index("spark_enter:flight_delay_ablation") < call_order.index("ablation")
+    elif expect_ablation:
+        assert call_order.index("evaluate") < call_order.index("ablation") < call_order.index("spark_exit:flight_delay")
+
+    timings = json.loads((tmp_path / "results" / "stage_timings.json").read_text(encoding="utf-8"))
+    assert len(timings) == 1
+    assert timings[0]["run_id"] == "run_001"
+    assert ("benchmark" in timings[0]["stages"]) is expect_benchmark
