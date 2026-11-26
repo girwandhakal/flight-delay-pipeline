@@ -9,6 +9,7 @@ from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
 from pyspark.ml.feature import OneHotEncoder, StringIndexer, VectorAssembler
 from pyspark.sql import Row
 
+from scripts.common.context import PipelineContext
 from scripts.modeling import feature_importance
 
 
@@ -128,3 +129,15 @@ def test_logistic_and_rf_extraction_and_export(spark, tmp_path: Path) -> None:
     with lr_csv.open("r", encoding="utf-8", newline="") as handle:
         lr_rows = list(csv.DictReader(handle))
     assert any(row["feature_name"].startswith("Origin=") for row in lr_rows)
+
+    ctx = PipelineContext(
+        root=tmp_path,
+        config={},
+        settings={},
+        run_id=run_id,
+        spark=spark,
+    )
+    run_out = feature_importance.run(ctx)
+    assert run_out == results_dir / "feature_importance.json"
+    assert run_out.is_file()
+    assert "feature_importance" in ctx.timings

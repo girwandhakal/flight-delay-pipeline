@@ -16,7 +16,7 @@ from scripts.bts.recent_delays import HOLIDAY_FEATURES, ROLLING_FEATURES
 from scripts.common.config import ROOT, project_path
 from scripts.common.context import PipelineContext
 from scripts.common.io import write_json
-from scripts.common.progress import pipeline_stage
+from scripts.common.progress import stage
 from scripts.destination_weather.build_features import DESTINATION_WEATHER_FLAGS, DESTINATION_WEATHER_NUMERIC
 from scripts.enroute_weather.build_features import FEATURES as ENROUTE_FEATURES
 from scripts.origin_weather.build_features import WEATHER_FLAGS, WEATHER_NUMERIC
@@ -285,7 +285,7 @@ def analyze_run(
 
 def run(ctx: PipelineContext) -> Path:
     """Execute feature importance and coefficient analysis for the current pipeline run."""
-    with pipeline_stage(
+    with stage(
         "Feature Importance & Coefficient Analysis (RQ3)",
         timings=ctx.timings,
         key="feature_importance",
