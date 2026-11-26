@@ -3,20 +3,22 @@
 from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Optional, Union
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pyspark import StorageLevel
 from pyspark.sql import DataFrame, SparkSession, functions as F
 
 from scripts.bts.cache import active
+from scripts.common.config import ROOT, load_config, project_path
+from scripts.common.io import reference_matches, sha256, write_json
+from scripts.common.progress import stage as progress_stage
+from scripts.common.results import records
+from scripts.common.spark import get_spark_session
+from scripts.common.stage_cache import find_gold, input_identity, save_gold, scoped_manifest
 from scripts.origin_weather import build_features as origin
 from scripts.origin_weather.clean import clean_weather
-from scripts.origin_weather.download import (
-    ROOT, load_config, prepare_references, project_path, download_weather,
-    reference_matches, sha256, write_json,
-)
-from scripts.results import records
+from scripts.origin_weather.download import download_weather, prepare_references
 
 DESTINATION_WEATHER_NUMERIC = [name.replace("origin_", "destination_", 1) for name in origin.WEATHER_NUMERIC]
 DESTINATION_WEATHER_FLAGS = [name.replace("origin_", "destination_", 1) for name in origin.WEATHER_FLAGS]
@@ -92,12 +94,33 @@ def build_destination_cutoffs(
         resolve,
         "destination_station_id string, destination_time_zone string, destination_mapping_method string",
     )
-    scheduled_utc_formatted = F.date_format("scheduled_departure_utc", "yyyy-MM-dd'T'HH:mm:ss")
-    return (
-        flights.withColumn(
-            "_destination_mapping", lookup("Dest", scheduled_utc_formatted)
+    with_str = flights.withColumn(
+        "_scheduled_utc_str", F.date_format("scheduled_departure_utc", "yyyy-MM-dd'T'HH:mm:ss")
+    )
+    # Deduplicate (Dest, scheduled_departure_utc) keys before Python timezone/station lookup.
+    dest_keys = (
+        with_str.select("Dest", "_scheduled_utc_str")
+        .distinct()
+        .withColumn("_destination_mapping", lookup("Dest", "_scheduled_utc_str"))
+        .select(
+            F.col("Dest").alias("_k_dest"),
+            F.col("_scheduled_utc_str").alias("_k_utc"),
+            "_destination_mapping.*",
         )
-        .select(*flights.columns, "_destination_mapping.*")
+    )
+    return (
+        with_str.join(
+            dest_keys,
+            with_str.Dest.eqNullSafe(dest_keys._k_dest)
+            & with_str._scheduled_utc_str.eqNullSafe(dest_keys._k_utc),
+            "left",
+        )
+        .select(
+            *flights.columns,
+            "destination_station_id",
+            "destination_time_zone",
+            "destination_mapping_method",
+        )
     )
 
 
@@ -115,7 +138,6 @@ def validate_destination_cohort(
     original: DataFrame,
     enriched: DataFrame,
     max_age_minutes: int = 120,
-    publication_lag_minutes: int = 0,
 ) -> None:
     """Verify that destination enrichment preserved parent flight cohort and predictor values."""
     if original.schema != enriched.select(original.columns).schema:
@@ -140,13 +162,12 @@ def validate_destination_cohort(
     observation = F.col("destination_observation_utc")
     cutoff = F.col("scheduled_departure_utc")
     age = (cutoff.cast("long") - observation.cast("long")) / 60
-    available = observation + F.expr(f"INTERVAL {publication_lag_minutes} MINUTES")
     invalid_report = observation.isNotNull() & (
         cutoff.isNull() | F.col("destination_station_id").isNull()
         | (observation < cutoff - F.expr(f"INTERVAL {max_age_minutes} MINUTES"))
-        | (observation > cutoff - F.expr(f"INTERVAL {publication_lag_minutes} MINUTES"))
+        | (observation > cutoff)
         | ~F.col("destination_weather_age_minutes").eqNullSafe(age)
-        | ~F.col("destination_available_utc").eqNullSafe(available)
+        | ~F.col("destination_available_utc").eqNullSafe(observation)
         | (F.col("destination_weather_missing") != 0)
     )
     invalid_missing = F.col("destination_available_utc").isNotNull()
@@ -159,21 +180,23 @@ def validate_destination_cohort(
         raise ValueError("Destination observation or missing-report semantics violate the cutoff contract.")
 
 
-def main(origin_gold_dir: Union[str, Path]) -> tuple[Path, Path]:
+def main(
+    origin_gold_dir: Union[str, Path],
+    spark: Optional[SparkSession] = None,
+    bts_files: Optional[dict[str, Any]] = None,
+) -> tuple[Path, Path]:
     """Execute end-to-end destination weather enrichment on the origin-weather Gold dataset."""
-    from scripts.weather_cache import find_gold, input_identity, save_gold, scoped_manifest
-    from scripts.progress import stage as progress_stage
-    from scripts.bts.build_features import get_spark_session
-
     settings, policy, config = load_config()
-    cached = find_gold(ROOT, settings, policy, config, origin_gold_dir)
+    cached = find_gold(ROOT, settings, policy, config, origin_gold_dir, bts_files=bts_files)
     if cached is not None:
         return cached, cached
     parent = validate_parent(origin_gold_dir, settings, policy, config)
     reference = project_path(ROOT, config["destination_weather"]["reference_directory"])
     if reference == settings["reference_directory"]:
         raise ValueError("Destination references must have a separate scope.")
-    spark = get_spark_session("destination_weather_features")
+    owns_spark = spark is None
+    if owns_spark:
+        spark = get_spark_session("destination_weather_features")
     enriched = None
     try:
         with progress_stage("Destination weather: validate the origin-weather parent cohort"):
@@ -213,7 +236,9 @@ def main(origin_gold_dir: Union[str, Path]) -> tuple[Path, Path]:
             manifest = download_weather(requests, settings["output_directory"])
             scope = sorted({f"{year}/LCD_{station}_{year}.csv" for station, year, _ in requests})
             manifest = scoped_manifest(manifest, scope)
-        cache_inputs = input_identity(ROOT, settings, policy, config, origin_gold_dir, scope)
+        cache_inputs = input_identity(
+            ROOT, settings, policy, config, origin_gold_dir, scope, bts_files=bts_files
+        )
         build_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         gold = ROOT / "data/gold/bts_origin_destination_weather" / build_id
         silver = ROOT / "data/silver/weather" / build_id
@@ -272,7 +297,7 @@ def main(origin_gold_dir: Union[str, Path]) -> tuple[Path, Path]:
                     + DESTINATION_WEATHER_FLAGS
                 ),
                 "schema": enriched.schema.jsonValue(),
-                "availability_assumption": "Observation time plus lag; historical publication and metadata availability unverified. Conditions at departure, not an arrival forecast.",
+                "availability_assumption": "Uses observation timestamps; historical metadata availability unverified. Conditions at departure, not an arrival forecast.",
                 "raw_integrity": "Cached CSVs reused without content scans or checksums; cleaning checks records, not historical immutability.",
                 "source_files": [
                     {"path": str(path.relative_to(ROOT)), "bytes": path.stat().st_size}
@@ -280,12 +305,11 @@ def main(origin_gold_dir: Union[str, Path]) -> tuple[Path, Path]:
                 ],
             }
             write_json(gold / "_metadata.json", metadata)
-            if input_identity(ROOT, settings, policy, config, origin_gold_dir, scope) != cache_inputs:
-                raise ValueError("Weather inputs changed while building destination Gold.")
             save_gold(gold, cache_inputs)
         return gold, gold
     finally:
         if enriched is not None:
             enriched.unpersist(blocking=True)
         spark.catalog.clearCache()
-        spark.stop()
+        if owns_spark:
+            spark.stop()

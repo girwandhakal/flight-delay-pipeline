@@ -4,6 +4,8 @@ import math
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
 from scripts.origin_weather.measurements import (
     SOURCE_FIELDS, NUMERIC_FEATURES, MISSING_FLAGS, INDICATOR_FLAGS,
     FEATURE_COLUMNS, decode_weather,

@@ -1,16 +1,29 @@
-"""Reuse validated weather Gold independently of model/result publication."""
+"""Stage-level cache resolution and Parquet partition fingerprinting."""
 
 import hashlib
 import inspect
 import json
-from time import monotonic
-from uuid import uuid4
 from pathlib import Path
+import shutil
+from time import monotonic
 from typing import Any, Optional, Union
+from uuid import uuid4
 
-from scripts.bts.cache import active, current_partitions
-from scripts.origin_weather.clean import file_fingerprints
-from scripts.origin_weather.download import project_path, sha256, write_json
+from .config import project_path
+from .io import file_fingerprints, sha256, write_json
+
+
+def _default_bts_files(root: Path, config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve active BTS Gold partition fingerprints without importing scripts.bts."""
+    base = root / "data" / "gold" / "bts_generations"
+    pointer = base / "_current.json"
+    if pointer.exists():
+        bts_dir = (base / json.loads(pointer.read_text(encoding="utf-8"))).resolve()
+        if bts_dir.parent != base.resolve():
+            raise ValueError("Invalid BTS generation path")
+        return consumed(bts_dir, config["splits"])
+    legacy = root / "data" / "gold" / "bts"
+    return partition_files(legacy, config["splits"])
 
 
 def input_identity(
@@ -20,22 +33,10 @@ def input_identity(
     config: dict[str, Any],
     parent: Optional[Union[str, Path]] = None,
     scope=None,
+    *,
+    bts_files: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Build a deterministic provenance fingerprint of all inputs for weather Gold.
-
-    Captures BTS gold files, raw weather files, station metadata, airport
-    references, transformation source code hashes, and parent origin gold (if destination).
-
-    Args:
-        root: Project root directory.
-        settings: Weather dataset settings from config.json.
-        policy: Weather matching policy parameters (max age, publication lag).
-        config: Full configuration dictionary.
-        parent: Optional path to parent origin Gold directory (for destination).
-
-    Returns:
-        Dictionary defining the full input identity fingerprint.
-    """
+    """Build a deterministic provenance fingerprint of all inputs for weather Gold."""
     root = Path(root)
     references = [settings["reference_directory"]]
     code = [
@@ -53,9 +54,9 @@ def input_identity(
     manifest = json.loads((settings["output_directory"] / "manifest.json").read_text())
     if not manifest.get("complete"):
         raise ValueError("Weather acquisition is incomplete.")
-
     if scope is None:
         raise ValueError("Weather station/year selection is missing.")
+
     manifest = scoped_manifest(manifest, scope)
     weather_files = []
     for name, entry in manifest["files"].items():
@@ -84,20 +85,13 @@ def input_identity(
         for directory in references
     }
 
-    bts = active(root, "gold")
-    if bts.parent.name == "bts_generations":
-        bts_files = current_partitions(root, config, bts)
-    else:
-        from scripts.bts.recent_delays import features_current as legacy_current
-        if not legacy_current(root, config):
-            raise ValueError("Legacy BTS Gold is incomplete or stale")
-        bts_files = partition_files(bts, config["splits"])
-
+    resolved_bts = bts_files if bts_files is not None else _default_bts_files(root, config)
     identity = {
         "splits": config["splits"],
         "policy": policy,
-        "bts": bts_files,
-        "weather": file_fingerprints(weather_files), "scope": sorted(scope),
+        "bts": resolved_bts,
+        "weather": file_fingerprints(weather_files),
+        "scope": sorted(scope),
         "stations": stations_summary,
         "references": reference_hashes,
         "code": {name: sha256(root / "scripts" / name) for name in code},
@@ -109,22 +103,16 @@ def input_identity(
             raise ValueError("Invalid origin Gold generation path")
         identity["parent"] = consumed(parent_path, config["splits"])
         parent_inputs = json.loads((parent_path / "_reuse.json").read_text())["inputs"]
-        if parent_inputs != input_identity(root, settings, policy, config, scope=parent_inputs.get("scope")):
+        if parent_inputs != input_identity(
+            root, settings, policy, config, scope=parent_inputs.get("scope"), bts_files=resolved_bts
+        ):
             raise ValueError("Origin Gold inputs changed")
 
     return identity
 
 
 def save_gold(directory: Union[str, Path], inputs: dict[str, Any]) -> None:
-    """Record a reuse marker sidecar (_reuse.json) in a completed Gold directory.
-
-    Args:
-        directory: Gold dataset directory to cache.
-        inputs: Input identity dictionary computed before building Gold.
-
-    Raises:
-        ValueError: If split completion markers or parquet outputs are missing.
-    """
+    """Record a reuse marker sidecar (_reuse.json) in a completed weather Gold directory."""
     directory = Path(directory)
     partitions = partition_files(directory, inputs["splits"])
     outputs = file_fingerprints(directory.rglob("*.parquet"))
@@ -134,11 +122,33 @@ def save_gold(directory: Union[str, Path], inputs: dict[str, Any]) -> None:
     write_json(
         directory / "_reuse.json",
         {
-            "inputs": inputs, "key": contract_digest({"version": 1, "inputs": inputs}),
-            "outputs": outputs, "partitions": partitions,
+            "inputs": inputs,
+            "key": contract_digest({"version": 1, "inputs": inputs}),
+            "outputs": outputs,
+            "partitions": partitions,
             "metadata": sha256(directory / "_metadata.json"),
         },
     )
+
+
+STAGE_LABELS = {
+    ("silver", "bts_generations"): "BTS Silver (cleaned flights)",
+    ("gold", "bts_generations"): "BTS Gold (schedule & rolling features)",
+    ("silver", "taf_stations"): "TAF station list",
+    ("silver", "taf"): "TAF Silver (forecast segments)",
+    ("silver", "sigmets"): "SIGMET Silver (convective advisories)",
+    ("gold", "rotation"): "Aircraft Rotation Gold",
+    ("gold", "enroute"): "En-route Weather Gold",
+}
+WEATHER_GOLD_LABELS = {
+    "bts_origin_weather": "Origin Surface Weather Gold",
+    "bts_origin_destination_weather": "Destination Surface Weather Gold",
+}
+
+
+def _stage_label(base: Path) -> str:
+    """Return a descriptive console label for a cached stage directory."""
+    return STAGE_LABELS.get((base.parent.name, base.name), base.name)
 
 
 def find_gold(
@@ -147,65 +157,57 @@ def find_gold(
     policy: dict[str, Any],
     config: dict[str, Any],
     parent: Optional[Union[str, Path]] = None,
+    *,
+    bts_files: Optional[dict[str, Any]] = None,
 ) -> Optional[Path]:
-    """Search for an existing completed Gold dataset matching current inputs.
-
-    Checks newest to oldest completed builds. Reuses the dataset if all inputs,
-    output parquet fingerprints, completion markers, and metadata match exactly.
-
-    Args:
-        root: Project root directory.
-        settings: Weather dataset settings.
-        policy: Weather matching policy parameters.
-        config: Full configuration dictionary.
-        parent: Optional parent origin Gold directory for destination searches.
-
-    Returns:
-        Resolved Path to matching Gold directory, or None if rebuild is needed.
-    """
+    """Return an existing completed weather Gold directory matching current inputs, or None."""
     started = monotonic()
     variant = "bts_origin_weather" if parent is None else "bts_origin_destination_weather"
+    label = WEATHER_GOLD_LABELS[variant]
     base = (Path(root) / "data/gold" / variant).resolve()
 
-    # Scan completed builds from newest to oldest
     for marker in sorted(base.glob("*/_reuse.json"), reverse=True):
         directory = marker.parent.resolve()
         if not directory.is_relative_to(base):
             continue
-
         try:
             saved = json.loads(marker.read_text())
             if not isinstance(saved, dict):
                 continue
-
-            # Verify inputs, split completion, output parquet fingerprints, and metadata
-            inputs = input_identity(root, settings, policy, config, parent, saved["inputs"].get("scope"))
+            inputs = input_identity(
+                root, settings, policy, config, parent, saved["inputs"].get("scope"),
+                bts_files=bts_files,
+            )
             if saved.get("inputs") != inputs:
                 continue
             consumed(directory, config["splits"])
-
         except (OSError, ValueError, KeyError, TypeError):
             continue
 
         print(
-            f"Reusing {variant} Gold from {directory} ({monotonic() - started:.2f}s); "
-            "skipping acquisition, cleaning and matching.",
+            f"  [Cache HIT] Reusing {label} ({directory.name}, {monotonic() - started:.2f}s).",
             flush=True,
         )
         return directory
 
-    print(f"{variant} cache miss (no verified matching generation, {monotonic() - started:.2f}s)", flush=True)
+    print(
+        f"  [Cache MISS] {label} — no matching cache ({monotonic() - started:.2f}s), building now...",
+        flush=True,
+    )
     return None
 
 
-def partition_files(directory, partitions):
-    """Fingerprint each partition relative to its own root so generations can move."""
+def partition_files(directory: Path, partitions) -> dict[str, list[dict[str, Any]]]:
+    """Fingerprint each Parquet partition and validate its PAR1 footer."""
     outputs = {}
     for name in partitions:
         part = (directory / name).resolve()
         marker = part / "_SUCCESS"
-        if (not part.is_relative_to(directory.resolve()) or not marker.is_file()
-                or marker.resolve().parent != part):
+        if (
+            not part.is_relative_to(directory.resolve())
+            or not marker.is_file()
+            or marker.resolve().parent != part
+        ):
             raise ValueError(f"Incomplete partition: {name}")
         files = file_fingerprints(part.rglob("*.parquet"))
         if not files:
@@ -213,8 +215,7 @@ def partition_files(directory, partitions):
         for item in files:
             path = Path(item["path"])
             item["path"] = path.relative_to(part).as_posix()
-            # The Parquet footer includes the physical schema. Reading just the
-            # footer keeps validation independent of Spark and of row count.
+            # Reading just the Parquet footer verifies the physical file without Spark.
             with path.open("rb") as stream:
                 if stream.read(4) == b"PAR1":
                     stream.seek(-8, 2)
@@ -227,13 +228,10 @@ def partition_files(directory, partitions):
     return outputs
 
 
-def output_identity(directory, partitions, sidecars):
-    hashes = {}
-    for name in sidecars:
-        path = project_path(directory, name)
-        hashes[name] = sha256(path)
-    outputs = {"partitions": partition_files(directory, partitions), "sidecars": hashes}
-    # A BTS month only has quarantine output when cleaning rejected rows.
+def output_identity(directory: Path, partitions, sidecars) -> dict[str, Any]:
+    """Fingerprint completed partitions, sidecar JSONs, and optional quarantine partitions."""
+    hashes = {name: sha256(project_path(directory, name)) for name in sidecars}
+    outputs: dict[str, Any] = {"partitions": partition_files(directory, partitions), "sidecars": hashes}
     quarantine = directory / "_quarantine"
     if quarantine.exists():
         names = [path.relative_to(directory).as_posix() for path in quarantine.glob("*/*") if path.is_dir()]
@@ -241,52 +239,70 @@ def output_identity(directory, partitions, sidecars):
     return outputs
 
 
-def logic_hash(*functions):
-    """Hash shared helpers without coupling their callers to unrelated module code."""
+def logic_hash(*functions) -> str:
+    """Hash source code of helper functions to invalidate caches when logic changes."""
     return hashlib.sha256("".join(inspect.getsource(fn) for fn in functions).encode()).hexdigest()
 
 
-def contract_digest(contract):
+def contract_digest(contract: dict[str, Any]) -> str:
+    """Compute a canonical SHA-256 digest for a JSON-serializable stage contract."""
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
-def resolve_stage(base, inputs, partitions, sidecars, build):
-    """Reuse a verified generation or publish an isolated rebuild."""
+def resolve_stage(base: Path, inputs, partitions, sidecars, build) -> Path:
+    """Reuse a verified stage generation matching `inputs()` or build a fresh one."""
     started = monotonic()
+    label = _stage_label(base)
     identity = inputs()
     contract = {"version": 1, "inputs": identity, "partitions": list(partitions), "sidecars": list(sidecars)}
     key = contract_digest(contract)
-    prefix = key[:16]  # Keep Spark scratch paths short enough for Windows.
+    prefix = key[:16]  # Keep generation directory names short for Windows paths.
     reason = "no matching inputs"
     for path in sorted(base.glob(f"{prefix}-*"), reverse=True):
         if path.resolve().parent != base.resolve():
             continue
         try:
             saved = json.loads((path / "_stage.json").read_text())
-            if (saved["contract"] == contract and saved["key"] == key
-                    and saved["outputs"] == output_identity(path, partitions, sidecars)):
-                print(f"{base.name} cache hit ({monotonic() - started:.2f}s)", flush=True)
+            if (
+                saved["contract"] == contract
+                and saved["key"] == key
+                and saved["outputs"] == output_identity(path, partitions, sidecars)
+            ):
+                print(f"  [Cache HIT] Reusing {label} ({monotonic() - started:.2f}s)", flush=True)
                 return path
         except (ValueError, OSError, KeyError, TypeError):
             pass
         reason = "incomplete or changed output"
+
+    # Announce cache misses before starting expensive builds so logs stay clear during long runs.
+    print(f"  [Cache MISS] {label} ({reason}) — building now...", flush=True)
     path = base / f"{prefix}-{uuid4().hex[:12]}"
     path.mkdir(parents=True, exist_ok=False)
-    provenance = build(path)
-    outputs = output_identity(path, partitions, sidecars)
-    # Only the final manifest makes this generation visible to later runs.
-    if inputs() != identity:
-        raise ValueError(f"{base.name} inputs changed during preparation")
-    write_json(path / "_stage.json", {"key": key, "contract": contract, "outputs": outputs,
-                                      "reason": reason, "seconds": monotonic() - started,
-                                      "provenance": provenance})
-    print(f"{base.name} cache miss ({reason}, {monotonic() - started:.2f}s)", flush=True)
+    try:
+        provenance = build(path)
+        outputs = output_identity(path, partitions, sidecars)
+        write_json(
+            path / "_stage.json",
+            {
+                "key": key,
+                "contract": contract,
+                "outputs": outputs,
+                "reason": reason,
+                "seconds": monotonic() - started,
+                "provenance": provenance,
+            },
+        )
+    except BaseException:
+        # Remove partial build directories immediately so failed runs do not accumulate on disk.
+        shutil.rmtree(path, ignore_errors=True)
+        raise
+    print(f"  [Cache BUILT] {label} in {monotonic() - started:.1f}s", flush=True)
     return path
 
 
-def consumed(directory, partitions):
-    """Check the entire producer before selecting the partitions a consumer reads."""
+def consumed(directory: Path, partitions) -> dict[str, Any]:
+    """Verify a producer directory's outputs and return fingerprints for `partitions`."""
     if (directory / "_stage.json").is_file():
         saved = json.loads((directory / "_stage.json").read_text())
         contract = saved["contract"]
@@ -297,17 +313,19 @@ def consumed(directory, partitions):
         if current != saved["outputs"]:
             raise ValueError(f"Changed stage output: {directory}")
         return {name: current["partitions"][name] for name in partitions}
+
     saved = json.loads((directory / "_reuse.json").read_text())
     current = partition_files(directory, saved["inputs"]["splits"])
-    if ("key" in saved and saved["key"] != contract_digest({"version": 1, "inputs": saved["inputs"]})
-            or ("partitions" in saved and saved["partitions"] != current)
-            or saved["outputs"] != file_fingerprints(directory.rglob("*.parquet"))
-            or saved["metadata"] != sha256(directory / "_metadata.json")):
+    if (
+        ("key" in saved and saved["key"] != contract_digest({"version": 1, "inputs": saved["inputs"]}))
+        or ("partitions" in saved and saved["partitions"] != current)
+        or saved["outputs"] != file_fingerprints(directory.rglob("*.parquet"))
+        or saved["metadata"] != sha256(directory / "_metadata.json")
+    ):
         raise ValueError(f"Changed weather Gold: {directory}")
     return {name: current[name] for name in partitions}
 
 
-def scoped_manifest(manifest, names):
-    # NOAA tracks both airport roles in one acquisition ledger. Only pass the
-    # requested station-years to cleaning, or the other role becomes a dependency.
+def scoped_manifest(manifest: dict[str, Any], names) -> dict[str, Any]:
+    """Filter the NOAA acquisition ledger down to only the station-years needed by this role."""
     return {**manifest, "files": {name: manifest["files"][name] for name in sorted(set(names))}}

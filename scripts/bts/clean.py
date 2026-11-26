@@ -1,19 +1,15 @@
 """Clean raw BTS CSV files into Silver Parquet matching Bronze folder structure."""
 
-"""Clean raw BTS CSV files into Silver Parquet matching Bronze folder structure."""
-
 from pathlib import Path
 import sys
 from typing import Optional, Union
 
-from scripts.results import records, update_results
-
 import pandas as pd
 from pyspark.sql import SparkSession, functions as F
 
-from .build_features import get_spark_session as _get_spark_session
-
-ROOT = Path(__file__).resolve().parents[2]
+from scripts.common.config import ROOT
+from scripts.common.results import records, update_results
+from scripts.common.spark import get_spark_session as _get_spark_session
 
 
 def get_spark_session(app_name: str = "bts_cleaning") -> SparkSession:

@@ -26,7 +26,21 @@
     "random_seed": 42
   },
   "bts_features": {
-    "rolling_window_minutes": 120
+    "rolling_window_minutes": 120,
+    "outbound_schedule_slack": {
+      "release_manifest": "data/bronze/bts_block_history/manifest.json",
+      "bts_archive_dates": {
+        "2024-01": "2024-04-11",
+        "2024-02": "2024-05-13",
+        "2024-03": "2024-05-29",
+        "2024-04": "2024-07-18",
+        "2024-05": "2024-08-09",
+        "2024-06": "2024-08-30",
+        "2024-07": "2024-09-27",
+        "2024-08": "2024-10-21",
+        "2024-09": "2024-12-11"
+      }
+    }
   },
   "splits": {
     "train": {
@@ -62,8 +76,7 @@
     "Diverted"
   ],
   "origin_weather": {
-    "max_age_minutes": 120,
-    "publication_lag_minutes": 0
+    "max_age_minutes": 120
   },
   "destination_weather": {
     "reference_directory": "data/reference/weather/2024-2025-destination-v1"
