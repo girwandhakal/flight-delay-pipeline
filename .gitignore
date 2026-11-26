@@ -30,3 +30,4 @@ output.txt
 .agents/
 AGENTS.md
 course/
+.spark_tmp
