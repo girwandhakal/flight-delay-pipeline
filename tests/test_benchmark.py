@@ -6,6 +6,7 @@ import sys
 
 from pipeline.main import parse_args
 from scripts.common.benchmark import (
+    _resolve_gold_train_dir,
     collect_hardware_metadata,
     compute_speedup,
     run_benchmark_suite,
@@ -80,3 +81,56 @@ def test_run_benchmark_suite_writes_results_json(tmp_path: Path, monkeypatch) ->
     assert len(data["worker_scaling"]) == 3
     assert data["worker_scaling"][0]["speedup"] == 1.0
     assert data["worker_scaling"][1]["speedup"] == 2.0
+    assert data["workload"] == "preprocessing+logistic_regression"
+
+
+def test_parse_args_combined_flags() -> None:
+    """Verify --benchmark and --ablation can be combined independently."""
+    args = parse_args(["--benchmark", "--ablation"])
+    assert args.benchmark is True
+    assert args.ablation is True
+
+
+def test_resolve_gold_train_dir_prefers_explicit_then_active_enroute(tmp_path: Path) -> None:
+    """Verify _resolve_gold_train_dir resolves explicit gold_dir and latest enroute Gold."""
+    explicit = tmp_path / "explicit_gold"
+    (explicit / "train").mkdir(parents=True)
+    assert _resolve_gold_train_dir(gold_dir=explicit, root=tmp_path) == explicit / "train"
+
+    enroute_gen = tmp_path / "data" / "gold" / "enroute" / "gen_abc"
+    (enroute_gen / "train").mkdir(parents=True)
+    (enroute_gen / "_SUCCESS").touch()
+    assert _resolve_gold_train_dir(gold_dir=None, root=tmp_path) == enroute_gen / "train"
+
+
+def test_run_worker_task_executes_ml_workload_on_gold_schema(tmp_path: Path, full_feature_rows) -> None:
+    """Verify _run_worker_task runs real preprocessing and LogisticRegression fitting in a subprocess."""
+    import datetime
+    import subprocess
+
+    gold_dir = tmp_path / "gold"
+    train_df = full_feature_rows("train", datetime.date(2024, 1, 5))
+    train_df.coalesce(1).write.parquet(str(gold_dir / "train"))
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.common.benchmark",
+            "--master",
+            "local[2]",
+            "--fraction",
+            "1.0",
+            "--seed",
+            "42",
+            "--gold-dir",
+            str(gold_dir),
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "BENCHMARK_ROW_COUNT=" in proc.stdout
+    assert "BENCHMARK_PREPROCESS_SECONDS=" in proc.stdout
+    assert "BENCHMARK_FIT_SECONDS=" in proc.stdout
