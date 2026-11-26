@@ -28,3 +28,5 @@ derby.log
 /envs/hadoop/
 output.txt
 .agents/
+AGENTS.md
+course/
