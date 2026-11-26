@@ -96,9 +96,12 @@ def test_training_reads_only_development_and_persists_both_variants(spark, tmp_p
 
     monkeypatch.setattr(DataFrameReader, "parquet", read_data)
     monkeypatch.setattr(train, "LOGISTIC_PARAMS", {**train.LOGISTIC_PARAMS, "maxIter": 1})
+    monkeypatch.setattr(train, "MLP_PARAMS", {**train.MLP_PARAMS, "maxIter": 1})
     summary = train.train(spark, tmp_path / "gold", tmp_path / "model", {})
     algorithms = summary["algorithm_comparison"]
-    assert set(algorithms) == {"logistic_regression", train.WEIGHTED_LOGISTIC}
+    assert set(algorithms) == {"logistic_regression", train.WEIGHTED_LOGISTIC, train.RANDOM_FOREST, train.MLP}
+    assert algorithms[train.MLP]["layers"][0] > 0
+    assert algorithms[train.MLP]["layers"][-1] == 2
     assert algorithms[train.WEIGHTED_LOGISTIC]["class_weights"] == pytest.approx({"on_time": 0.75, "delayed": 1.5})
     for reports in algorithms.values():
         model = Path(reports["models_dir"])
