@@ -8,7 +8,7 @@ from typing import Any, Optional
 import pandas as pd
 from pyspark import StorageLevel
 from pyspark.ml import Pipeline, PipelineModel
-from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml.feature import Imputer, OneHotEncoder, SQLTransformer, StringIndexer, VectorAssembler
 from pyspark.ml.functions import vector_to_array
@@ -34,47 +34,89 @@ INPUT_COLUMNS = [
 ]
 LOGISTIC_PARAMS = {"regParam": 0.01, "elasticNetParam": 0.0, "maxIter": 100, "tol": 1e-6}
 WEIGHTED_LOGISTIC = "class_weighted_logistic_regression"
+RANDOM_FOREST = "random_forest"
+# maxBins=512 accommodates >300 airports plus StringIndexer's unknown bucket.
+RANDOM_FOREST_PARAMS = {
+    "numTrees": 50,
+    "maxDepth": 10,
+    "maxBins": 512,
+    "minInstancesPerNode": 50,
+    "subsamplingRate": 0.8,
+    "featureSubsetStrategy": "sqrt",
+    "seed": 42,
+}
 CLASS_WEIGHT_COL = "class_weight"
 THRESHOLDS = [round(i * 0.05, 2) for i in range(1, 20)]
+ABLATION_GROUPS: dict[str, dict[str, bool]] = {
+    "bts_only": {"surface_weather": False, "rotation": False, "enroute": False},
+    "bts_surface_weather": {"surface_weather": True, "rotation": False, "enroute": False},
+    "bts_surface_rotation": {"surface_weather": True, "rotation": True, "enroute": False},
+    "full": {"surface_weather": True, "rotation": True, "enroute": True},
+}
 
 
-def build_preprocessor(*, empty_enroute: tuple[str, ...] = ()) -> Pipeline:
-    """Build the full feature vector in its established order."""
+def build_preprocessor(
+    *,
+    empty_enroute: tuple[str, ...] = (),
+    one_hot: bool = True,
+    feature_group: str = "full",
+) -> Pipeline:
+    """Build the feature vector for a specified ablation feature group in its established order."""
+    if feature_group not in ABLATION_GROUPS:
+        raise ValueError(f"Unknown feature_group {feature_group!r}; expected one of {tuple(ABLATION_GROUPS)}")
+    group = ABLATION_GROUPS[feature_group]
     indices = [name + "_idx" for name in CATEGORICAL_FEATURES]
     vectors = [name + "_vec" for name in CATEGORICAL_FEATURES]
-    filled = [*ROLLING_FEATURES, *ROTATION_NUMERIC, SLACK_FEATURES[0], RECOVERY_FEATURES[0]]
-    enroute_imputed = [name for name in ENROUTE_NUMERIC if name not in empty_enroute]
+    categorical_outputs = vectors if one_hot else indices
+    filled = [*ROLLING_FEATURES, SLACK_FEATURES[0]]
+    if group["rotation"]:
+        filled.extend([*ROTATION_NUMERIC, RECOVERY_FEATURES[0]])
     stages = [
         StringIndexer(inputCols=CATEGORICAL_FEATURES, outputCols=indices, handleInvalid="keep"),
-        OneHotEncoder(inputCols=indices, outputCols=vectors, handleInvalid="keep", dropLast=False),
-        Imputer(inputCols=SURFACE_NUMERIC, outputCols=[name + "_imputed" for name in SURFACE_NUMERIC],
-                strategy="mean"),
+    ]
+    if one_hot:
+        # Linear models use one-hot indicators; tree models split directly on StringIndexer metadata.
+        stages.append(OneHotEncoder(inputCols=indices, outputCols=vectors, handleInvalid="keep", dropLast=False))
+    if group["surface_weather"]:
+        stages.append(
+            Imputer(inputCols=SURFACE_NUMERIC, outputCols=[name + "_imputed" for name in SURFACE_NUMERIC],
+                    strategy="mean"),
+        )
+    stages.append(
         SQLTransformer(statement=(
             "SELECT *, SIN(2 * PI() * (Month - 1) / 12) AS MonthSin, "
             "COS(2 * PI() * (Month - 1) / 12) AS MonthCos, "
             + ", ".join(f"COALESCE({name}, 0D) AS {name}_filled" for name in filled)
             + " FROM __THIS__"
         )),
-        SQLTransformer(statement="SELECT *, " + ", ".join(
-            f"COALESCE({name}, 0D) AS {name}_filled" for name in (*ENROUTE_FLAGS, *empty_enroute)
-        ) + " FROM __THIS__"),
+    )
+    if group["enroute"]:
+        enroute_imputed = [name for name in ENROUTE_NUMERIC if name not in empty_enroute]
+        stages.append(
+            SQLTransformer(statement="SELECT *, " + ", ".join(
+                f"COALESCE({name}, 0D) AS {name}_filled" for name in (*ENROUTE_FLAGS, *empty_enroute)
+            ) + " FROM __THIS__"),
+        )
+        if enroute_imputed:
+            stages.append(Imputer(inputCols=enroute_imputed, outputCols=[f"{name}_filled" for name in enroute_imputed],
+                                  strategy="median"))
+    assembler_inputs = [
+        *categorical_outputs, *NUMERIC_FEATURES, "MonthSin", "MonthCos",
+        *(f"{name}_filled" for name in ROLLING_FEATURES), *HOLIDAY_FEATURES,
     ]
-    if enroute_imputed:
-        stages.append(Imputer(inputCols=enroute_imputed, outputCols=[f"{name}_filled" for name in enroute_imputed],
-                              strategy="median"))
-    stages.append(VectorAssembler(
-        inputCols=[
-            *vectors, *NUMERIC_FEATURES, "MonthSin", "MonthCos",
-            *(f"{name}_filled" for name in ROLLING_FEATURES), *HOLIDAY_FEATURES,
+    if group["surface_weather"]:
+        assembler_inputs.extend([
             *(f"{name}_imputed" for name in WEATHER_NUMERIC), *WEATHER_FLAGS,
             *(f"{name}_imputed" for name in DESTINATION_WEATHER_NUMERIC), *DESTINATION_WEATHER_FLAGS,
-            *(f"{name}_filled" for name in ROTATION_NUMERIC), *ROTATION_FLAGS,
-            *(f"{name}_filled" for name in ENROUTE_FEATURES),
-            f"{SLACK_FEATURES[0]}_filled", SLACK_FEATURES[1],
-            f"{RECOVERY_FEATURES[0]}_filled", RECOVERY_FEATURES[1],
-        ],
-        outputCol="features", handleInvalid="error",
-    ))
+        ])
+    if group["rotation"]:
+        assembler_inputs.extend([*(f"{name}_filled" for name in ROTATION_NUMERIC), *ROTATION_FLAGS])
+    if group["enroute"]:
+        assembler_inputs.extend(f"{name}_filled" for name in ENROUTE_FEATURES)
+    assembler_inputs.extend([f"{SLACK_FEATURES[0]}_filled", SLACK_FEATURES[1]])
+    if group["rotation"]:
+        assembler_inputs.extend([f"{RECOVERY_FEATURES[0]}_filled", RECOVERY_FEATURES[1]])
+    stages.append(VectorAssembler(inputCols=assembler_inputs, outputCol="features", handleInvalid="error"))
     return Pipeline(stages=stages)
 
 
@@ -280,24 +322,36 @@ def train(spark: SparkSession, gold_dir: Path, models_dir: Path, splits: dict) -
                                models_dir / "weighted_logistic"))
         else:
             print("  Skipping class-weighted logistic regression because training has one class.", flush=True)
+        rf = RandomForestClassifier(featuresCol="features", labelCol=TARGET_COL, **RANDOM_FOREST_PARAMS)
+        estimators.append((RANDOM_FOREST, rf, models_dir / RANDOM_FOREST))
+
         algorithms = {}
+        logistic_preprocessor = None
         for name, estimator, directory in estimators:
             weighted = name == WEIGHTED_LOGISTIC
+            is_tree = name == RANDOM_FOREST
             algorithm_timings = {}
-            print(f"  Fitting {name} on all training flights with fixed settings: {LOGISTIC_PARAMS}", flush=True)
-            # Both logistic models use the same fitted feature mapping.
-            if not weighted:
+            params = RANDOM_FOREST_PARAMS if is_tree else LOGISTIC_PARAMS
+            print(f"  Fitting {name} on all training flights with fixed settings: {params}", flush=True)
+            # Both logistic models share the one-hot mapping; tree models use indexed categories.
+            if name == "logistic_regression":
                 with stage(f"{name}: fit preprocessing", timings=algorithm_timings, key="preprocessor_fit"):
-                    preprocessor = build_preprocessor(empty_enroute=empty_enroute).fit(train_features)
+                    logistic_preprocessor = build_preprocessor(empty_enroute=empty_enroute, one_hot=True).fit(train_features)
+                active_preprocessor = logistic_preprocessor
+            elif is_tree:
+                with stage(f"{name}: fit preprocessing", timings=algorithm_timings, key="preprocessor_fit"):
+                    active_preprocessor = build_preprocessor(empty_enroute=empty_enroute, one_hot=False).fit(train_features)
+            else:
+                active_preprocessor = logistic_preprocessor
             with stage(f"{name}: fit classifier", timings=algorithm_timings, key="classifier_fit"):
-                fit_features = preprocessor.transform(train_features)
+                fit_features = active_preprocessor.transform(train_features)
                 if weighted:
                     fit_features = fit_features.withColumn(
                         CLASS_WEIGHT_COL, F.when(F.col(TARGET_COL) == 1, class_weights["delayed"])
                         .otherwise(class_weights["on_time"]),
                     )
                 classifier = estimator.fit(fit_features)
-                selected_model = PipelineModel(stages=[*preprocessor.stages, classifier])
+                selected_model = PipelineModel(stages=[*active_preprocessor.stages, classifier])
             with stage(f"{name}: score validation and select threshold",
                        timings=algorithm_timings, key="validation"):
                 selected_scores = (
@@ -313,9 +367,9 @@ def train(spark: SparkSession, gold_dir: Path, models_dir: Path, splits: dict) -
                 )
                 selected_metrics.update({key: selected_default[key] for key in ("pr_auc", "roc_auc")})
                 if name == "logistic_regression":
-                    vector_dimension = preprocessor.transform(val_features.limit(1)).first()["features"].size
+                    vector_dimension = active_preprocessor.transform(val_features.limit(1)).first()["features"].size
                     imputation_means = next((item.surrogateDF.first().asDict()
-                                             for item in preprocessor.stages
+                                             for item in active_preprocessor.stages
                                              if hasattr(item, "surrogateDF")), {})
             with stage(f"{name}: save model and threshold",
                        timings=algorithm_timings, key="save_model_and_threshold"):
@@ -330,14 +384,25 @@ def train(spark: SparkSession, gold_dir: Path, models_dir: Path, splits: dict) -
                 (selected_scores.withColumn("prediction", (F.col("p_delayed") >= threshold).cast("int"))
                  .withColumn("threshold", F.lit(threshold))
                  .write.parquet(str(directory / "validation_predictions")))
-            model_params = {
-                "reg_param": estimator.getRegParam(),
-                "elastic_net_param": estimator.getElasticNetParam(),
-                "max_iter": estimator.getMaxIter(),
-                "tol": estimator.getTol(),
-            }
-            if weighted:
-                model_params["class_weights"] = class_weights
+            if is_tree:
+                model_params = {
+                    "num_trees": estimator.getNumTrees(),
+                    "max_depth": estimator.getMaxDepth(),
+                    "max_bins": estimator.getMaxBins(),
+                    "min_instances_per_node": estimator.getMinInstancesPerNode(),
+                    "subsampling_rate": estimator.getSubsamplingRate(),
+                    "feature_subset_strategy": estimator.getFeatureSubsetStrategy(),
+                    "seed": estimator.getSeed(),
+                }
+            else:
+                model_params = {
+                    "reg_param": estimator.getRegParam(),
+                    "elastic_net_param": estimator.getElasticNetParam(),
+                    "max_iter": estimator.getMaxIter(),
+                    "tol": estimator.getTol(),
+                }
+                if weighted:
+                    model_params["class_weights"] = class_weights
             algorithms[name] = {
                 "algorithm": name,
                 **model_params,
