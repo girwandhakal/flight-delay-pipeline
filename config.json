@@ -80,5 +80,20 @@
   },
   "destination_weather": {
     "reference_directory": "data/reference/weather/2024-2025-destination-v1"
+  },
+  "benchmark": {
+    "workers": [
+      "local[2]",
+      "local[4]",
+      "local[8]"
+    ],
+    "data_fractions": [
+      0.1,
+      0.5,
+      1.0
+    ],
+    "fixed_worker_for_size_scaling": "local[4]",
+    "seed": 42,
+    "poll_interval_seconds": 0.25
   }
 }
