@@ -8,9 +8,9 @@ from typing import Any, Optional
 import pandas as pd
 from pyspark import StorageLevel
 from pyspark.ml import Pipeline, PipelineModel
-from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
+from pyspark.ml.classification import LogisticRegression, MultilayerPerceptronClassifier, RandomForestClassifier
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
-from pyspark.ml.feature import Imputer, OneHotEncoder, SQLTransformer, StringIndexer, VectorAssembler
+from pyspark.ml.feature import Imputer, OneHotEncoder, SQLTransformer, StandardScaler, StringIndexer, VectorAssembler
 from pyspark.ml.functions import vector_to_array
 from pyspark.sql import DataFrame, SparkSession, functions as F
 
@@ -35,6 +35,7 @@ INPUT_COLUMNS = [
 LOGISTIC_PARAMS = {"regParam": 0.01, "elasticNetParam": 0.0, "maxIter": 100, "tol": 1e-6}
 WEIGHTED_LOGISTIC = "class_weighted_logistic_regression"
 RANDOM_FOREST = "random_forest"
+MLP = "multilayer_perceptron"
 # maxBins=512 accommodates >300 airports plus StringIndexer's unknown bucket.
 RANDOM_FOREST_PARAMS = {
     "numTrees": 50,
@@ -43,6 +44,13 @@ RANDOM_FOREST_PARAMS = {
     "minInstancesPerNode": 50,
     "subsamplingRate": 0.8,
     "featureSubsetStrategy": "sqrt",
+    "seed": 42,
+}
+MLP_PARAMS = {
+    "hidden_layers": [64, 32],
+    "maxIter": 50,
+    "stepSize": 0.03,
+    "blockSize": 128,
     "seed": 42,
 }
 CLASS_WEIGHT_COL = "class_weight"
@@ -59,6 +67,7 @@ def build_preprocessor(
     *,
     empty_enroute: tuple[str, ...] = (),
     one_hot: bool = True,
+    scale: bool = False,
     feature_group: str = "full",
 ) -> Pipeline:
     """Build the feature vector for a specified ablation feature group in its established order."""
@@ -117,6 +126,9 @@ def build_preprocessor(
     if group["rotation"]:
         assembler_inputs.extend([f"{RECOVERY_FEATURES[0]}_filled", RECOVERY_FEATURES[1]])
     stages.append(VectorAssembler(inputCols=assembler_inputs, outputCol="features", handleInvalid="error"))
+    if scale:
+        # withMean=False preserves sparsity for one-hot encoded vectors.
+        stages.append(StandardScaler(inputCol="features", outputCol="scaled_features", withMean=False, withStd=True))
     return Pipeline(stages=stages)
 
 
@@ -324,14 +336,24 @@ def train(spark: SparkSession, gold_dir: Path, models_dir: Path, splits: dict) -
             print("  Skipping class-weighted logistic regression because training has one class.", flush=True)
         rf = RandomForestClassifier(featuresCol="features", labelCol=TARGET_COL, **RANDOM_FOREST_PARAMS)
         estimators.append((RANDOM_FOREST, rf, models_dir / RANDOM_FOREST))
+        mlp = MultilayerPerceptronClassifier(
+            featuresCol="scaled_features",
+            labelCol=TARGET_COL,
+            maxIter=MLP_PARAMS["maxIter"],
+            stepSize=MLP_PARAMS["stepSize"],
+            blockSize=MLP_PARAMS["blockSize"],
+            seed=MLP_PARAMS["seed"],
+        )
+        estimators.append((MLP, mlp, models_dir / MLP))
 
         algorithms = {}
         logistic_preprocessor = None
         for name, estimator, directory in estimators:
             weighted = name == WEIGHTED_LOGISTIC
             is_tree = name == RANDOM_FOREST
+            is_mlp = name == MLP
             algorithm_timings = {}
-            params = RANDOM_FOREST_PARAMS if is_tree else LOGISTIC_PARAMS
+            params = RANDOM_FOREST_PARAMS if is_tree else (MLP_PARAMS if is_mlp else LOGISTIC_PARAMS)
             print(f"  Fitting {name} on all training flights with fixed settings: {params}", flush=True)
             # Both logistic models share the one-hot mapping; tree models use indexed categories.
             if name == "logistic_regression":
@@ -341,6 +363,13 @@ def train(spark: SparkSession, gold_dir: Path, models_dir: Path, splits: dict) -
             elif is_tree:
                 with stage(f"{name}: fit preprocessing", timings=algorithm_timings, key="preprocessor_fit"):
                     active_preprocessor = build_preprocessor(empty_enroute=empty_enroute, one_hot=False).fit(train_features)
+            elif is_mlp:
+                with stage(f"{name}: fit preprocessing", timings=algorithm_timings, key="preprocessor_fit"):
+                    active_preprocessor = build_preprocessor(
+                        empty_enroute=empty_enroute, one_hot=True, scale=True
+                    ).fit(train_features)
+                input_dim = active_preprocessor.transform(train_features.limit(1)).first()["features"].size
+                estimator = estimator.setLayers([input_dim, *MLP_PARAMS["hidden_layers"], 2])
             else:
                 active_preprocessor = logistic_preprocessor
             with stage(f"{name}: fit classifier", timings=algorithm_timings, key="classifier_fit"):
@@ -392,6 +421,14 @@ def train(spark: SparkSession, gold_dir: Path, models_dir: Path, splits: dict) -
                     "min_instances_per_node": estimator.getMinInstancesPerNode(),
                     "subsampling_rate": estimator.getSubsamplingRate(),
                     "feature_subset_strategy": estimator.getFeatureSubsetStrategy(),
+                    "seed": estimator.getSeed(),
+                }
+            elif is_mlp:
+                model_params = {
+                    "layers": list(estimator.getLayers()),
+                    "max_iter": estimator.getMaxIter(),
+                    "step_size": estimator.getStepSize(),
+                    "block_size": estimator.getBlockSize(),
                     "seed": estimator.getSeed(),
                 }
             else:
