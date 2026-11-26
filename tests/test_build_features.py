@@ -144,14 +144,18 @@ class TestBuildFeatures(unittest.TestCase):
             self.assertEqual(aa["ArrHour"], 9)
             self.assertEqual(aa["ArrDel15"], 0)
             self.assertEqual(aa["is_federal_holiday"], 1)
-            self.assertEqual(aa["origin_departure_count_2h"], 1)
             self.assertEqual(aa["origin_departure_delay_rate_2h"], 1.0)
             self.assertEqual(aa["origin_departure_mean_delay_minutes_2h"], 30.0)
             self.assertEqual(aa["origin_departure_mean_taxi_out_2h"], 20.0)
-            self.assertEqual(aa["origin_departure_taxi_out_count_2h"], 1)
             self.assertEqual(aa["origin_departure_taxi_out_surge_2h"], 8.0)
             self.assertIsNone(aa["destination_arrival_delay_rate_2h"])
             self.assertTrue((gold / "_features.json").exists())
+            block = json.loads((gold / "_block_time.json").read_text())
+            self.assertEqual(block["history"]["status"], "absent")
+            for split in ("train", "val", "test"):
+                stored = self.spark.read.parquet(str(gold / split))
+                self.assertFalse(stored.where("outbound_schedule_slack_minutes is not null").take(1))
+                self.assertFalse(stored.where("outbound_schedule_slack_missing != 1").take(1))
 
             # DL flight: 2024-01-07 (Sunday -> DayOfWeek=7), dep 2400 -> hour 0, arr 0115 -> hour 1
             dl = train_records["2024-01-07_DL_202_ATL_ORD_2400"]

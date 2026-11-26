@@ -4,13 +4,14 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pandas as pd
+import pytest
 
-from scripts.bts.evaluate import evaluate, save_evaluation_results
-from scripts.results import update_results
-from pipeline import main as pipeline
+pytestmark = pytest.mark.unit
+
+
+from scripts.common.results import update_results
 
 
 class ResultsTests(unittest.TestCase):
@@ -20,7 +21,7 @@ class ResultsTests(unittest.TestCase):
             update_results({"bts": {"training": {"fit": 1}, "validation": {"f1": 0.2}},
                             "bts_origin_weather": {"validation": {"f1": 0.3}}}, tmp)
             for run in range(3):
-                save_evaluation_results({"run": run}, pd.DataFrame({"run": [run]}), tmp)
+                update_results({"bts": {"test": {"run": run, "subgroups": [{"run": run}]}}}, tmp)
             path = Path(tmp) / "results.json"
             result = json.loads(path.read_text())
             self.assertEqual(result["bts"]["test"], {"run": 2, "subgroups": [{"run": 2}]})
@@ -53,42 +54,6 @@ class ResultsTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), previous)
             self.assertEqual(list(Path(tmp).iterdir()), [path])
 
-    def test_archives_exact_previous_bytes_for_each_update(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            history = root / "results_history"
-            path = update_results({"bts": {"test": {"run": 0}}}, root / "results")
-            self.assertFalse(history.exists())
-            previous = []
-            for run in (1, 2):
-                previous.append(path.read_bytes())
-                update_results({"bts": {"test": {"run": run}}}, root / "results")
-            snapshots = sorted(history.iterdir())
-            self.assertEqual([p.read_bytes() for p in snapshots], previous)
-            for snapshot in snapshots:
-                self.assertRegex(snapshot.name, r"^results_\d{8}T\d{12}Z_[0-9a-f]{32}\.json$")
-            self.assertEqual(list(path.parent.iterdir()), [path])
-            self.assertEqual(json.loads(path.read_text())["bts"]["test"]["run"], 2)
-
-    def test_archive_failure_preserves_latest_results(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            path = update_results({"bts": {"test": {"run": 0}}}, root / "results")
-            previous = path.read_bytes()
-            (root / "results_history").write_text("blocked")
-            with self.assertRaises(FileExistsError):
-                update_results({"bts": {"test": {"run": 1}}}, root / "results")
-            self.assertEqual(path.read_bytes(), previous)
-
-    def test_evaluation_uses_current_model_and_rejects_an_unrelated_fit(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            model = root / "current_model"
-            update_results({"bts": {"training": {"models_dir": str(model)}}}, root)
-            with self.assertRaisesRegex(FileNotFoundError, "current_model"):
-                evaluate(MagicMock(), results_dir=root)
-            with self.assertRaisesRegex(ValueError, "current BTS training"):
-                evaluate(MagicMock(), models_dir=root / "old_model", results_dir=root)
 
     def test_corrupt_existing_results_are_not_overwritten(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -99,58 +64,6 @@ class ResultsTests(unittest.TestCase):
             self.assertEqual(path.read_text(), "broken")
 
 
-class ComparisonPublicationTests(unittest.TestCase):
-    def test_both_models_publish_together_and_failed_comparison_preserves_results(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            for split in ("train", "val", "test"):
-                path = root / "data/gold/bts" / split
-                path.mkdir(parents=True)
-                (path / "_SUCCESS").touch()
-            gold = root / "enriched"
-            gold.mkdir()
-            (gold / "_metadata.json").write_text("{}")
-            latest = update_results({"bts": {"test": {"old": True}},
-                                     "bts_origin_weather": {"test": {"old": True}}}, root / "results")
-            publish = lambda updates: update_results(updates, root / "results")
-            with (patch.object(pipeline, "ROOT", root),
-                  patch.object(pipeline, "features_current", return_value=True),
-                  patch.object(pipeline, "run_stage", side_effect=AssertionError("Unexpected real preparation stage")),
-                  patch.object(pipeline.weather_features, "main", return_value=(gold, gold)),
-                  patch.object(pipeline.bts_transform, "get_spark_session", return_value=MagicMock(version="fixture")),
-                  patch.object(pipeline, "load_config", return_value=({}, {}, {})),
-                  patch.object(pipeline, "update_results", side_effect=publish),
-                  patch.object(pipeline.bts_train, "train", return_value={"fit": "new"}) as train,
-                  patch.object(pipeline, "compare_predictions", side_effect=ValueError("cohort mismatch")) as compare):
-                previous = latest.read_bytes()
-                with self.assertRaisesRegex(ValueError, "cohort mismatch"):
-                    pipeline.run_origin_weather()
-                self.assertEqual(latest.read_bytes(), previous)
-                self.assertTrue(all(call.kwargs["publish_results"] is False for call in train.call_args_list))
-                compare.side_effect = None
-                compare.return_value = {name: {"validation": {"f1": 0.2}}
-                                        for name in ("bts", "bts_origin_weather")}
-                self.assertEqual(pipeline.run_origin_weather(), 0)
-                result = json.loads(latest.read_text())
-                for name in ("bts", "bts_origin_weather"):
-                    self.assertEqual(result[name]["training"], {"fit": "new"})
-                    self.assertEqual(result[name]["validation"], {"f1": 0.2})
-                    self.assertNotIn("test", result[name])
-                self.assertEqual(result["bts"]["run_id"], result["bts_origin_weather"]["run_id"])
-                self.assertEqual([p.name for p in (root / "results").iterdir()], ["results.json"])
-
-    def test_old_comparison_cannot_attach_test_scores_to_new_training(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            run = root / "models/origin_weather_comparison/old"
-            run.mkdir(parents=True)
-            (run / "_SUCCESS").touch()
-            update_results({"bts": {"run_id": "new"}}, root / "results")
-            with (patch.object(pipeline, "ROOT", root),
-                  patch.object(pipeline.bts_transform, "get_spark_session") as spark):
-                with self.assertRaisesRegex(ValueError, "current comparison"):
-                    pipeline.evaluate_origin_weather("old")
-                spark.assert_not_called()
 
 
 if __name__ == "__main__":

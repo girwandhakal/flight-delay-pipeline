@@ -1,23 +1,5 @@
 """Download and extract an inclusive range of monthly BTS flight files."""
 
-from datetime import datetime
-import json
-from pathlib import Path
-import shutil
-import time
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
-import zipfile
-
-from tqdm import tqdm
-
-ROOT = Path(__file__).resolve().parents[2]
-
-BTS_URL = "https://transtats.bts.gov/PREZIP/On_Time_Reporting_Carrier_On_Time_Performance_1987_present_{year}_{month}.zip"
-
-
-"""Download and extract an inclusive range of monthly BTS flight files."""
-
 from collections.abc import Iterator
 from datetime import datetime
 import json
@@ -31,7 +13,7 @@ import zipfile
 
 from tqdm import tqdm
 
-ROOT = Path(__file__).resolve().parents[2]
+from scripts.common.config import ROOT
 
 BTS_URL = (
     "https://transtats.bts.gov/PREZIP/"
@@ -242,20 +224,20 @@ def main() -> int:
 
             if csv_path.exists():
                 skipped += 1
-                print(f"  Reusing BTS file {csv_path} because it already exists.", flush=True)
+                print(f"    Reusing existing BTS CSV: {csv_path.name}", flush=True)
                 continue
 
             started = time.monotonic()
             if zip_path.exists():
-                print(f"  Reusing BTS archive {zip_path} because it already exists.", flush=True)
+                print(f"    Reusing existing BTS archive: {zip_path.name}", flush=True)
             else:
-                print(f"  Downloading BTS archive {zip_path} from {url}", flush=True)
+                print(f"    Downloading BTS archive {zip_path.name} from {url}", flush=True)
 
             download_file(url, zip_path)
-            print(f"  Extracting BTS file {csv_path}", flush=True)
+            print(f"    Extracting BTS CSV: {csv_path.name}", flush=True)
             extract_csv(zip_path, csv_path)
             completed += 1
-            print(f"  Prepared BTS file {csv_path} in {time.monotonic() - started:.1f}s.", flush=True)
+            print(f"    Prepared {csv_path.name} in {time.monotonic() - started:.1f}s.", flush=True)
 
         except (
             OSError,
@@ -279,4 +261,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

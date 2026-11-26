@@ -15,21 +15,24 @@ from pyspark.sql import DataFrame, Row, Window, functions as F
 
 from scripts.bts.cache import active
 from scripts.bts.download import iter_months
-from scripts.origin_weather.build_features import local_cutoff
-from scripts.origin_weather.download import project_path, reference_matches, sha256
+from scripts.common.config import project_path
+from scripts.common.io import reference_matches, sha256
+from scripts.common.references import airport_zone, load_airports
+from scripts.common.time_utils import (
+    clock_matches, event_zone, local_cutoff, scheduled_clocks, valid_delay,
+)
+from .block_time import BLOCK_TIME_SIDECAR, POLICY as BLOCK_TIME_POLICY, SLACK_FEATURES, resolve_block_history
 
 ROLLING_FEATURES = [
     f"{role}_{measurement}_2h"
     for role in ("origin_departure", "destination_arrival")
-    for measurement in ("delay_rate", "mean_delay_minutes", "count")
+    for measurement in ("delay_rate", "mean_delay_minutes")
 ]
-TAXI_MEAN, TAXI_SURGE, TAXI_COUNT = (
-    "origin_departure_mean_taxi_out_2h", "origin_departure_taxi_out_surge_2h", "origin_departure_taxi_out_count_2h",
-)
-TAXI_FEATURES = [TAXI_MEAN, TAXI_SURGE, TAXI_COUNT]
+TAXI_MEAN = "origin_departure_mean_taxi_out_2h"
+TAXI_SURGE = "origin_departure_taxi_out_surge_2h"
+TAXI_FEATURES = [TAXI_MEAN, TAXI_SURGE]
 ROLLING_FEATURES += TAXI_FEATURES
 TAXI_BASELINE_FILE = "_taxi_out_baselines.json"
-TAXI_AVAILABILITY_LAG_MINUTES = 15
 TAXI_BASELINE_FALLBACK_MINUTES = 12.0
 MAX_TAXI_MINUTES = 120.0
 HOLIDAY_FEATURES = [
@@ -37,18 +40,8 @@ HOLIDAY_FEATURES = [
     "is_day_before_federal_holiday",
     "is_day_after_federal_holiday",
 ]
-UPSTREAM_ROLES = {"origin": (0, 60), "dest": (-30, 30)}
-UPSTREAM_FEATURES = [
-    f"{role}_upstream_{metric}"
-    for role in UPSTREAM_ROLES
-    for metric in ("delay_pressure", "scheduled_arrivals", "observed_share")
-]
-UPSTREAM_SNAPSHOT_MINUTES = 15
-UPSTREAM_LAG_MINUTES = 15
-UPSTREAM_HISTORY_MINUTES = 120
-UPSTREAM_EDGE_HOURS = 48
 DELAY_THRESHOLD_MINUTES = 15
-FEATURES = ROLLING_FEATURES + HOLIDAY_FEATURES + UPSTREAM_FEATURES
+FEATURES = ROLLING_FEATURES + HOLIDAY_FEATURES
 EVENT_COLUMNS = [
     "FlightDate", "Reporting_Airline", "Flight_Number_Reporting_Airline", "Origin", "Dest",
     "CRSDepTime", "CRSElapsedTime", "DepTime", "DepDelay", "ArrTime", "ArrDelay", "Diverted",
@@ -70,24 +63,17 @@ def feature_policy(root: Union[str, Path], config: dict[str, Any]) -> dict[str, 
             raise ValueError(f"Reference changed: {name}")
 
     return {
-        "version": 3,
+        "version": 8,
         "rolling_window_minutes": window,
         "event_availability": "immediate",
         "delay_threshold_minutes": DELAY_THRESHOLD_MINUTES,
         "holiday_calendar": "USFederalHolidayCalendar_actual_and_observed",
-        "columns": FEATURES,
+        "columns": [*FEATURES, *SLACK_FEATURES],
+        "outbound_schedule_slack": BLOCK_TIME_POLICY,
         "splits": config["splits"],
         "reference_files": sources["files"],
-        "upstream": {
-            "windows_minutes": {role: list(bounds) for role, bounds in UPSTREAM_ROLES.items()},
-            "snapshot_minutes": UPSTREAM_SNAPSHOT_MINUTES,
-            "availability_lag_minutes": UPSTREAM_LAG_MINUTES,
-            "history_minutes": UPSTREAM_HISTORY_MINUTES,
-            "uncovered_edge_hours": UPSTREAM_EDGE_HOURS,
-        },
         "taxi_out": {
-            "availability": "verified wheels-off plus assumed reporting lag",
-            "availability_lag_minutes": TAXI_AVAILABILITY_LAG_MINUTES,
+            "availability": "verified wheels-off",
             "max_observation_minutes": MAX_TAXI_MINUTES,
             "fallback_baseline_minutes": TAXI_BASELINE_FALLBACK_MINUTES,
             "baseline_percentile": 0.15,
@@ -97,12 +83,7 @@ def feature_policy(root: Union[str, Path], config: dict[str, Any]) -> dict[str, 
 
 
 def feature_months(settings):
-    core = {date(year, month, 1) for year, month in iter_months(settings["start_month"], settings["end_month"])}
-    # Adjacent schedules contribute to windows at the study boundaries, but
-    # their flights never enter the model cohort.
-    previous = (min(core) - timedelta(days=1)).replace(day=1)
-    following = (max(core) + timedelta(days=32)).replace(day=1)
-    return core, {previous, following}
+    return {date(year, month, 1) for year, month in iter_months(settings["start_month"], settings["end_month"])}
 
 
 def file_fingerprints(directory: Path, pattern: str, months) -> list[dict[str, Any]]:
@@ -123,15 +104,18 @@ def feature_manifest(
     config: dict[str, Any],
     bronze_dir: Optional[Union[str, Path]] = None,
     silver_dir: Optional[Union[str, Path]] = None,
+    block_history: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Build a complete provenance dictionary covering policy and input files."""
     root = Path(root)
     bronze = Path(bronze_dir or project_path(root, config["datasets"]["bts"]["output_directory"]))
     silver = Path(silver_dir or active(root, "silver"))
-    core, adjacent = feature_months(config["datasets"]["bts"])
+    core = feature_months(config["datasets"]["bts"])
     return {
         **feature_policy(root, config),
-        "bronze_files": file_fingerprints(bronze, "*.csv", core | adjacent),
+        "block_time_code_sha256": sha256(Path(__file__).with_name("block_time.py")),
+        "block_history": block_history if block_history is not None else resolve_block_history(root, config, bronze_dir),
+        "bronze_files": file_fingerprints(bronze, "*.csv", core),
         "silver_files": file_fingerprints(silver, "*.parquet", core),
     }
 
@@ -148,95 +132,11 @@ def features_current(root: Union[str, Path], config: dict[str, Any]) -> bool:
             isinstance(recorded, dict)
             and all((gold / split / "_SUCCESS").exists() for split in config["splits"])
             and recorded.pop("taxi_baselines_sha256") == sha256(gold / TAXI_BASELINE_FILE)
-            and isinstance(recorded.pop("upstream_coverage"), dict)
+            and recorded.pop("block_time_sha256") == sha256(gold / BLOCK_TIME_SIDECAR)
             and recorded == feature_manifest(root, config)
         )
     except (KeyError, OSError, ValueError):
         return False
-
-
-def load_airports(directory: Union[str, Path]) -> dict[str, list[dict[str, Any]]]:
-    """Load and validate historical airport reference intervals from airports.csv.
-
-    Args:
-        directory: Directory containing airports.csv.
-
-    Returns:
-        Mapping from 3-letter IATA airport code to valid date-interval rows.
-    """
-    with (Path(directory) / "airports.csv").open(encoding="utf-8", newline="") as stream:
-        rows = list(csv.DictReader(stream))
-
-    by_airport = {}
-    for row in rows:
-        ZoneInfo(row["time_zone"])
-        if row["valid_from"] >= row["valid_to"]:
-            raise ValueError("Airport reference interval must be nonempty.")
-        by_airport.setdefault(row["Origin"], []).append(row)
-
-    # Confirm intervals for each airport are mutually disjoint
-    for intervals in by_airport.values():
-        ordered = sorted(intervals, key=lambda r: r["valid_from"])
-        if any(a["valid_to"] > b["valid_from"] for a, b in zip(ordered, ordered[1:])):
-            raise ValueError("Airport reference intervals overlap.")
-
-    return by_airport
-
-
-def airport_zone(
-    airports: dict[str, list[dict[str, Any]]],
-    airport: str,
-    flight_date: Optional[date],
-) -> Optional[str]:
-    """Look up the valid IANA time zone for an airport on a specific service date."""
-    if flight_date is None:
-        return None
-    iso_date = flight_date.isoformat()
-    return next(
-        (
-            r["time_zone"]
-            for r in airports.get(airport, [])
-            if r["valid_from"] <= iso_date < r["valid_to"]
-        ),
-        None,
-    )
-
-
-def valid_delay(value: Any) -> Optional[float]:
-    """Safely convert numeric delay tokens to float, returning None for non-finite values."""
-    try:
-        result = float(value)
-        return result if math.isfinite(result) else None
-    except (TypeError, ValueError):
-        return None
-
-
-def clock_matches(instant: datetime, clock: Any, zone: Optional[str]) -> bool:
-    """Verify that an instant converted to a local time zone matches an HHMM clock string."""
-    spelling = str(clock).strip()
-    if not spelling.isdigit() or len(spelling) > 4 or not zone:
-        return False
-
-    hours, minutes = divmod(int(spelling), 100)
-    if (hours, minutes) != (24, 0) and not (0 <= hours < 24 and 0 <= minutes < 60):
-        return False
-
-    local = instant.replace(tzinfo=timezone.utc).astimezone(ZoneInfo(zone))
-    return (local.hour, local.minute) == (hours % 24, minutes)
-
-
-def event_zone(
-    airports: dict[str, list[dict[str, Any]]],
-    airport: str,
-    instant: datetime,
-) -> Optional[str]:
-    """Identify the unique airport time zone covering an event instant."""
-    zones = {
-        r["time_zone"]
-        for r in airports.get(airport, [])
-        if r["valid_from"] <= instant.replace(tzinfo=timezone.utc).astimezone(ZoneInfo(r["time_zone"])).date().isoformat() < r["valid_to"]
-    }
-    return next(iter(zones)) if len(zones) == 1 else None
 
 
 def event_clocks(row: Row, airports: dict[str, list[dict[str, Any]]]) -> tuple[Optional[str], Optional[str]]:
@@ -268,28 +168,6 @@ def event_clocks(row: Row, airports: dict[str, list[dict[str, Any]]]) -> tuple[O
         return None, None
 
     return departure, arrival
-
-
-def scheduled_clocks(
-    row: Any,
-    airports: dict,
-) -> tuple[Optional[str], Optional[str]]:
-    """Resolve scheduled UTC clocks using only schedule fields."""
-    scheduled, _ = local_cutoff(
-        row.FlightDate, row.CRSDepTime, airport_zone(airports, row.Origin, row.FlightDate)
-    )
-    if scheduled is None:
-        return None, None
-    elapsed = valid_delay(row.CRSElapsedTime)
-    scheduled_arrival = None
-    if elapsed is not None and elapsed > 0:
-        try:
-            instant = scheduled + timedelta(minutes=elapsed)
-            if clock_matches(instant, row.CRSArrTime, event_zone(airports, row.Dest, instant)):
-                scheduled_arrival = instant.isoformat() + "Z"
-        except (OverflowError, ValueError):
-            pass
-    return scheduled.isoformat() + "Z", scheduled_arrival
 
 
 def build_events(raw: DataFrame, airports: dict[str, list[dict[str, Any]]]) -> DataFrame:
@@ -368,7 +246,28 @@ def add_cutoffs(flights: DataFrame, airports: dict[str, list[dict[str, Any]]]) -
         return instant.isoformat() + "Z" if instant else None
 
     convert = F.udf(cutoff, "string")
-    return flights.withColumn("_cutoff", F.to_timestamp(convert("FlightDate", "CRSDepTime", "Origin")))
+    # Deduplicate schedule keys before Python UDF serialization, preserving null-safe matches.
+    keys = (
+        flights.select("FlightDate", "CRSDepTime", "Origin")
+        .distinct()
+        .withColumn("_cutoff", F.to_timestamp(convert("FlightDate", "CRSDepTime", "Origin")))
+        .select(
+            F.col("FlightDate").alias("_k_date"),
+            F.col("CRSDepTime").alias("_k_clock"),
+            F.col("Origin").alias("_k_origin"),
+            "_cutoff",
+        )
+    )
+    return (
+        flights.join(
+            keys,
+            flights.FlightDate.eqNullSafe(keys._k_date)
+            & flights.CRSDepTime.eqNullSafe(keys._k_clock)
+            & flights.Origin.eqNullSafe(keys._k_origin),
+            "left",
+        )
+        .drop("_k_date", "_k_clock", "_k_origin")
+    )
 
 
 def add_recent_delays(flights: DataFrame, events: DataFrame, window_minutes: int = 120) -> DataFrame:
@@ -383,7 +282,7 @@ def add_recent_delays(flights: DataFrame, events: DataFrame, window_minutes: int
         window_minutes: Lookback window duration (default 120 minutes).
 
     Returns:
-        Enriched flights DataFrame with rolling delay rates, means, and counts.
+        Enriched flights DataFrame with rolling delay rates, means, and taxi-out features.
     """
     # 1. Build query points at flight cutoff time for origin departure and destination arrival
     queries = flights.select(
@@ -396,9 +295,7 @@ def add_recent_delays(flights: DataFrame, events: DataFrame, window_minutes: int
                 "flight_id",
                 F.col(airport).alias("airport"),
                 F.lit(role).alias("role"),
-                (F.col("event_seconds") - (TAXI_AVAILABILITY_LAG_MINUTES * 60 if role == "taxi" else 0)).alias(
-                    "event_seconds"
-                ),
+                "event_seconds",
                 F.lit(None).cast("double").alias("minutes"),
             )
         )
@@ -455,13 +352,11 @@ def add_recent_delays(flights: DataFrame, events: DataFrame, window_minutes: int
         for value, name in (
             (F.when(F.col("n") > 0, F.col("delayed") / F.col("n")), "delay_rate"),
             (F.when(F.col("n") > 0, F.col("total_minutes") / F.col("n")), "mean_delay_minutes"),
-            (F.col("n"), "count"),
         ):
             expressions.append(F.max(F.when(F.col("role") == role, value)).alias(f"{prefix}_{name}_2h"))
 
     expressions += [
         F.max(F.when(taxi & (F.col("n") > 0), F.col("total_minutes") / F.col("n"))).alias(TAXI_MEAN),
-        F.max(F.when(taxi, F.col("n"))).alias(TAXI_COUNT),
     ]
     return flights.join(stats.groupBy("flight_id").agg(*expressions), "flight_id", "left").drop("_cutoff")
 
@@ -487,7 +382,7 @@ def compute_unimpeded_taxi_baselines(
     eligible = events.where("role = 'taxi'").join(training, "flight_id")
     return (eligible.join(F.broadcast(dates), "airport")
             .where((F.col("FlightDate") < F.col("first_day"))
-                   & (F.col("event_seconds") + TAXI_AVAILABILITY_LAG_MINUTES * 60 < F.col("bound_seconds")))
+                   & (F.col("event_seconds") < F.col("bound_seconds")))
             .groupBy(F.col("airport").alias("Origin"), "taxi_snapshot")
             .agg(F.percentile_approx("minutes", 0.15).alias("unimpeded_taxi_minutes")))
 
