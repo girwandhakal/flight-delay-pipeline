@@ -14,6 +14,8 @@ from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.sql import DataFrame, SparkSession, functions as F
 
 from scripts.common.config import ROOT, project_path
+from scripts.common.context import PipelineContext
+from scripts.common.progress import stage
 from scripts.common.spark import get_spark_session
 from scripts.common.results import records, update_results
 
@@ -227,6 +229,15 @@ def evaluate(spark: SparkSession, root: Path, run_id: str) -> dict[str, Any]:
     }
     update_results({RESULT_KEY: {"test": summary}}, root / "results")
     return summary
+
+
+def run(ctx: PipelineContext) -> dict[str, Any]:
+    """Score the current run on the frozen test split and print the test report."""
+    with stage("Frozen Test Evaluation", timings=ctx.timings, key="test_evaluation"):
+        summary = evaluate(ctx.spark, ctx.root, ctx.run_id)
+        print(format_classification_report(ctx.run_id, summary["models"], split="TEST"), flush=True)
+        print(f"Test scores saved for {ctx.run_id} (attempt {summary['attempt_id']}).", flush=True)
+        return summary
 
 
 def main() -> int:

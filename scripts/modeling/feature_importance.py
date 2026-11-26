@@ -32,8 +32,7 @@ MODEL_DIRS: dict[str, tuple[str, str]] = {
 }
 
 FEATURE_GROUP_MAP: dict[str, str] = {
-    **{name: "bts_schedule" for name in (*CATEGORICAL_FEATURES, *NUMERIC_FEATURES, "MonthSin", "MonthCos", *HOLIDAY_FEATURES)},
-    **{name: "airport_activity_taxi" for name in ROLLING_FEATURES},
+    **{name: "bts_schedule" for name in (*CATEGORICAL_FEATURES, *NUMERIC_FEATURES, "MonthSin", "MonthCos", *HOLIDAY_FEATURES, *ROLLING_FEATURES)},
     **{name: "surface_weather" for name in (*WEATHER_NUMERIC, *WEATHER_FLAGS, *DESTINATION_WEATHER_NUMERIC, *DESTINATION_WEATHER_FLAGS)},
     **{name: "aircraft_rotation_slack" for name in (*ROTATION_NUMERIC, *ROTATION_FLAGS, *RECOVERY_FEATURES, *SLACK_FEATURES)},
     **{name: "enroute_weather" for name in ENROUTE_FEATURES},

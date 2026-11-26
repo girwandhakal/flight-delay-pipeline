@@ -2,8 +2,8 @@
 
 from scripts.common.context import PipelineContext
 from scripts.common.progress import pipeline_stage, stage
-from . import build_features, clean, download
-from .cache import active, current_partitions, features_current
+from . import download
+from .cache import active, current_partitions, features_current, prepare
 
 
 def run(ctx: PipelineContext) -> None:
@@ -17,9 +17,9 @@ def run(ctx: PipelineContext) -> None:
                 if status:
                     raise RuntimeError(f"BTS download failed with exit code {status}.")
             with stage("Clean raw BTS CSVs into BTS Silver Parquet"):
-                clean.clean_bts_data(ctx.spark, publish_results=False)
+                prepare(ctx.spark, ctx.root, "silver", publish_results=False)
             with stage("Build BTS Gold features and chronological splits"):
-                build_features.build_features(ctx.spark, publish_results=False)
+                prepare(ctx.spark, ctx.root, "gold", publish_results=False)
 
         bts_gold = active(ctx.root, "gold")
         ctx.gold_dir = bts_gold

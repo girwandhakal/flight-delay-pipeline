@@ -109,7 +109,6 @@ def test_logistic_and_rf_extraction_and_export(spark, tmp_path: Path) -> None:
     lr_groups = {g["feature_group"]: g for g in payload["models"]["logistic_regression"]["group_totals"]}
     assert set(lr_groups.keys()) == {
         "bts_schedule",
-        "airport_activity_taxi",
         "surface_weather",
         "aircraft_rotation_slack",
         "enroute_weather",

@@ -33,9 +33,12 @@ def get_spark_session(app_name: str = "flight_delay") -> SparkSession:
     if str(ROOT) not in python_path.split(os.pathsep):
         # Ensure Spark workers can import the project scripts package.
         os.environ["PYTHONPATH"] = str(ROOT) + (os.pathsep + python_path if python_path else "")
+    local_tmp_dir = ROOT / ".spark_tmp"
+    local_tmp_dir.mkdir(parents=True, exist_ok=True)
     return (
         SparkSession.builder.master("local[4]")
         .appName(app_name)
+        .config("spark.local.dir", str(local_tmp_dir))
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.driver.bindAddress", "127.0.0.1")
         .config("spark.driver.memory", "6g")
