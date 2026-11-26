@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from datetime import date
 import json
+import os
 from unittest.mock import Mock
 
 import pytest
@@ -10,7 +11,7 @@ from pyspark.sql import DataFrameReader, functions as F
 
 from pipeline import main as pipeline
 from scripts.common.context import PipelineContext
-from scripts.common.results import update_results
+from scripts.common.results import record_stage_timings, update_results
 from scripts.common.stage_cache import resolve_stage
 from scripts.modeling import evaluate as scoring
 from scripts.modeling import run, train
@@ -134,6 +135,21 @@ def test_main_publishes_validation(tmp_path, monkeypatch):
     assert list((tmp_path / run.RUNS_DIR).glob("*/_SUCCESS")) == [report.parent / "_SUCCESS"]
     assert spark.stop.call_count == 3
 
+    timings_file = tmp_path / "results/stage_timings.json"
+    assert len(json.loads(timings_file.read_text())) == 1
+    record_stage_timings(
+        "test_run_003",
+        "2026-11-25T15:00:00-06:00",
+        {"Stage 1": 12.345, "Stage 6": 4.567},
+        17.0,
+        tmp_path / "results",
+    )
+    history = json.loads(timings_file.read_text())
+    assert len(history) == 2
+    assert history[1]["run_id"] == "test_run_003"
+    assert history[1]["total_seconds"] == 17.0
+    assert history[1]["stages"] == {"Stage 1": 12.35, "Stage 6": 4.57}
+
 
 @pytest.mark.unit
 def test_model_retention_rollback_and_legacy_cleanup(tmp_path, monkeypatch):
@@ -175,6 +191,12 @@ def test_model_retention_rollback_and_legacy_cleanup(tmp_path, monkeypatch):
         legacy = models_root / name / "old_run"
         legacy.mkdir(parents=True)
         (legacy / "weights.bin").write_bytes(b"legacy")
+
+    # Verify Windows MAX_PATH (>260 chars) nested Spark metadata trees are measured and pruned safely.
+    deep_dir = models_root / "destination_weather_comparison" / ("nested_" * 20) / "metadata"
+    os.makedirs(run.fs_path(deep_dir), exist_ok=True)
+    with open(run.fs_path(deep_dir / "part-00000.snappy.parquet"), "wb") as handle:
+        handle.write(b"deep")
 
     # Refuse legacy cleanup before any active completed flight_delay run exists.
     with pytest.raises(ValueError, match="active flight_delay run"):

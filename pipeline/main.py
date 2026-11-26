@@ -13,6 +13,7 @@ from scripts.bts import run as bts
 from scripts.common.cleanup import cleanup_workspace, format_cleanup_summary
 from scripts.common.context import PipelineContext
 from scripts.common.progress import DIVIDER
+from scripts.common.results import record_stage_timings
 from scripts.common.spark import spark_session
 from scripts.destination_weather import run as destination_weather
 from scripts.enroute_weather import run as enroute_weather
@@ -55,7 +56,9 @@ def main() -> int:
     summary = cleanup_workspace(ctx.root)
     if summary.removed_dirs:
         print(format_cleanup_summary(summary), flush=True)
-    print_pipeline_summary(ctx, report, time.monotonic() - started)
+    total_seconds = time.monotonic() - started
+    record_stage_timings(ctx.run_id, started_at, ctx.timings, total_seconds, ctx.root / "results")
+    print_pipeline_summary(ctx, report, total_seconds)
     return 0
 
 

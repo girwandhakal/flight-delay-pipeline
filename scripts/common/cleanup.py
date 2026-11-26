@@ -4,10 +4,10 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
-import shutil
 from typing import Any, Optional
 
 from .config import project_path
+from .io import dir_size_bytes, rmtree_retry
 
 STAGE_CACHE_ROOTS = (
     Path("data/silver/bts_generations"),
@@ -48,18 +48,6 @@ def _read_json(path: Path) -> Any:
         return None
 
 
-def _dir_size_bytes(path: Path) -> int:
-    """Return total regular-file bytes under a directory without following symlinks."""
-    total = 0
-    for item in path.rglob("*"):
-        if not item.is_symlink() and item.is_file():
-            try:
-                total += item.stat().st_size
-            except OSError:
-                pass
-    return total
-
-
 def _safe_delete_dir(candidate: Path, allowed_root: Path, root: Path) -> int:
     """Validate containment under `allowed_root`, refuse symlinks, and delete `candidate`."""
     if candidate.is_symlink():
@@ -73,8 +61,8 @@ def _safe_delete_dir(candidate: Path, allowed_root: Path, root: Path) -> int:
         raise ValueError(f"Cleanup root escapes workspace: {allowed_root}")
     if not resolved_candidate.is_relative_to(resolved_allowed) or resolved_candidate == resolved_allowed:
         raise ValueError(f"Refusing cleanup path outside {allowed_root}: {candidate}")
-    freed = _dir_size_bytes(candidate)
-    shutil.rmtree(candidate)
+    freed = dir_size_bytes(candidate)
+    rmtree_retry(candidate)
     return freed
 
 

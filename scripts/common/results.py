@@ -70,3 +70,38 @@ def update_results(
         replace_file(staged, path)
 
     return path
+
+
+def record_stage_timings(
+    run_id: str,
+    started_at: str,
+    timings: dict[str, float],
+    total_seconds: float,
+    results_dir: Optional[Union[str, Path]] = None,
+) -> Path:
+    """Append a completed run's per-stage and total durations to results/stage_timings.json."""
+    path = Path(results_dir or ROOT / "results") / "stage_timings.json"
+    history: list[dict[str, Any]] = []
+    if path.exists():
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, list):
+            raise ValueError(f"Expected a JSON list in {path}")
+        history = loaded
+
+    history.append({
+        "run_id": run_id,
+        "started_at": started_at,
+        "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "total_seconds": round(total_seconds, 2),
+        "stages": {name: round(elapsed, 2) for name, elapsed in timings.items()},
+    })
+
+    serialized = json.dumps(history, indent=2, allow_nan=False) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Stage inside the target directory so atomic replace stays on the same filesystem.
+    with tempfile.TemporaryDirectory(prefix=".timings-", dir=path.parent) as tmp:
+        staged = Path(tmp) / "stage_timings.json"
+        staged.write_text(serialized, encoding="utf-8")
+        replace_file(staged, path)
+
+    return path

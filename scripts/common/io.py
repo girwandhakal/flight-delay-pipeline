@@ -3,7 +3,10 @@
 from collections.abc import Iterable
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
+import stat
 import time
 from typing import Any, Union
 from urllib.error import HTTPError, URLError
@@ -101,3 +104,52 @@ def fetch(
                 raise
             time.sleep(2 ** attempt)
     raise RuntimeError(f"Download failed unexpectedly: {url}")
+
+
+def fs_path(path: Path) -> str:
+    """Return an extended-length path on Windows so deep Spark trees never hit MAX_PATH."""
+    resolved = str(path.resolve())
+    if os.name == "nt" and not resolved.startswith("\\\\?\\"):
+        if resolved.startswith("\\\\"):
+            return "\\\\?\\UNC\\" + resolved[2:]
+        return "\\\\?\\" + resolved
+    return resolved
+
+
+def dir_size_bytes(path: Path) -> int:
+    """Return total regular-file bytes under a directory without following symlinks."""
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(fs_path(path), followlinks=False, onerror=lambda _err: None):
+        for name in filenames:
+            try:
+                total += os.stat(os.path.join(dirpath, name), follow_symlinks=False).st_size
+            except OSError:
+                pass
+    return total
+
+
+def rmtree_retry(path: Path) -> None:
+    """Delete a directory tree, clearing read-only bits and retrying transient Windows locks."""
+    target = fs_path(path)
+
+    def _handle_readonly(func, failed_path, exc_info):
+        if isinstance(exc_info[1], PermissionError):
+            try:
+                os.chmod(failed_path, stat.S_IWRITE)
+                func(failed_path)
+                return
+            except OSError:
+                pass
+        raise exc_info[1]
+
+    for attempt in range(6):
+        try:
+            shutil.rmtree(target, onerror=_handle_readonly)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if attempt == 5:
+                raise
+            # Exponential backoff for transient OneDrive/Windows Defender directory locks.
+            time.sleep(0.1 * (2 ** attempt))

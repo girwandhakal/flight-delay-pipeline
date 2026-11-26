@@ -8,7 +8,7 @@ from typing import Any
 
 from scripts.common.config import project_path
 from scripts.common.context import PipelineContext
-from scripts.common.io import sha256, write_json
+from scripts.common.io import dir_size_bytes, fs_path, rmtree_retry, sha256, write_json
 from scripts.common.progress import DIVIDER, pipeline_stage
 from scripts.common.results import update_results
 from scripts.common.stage_cache import consumed
@@ -29,18 +29,6 @@ LEGACY_MODEL_DIRS = (
 )
 
 
-def _dir_size_bytes(path: Path) -> int:
-    """Return total regular-file bytes under a directory without following symlinks."""
-    total = 0
-    for item in path.rglob("*"):
-        if not item.is_symlink() and item.is_file():
-            try:
-                total += item.stat().st_size
-            except OSError:
-                pass
-    return total
-
-
 def _safe_prune_entry(candidate: Path, expected_parent: Path) -> int:
     """Validate containment, refuse symlinks, and remove an obsolete model entry."""
     if candidate.is_symlink():
@@ -50,8 +38,8 @@ def _safe_prune_entry(candidate: Path, expected_parent: Path) -> int:
     if resolved_candidate.parent != resolved_parent or not resolved_candidate.is_relative_to(resolved_parent):
         raise ValueError(f"Refusing path outside {expected_parent}: {candidate}")
     if candidate.is_dir():
-        freed = _dir_size_bytes(candidate)
-        shutil.rmtree(candidate)
+        freed = dir_size_bytes(candidate)
+        rmtree_retry(candidate)
         return freed
     freed = candidate.stat().st_size
     candidate.unlink()
@@ -105,7 +93,7 @@ def _entry_size_bytes(path: Path) -> int:
         return 0
     if not path.is_dir():
         return path.stat().st_size
-    return _dir_size_bytes(path)
+    return dir_size_bytes(path)
 
 
 def gold_identity(gold: Path, splits: tuple[str, ...]) -> dict:

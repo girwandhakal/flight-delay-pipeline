@@ -2,12 +2,13 @@
 
 import os
 from pathlib import Path
+import stat
 
 import pytest
 
 from scripts.common import cleanup
 from scripts.common import stage_cache as cache
-from scripts.common.io import write_json
+from scripts.common.io import rmtree_retry, write_json
 
 pytestmark = pytest.mark.unit
 
@@ -206,3 +207,13 @@ def test_cleanup_workspace_preserves_pinned_and_newest_and_prunes_obsolete(tmp_p
     assert not enr_old.exists()
     assert not aborted_enr.exists()
     assert not run_aborted.exists()
+
+
+def test_rmtree_retry_clears_readonly_files(tmp_path):
+    target = tmp_path / "readonly_tree/nested"
+    target.mkdir(parents=True)
+    locked = target / "locked.bin"
+    locked.write_bytes(b"data")
+    os.chmod(locked, stat.S_IREAD)
+    rmtree_retry(tmp_path / "readonly_tree")
+    assert not (tmp_path / "readonly_tree").exists()
