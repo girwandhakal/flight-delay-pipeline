@@ -19,7 +19,7 @@ from scripts.common.results import record_stage_timings
 from scripts.common.spark import spark_session
 from scripts.destination_weather import run as destination_weather
 from scripts.enroute_weather import run as enroute_weather
-from scripts.modeling import ablation, run as modeling
+from scripts.modeling import ablation, feature_importance, run as modeling
 from scripts.origin_weather import run as origin_weather
 
 
@@ -86,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
         aircraft_rotation.run(ctx)
         enroute_weather.run(ctx)
         report = modeling.run(ctx)
+        feature_importance.run(ctx)
 
     summary = cleanup_workspace(ctx.root)
     if summary.removed_dirs:
