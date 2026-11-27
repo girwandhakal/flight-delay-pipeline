@@ -10,6 +10,7 @@ import time
 # Support direct execution with `python pipeline/main.py`.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from scripts import reporting
 from scripts.aircraft_rotation import run as aircraft_rotation
 from scripts.bts import run as bts
 from scripts.common.benchmark import run_benchmark_suite
@@ -53,6 +54,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--force-retrain",
         action="store_true",
         help="Bypass the Phase 1 model cache and force retraining from scratch.",
+    )
+    parser.add_argument(
+        "--reporting-only",
+        action="store_true",
+        help="Run only the reporting stage to generate publication figures from existing results/.",
     )
     return parser.parse_args(argv)
 
@@ -106,18 +112,30 @@ def _run_phase1(ctx: PipelineContext, *, run_ablation: bool = False) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Execute Phase 1 and optional Phase 2 (benchmarks) / Phase 3 (ablation) by CLI flags."""
+    """Execute Phase 1 and optional Phase 2 (benchmarks) / Phase 3 (ablation) / reporting."""
     args = parse_args(argv)
     started = time.monotonic()
     started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     ctx = PipelineContext.create()
     ctx.force_retrain = args.force_retrain
 
+    if args.reporting_only:
+        print(DIVIDER, flush=True)
+        print(f"REPORTING ONLY | Run ID: {ctx.run_id}", flush=True)
+        print(f"Started at: {started_at}", flush=True)
+        print(DIVIDER, flush=True)
+        with stage("Reporting: Publication Figures", timings=ctx.timings, key="reporting"):
+            written = reporting.run(ctx.root)
+        total_seconds = time.monotonic() - started
+        print(f"Reporting completed in {total_seconds:.1f}s ({len(written)} figure(s)).", flush=True)
+        return 0
+
     modes = ["PHASE 1 (PIPELINE & EVALUATION)"]
     if args.benchmark:
         modes.append("PHASE 2 (BENCHMARKS)")
     if args.ablation:
         modes.append("PHASE 3 (ABLATION)")
+    modes.append("REPORTING")
 
     print(DIVIDER, flush=True)
     print(f"{' -> '.join(modes)} | Run ID: {ctx.run_id}", flush=True)
@@ -140,6 +158,9 @@ def main(argv: list[str] | None = None) -> int:
             ctx.spark = spark
             ablation.run_ablation(ctx)
         ctx.spark = None
+
+    with stage("Reporting: Publication Figures", timings=ctx.timings, key="reporting"):
+        reporting.run(ctx.root)
 
     summary = cleanup_workspace(ctx.root)
     if summary.removed_dirs:
