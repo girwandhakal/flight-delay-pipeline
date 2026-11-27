@@ -47,8 +47,8 @@ RANDOM_FOREST_PARAMS = {
     "seed": 42,
 }
 MLP_PARAMS = {
-    "hidden_layers": [64, 32],
-    "maxIter": 50,
+    "hidden_layers": [32, 16],
+    "maxIter": 20,
     "stepSize": 0.03,
     "blockSize": 128,
     "seed": 42,
