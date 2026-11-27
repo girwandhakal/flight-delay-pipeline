@@ -16,6 +16,7 @@ import psutil
 import pyspark
 
 from .config import ROOT
+from .io import rmtree_retry
 from .results import replace_file
 from .spark import get_spark_session
 
@@ -55,22 +56,41 @@ def run_with_memory_monitor(
 ) -> dict[str, Any]:
     """Run a command in a subprocess while polling peak RSS memory (GB) and wall time (s)."""
     started = time.monotonic()
-    process = subprocess.Popen(
-        cmd,
-        cwd=str(cwd or ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    ps_proc = psutil.Process(process.pid)
-    peak_rss_bytes = 0
+    with tempfile.TemporaryDirectory(prefix=".benchmark-io-", ignore_cleanup_errors=True) as tmp_dir:
+        stdout_path = Path(tmp_dir) / "stdout.log"
+        stderr_path = Path(tmp_dir) / "stderr.log"
+        # Redirect to temp files instead of PIPE so Spark logs/progress bars never fill the OS pipe buffer and deadlock.
+        with stdout_path.open("w+", encoding="utf-8", errors="replace") as stdout_file, stderr_path.open(
+            "w+", encoding="utf-8", errors="replace"
+        ) as stderr_file:
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(cwd or ROOT),
+                stdout=stdout_file,
+                stderr=stderr_file,
+                text=True,
+            )
+            ps_proc = psutil.Process(process.pid)
+            peak_rss_bytes = 0
 
-    while process.poll() is None:
-        peak_rss_bytes = max(peak_rss_bytes, _sample_process_tree_rss_bytes(ps_proc))
-        time.sleep(poll_interval)
+            while process.poll() is None:
+                peak_rss_bytes = max(peak_rss_bytes, _sample_process_tree_rss_bytes(ps_proc))
+                time.sleep(poll_interval)
 
-    stdout, stderr = process.communicate()
-    elapsed = time.monotonic() - started
+            process.wait()
+            elapsed = time.monotonic() - started
+            stdout_file.flush()
+            stderr_file.flush()
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read()
+            stderr = stderr_file.read()
+
+        # Retry transient Windows file locks from exiting Spark child processes without failing the run.
+        try:
+            rmtree_retry(Path(tmp_dir))
+        except PermissionError:
+            pass
     if process.returncode != 0:
         raise RuntimeError(
             f"Benchmark subprocess failed (exit {process.returncode}): {' '.join(cmd)}\n{stderr}"

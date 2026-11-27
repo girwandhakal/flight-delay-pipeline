@@ -62,6 +62,17 @@ def test_run_with_memory_monitor_captures_time_and_rss() -> None:
     assert "BENCHMARK_ROW_COUNT=42" in res["stdout"]
 
 
+def test_run_with_memory_monitor_handles_large_stdout_and_stderr() -> None:
+    """Verify large stdout/stderr output does not deadlock the polling loop."""
+    script = (
+        "import sys; "
+        "sys.stderr.write('E' * 262144 + '\\n'); "
+        "sys.stdout.write('O' * 262144 + '\\nBENCHMARK_ROW_COUNT=7\\n')"
+    )
+    res = run_with_memory_monitor([sys.executable, "-c", script], poll_interval=0.05)
+    assert "BENCHMARK_ROW_COUNT=7" in res["stdout"]
+
+
 def test_run_benchmark_suite_writes_results_json(tmp_path: Path, monkeypatch) -> None:
     """Verify run_benchmark_suite writes valid JSON with data-size and worker scaling."""
     def fake_monitor(cmd, poll_interval=0.25, cwd=None):
