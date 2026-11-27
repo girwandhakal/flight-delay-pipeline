@@ -77,6 +77,13 @@ def prepare_references(
         airports = list(csv.reader(stream))
     with (directory / "isd_history.csv").open(encoding="utf-8", newline="") as stream:
         history = list(csv.DictReader(stream))
+    # NOAA froze isd-history.csv on 2025-08-27; cap END check there while LCDv2 continues.
+    max_history_end = max((row["END"] for row in history if row.get("END")), default="")
+    required_end = (
+        min(end_date.replace("-", ""), max_history_end)
+        if max_history_end
+        else end_date.replace("-", "")
+    )
     stations = {
         line[:11]: line
         for line in (directory / "lcd_stations.txt").read_text().splitlines()
@@ -119,7 +126,7 @@ def prepare_references(
             if (
                 station_id not in stations
                 or station["BEGIN"] > start_date.replace("-", "")
-                or station["END"] < end_date.replace("-", "")
+                or station["END"] < required_end
             ):
                 continue
             # NOAA LCD station inventory fixed-width format:
@@ -178,8 +185,9 @@ def prepare_references(
                 name: sha256(directory / name)
                 for name in ("airports.csv", "airport_station.csv")
             },
-            "mapping_policy": "Unique exact ICAO/WBAN linkage, LCD inventory location within 5 km, ISD history covering study dates; ambiguous mappings stay absent.",
-            "limitations": "Current OpenFlights airport/time-zone metadata does not establish historical metadata publication availability. OpenFlights data is ODbL; NOAA data is public domain.",
+            "isd_history_max_end": max_history_end,
+            "mapping_policy": "Unique exact ICAO/WBAN linkage, LCD inventory location within 5 km, ISD history covering study dates (capped at max ISD END date when study extends past ISD freeze); ambiguous mappings stay absent.",
+            "limitations": "Current OpenFlights airport/time-zone metadata does not establish historical metadata publication availability; ISD history stopped updating after its max END date while LCDv2 station files continue. OpenFlights data is ODbL; NOAA data is public domain.",
         },
     )
 

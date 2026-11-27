@@ -446,5 +446,44 @@ class WeatherSparkTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 features.validate_cohort(flights, mutated)
 
+    def test_prepare_references_caps_isd_end_at_history_freeze_date(self):
+        from scripts.origin_weather import download
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ref_dir = root / "refs"
+            airports_dat = (
+                '1,"Allentown","Allentown","US","ABE","KABE",40.6521,-75.4408,0,0,"A","America/New_York"\n'
+                '2,"Closed Airport","Nowhere","US","XYZ","KXYZ",35.0,-80.0,0,0,"A","America/New_York"\n'
+            )
+            isd_csv = (
+                "USAF,WBAN,STATION NAME,CTRY,STATE,ICAO,LAT,LON,ELEV(M),BEGIN,END\n"
+                "725170,14737,ALLENTOWN,US,PA,KABE,40.652,-75.441,118.9,19950101,20250827\n"
+                "723000,99998,OLD STATION,US,NC,KXYZ,35.000,-80.000,100.0,19950101,20200101\n"
+            )
+            lcd_txt = (
+                "USW00014737  40.6520  -75.4410  118.9    ALLENTOWN\n"
+                "USW00099998  35.0000  -80.0000  100.0    OLD STATION\n"
+            )
+            payloads = {
+                download.SOURCES["airports.dat"]: airports_dat.encode("utf-8"),
+                download.SOURCES["isd_history.csv"]: isd_csv.encode("utf-8"),
+                download.SOURCES["lcd_stations.txt"]: lcd_txt.encode("utf-8"),
+            }
+
+            def fake_fetch(url, target):
+                temp = target.with_suffix(".tmp")
+                temp.parent.mkdir(parents=True, exist_ok=True)
+                temp.write_bytes(payloads[url])
+                return temp
+
+            with patch.object(download, "fetch", side_effect=fake_fetch):
+                download.prepare_references(["ABE", "XYZ"], ref_dir, "2024-01-01", "2026-01-31")
+
+            _, mappings = features.load_references(ref_dir)
+            self.assertEqual([(m["Origin"], m["station_id"]) for m in mappings], [("ABE", "USW00014737")])
+            sources = json.loads((ref_dir / "sources.json").read_text(encoding="utf-8"))
+            self.assertEqual(sources["isd_history_max_end"], "20250827")
+
 if __name__ == "__main__":
     unittest.main()
