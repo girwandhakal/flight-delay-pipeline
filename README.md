@@ -16,6 +16,10 @@ An end-to-end **PySpark** machine learning pipeline that predicts whether U.S. d
 * **Machine Learning & Validation:** Fits `LogisticRegression` (unweighted and class-weighted) and `RandomForestClassifier` on training data, then tunes $F_1$ decision thresholds on validation data.
 * **Frozen Test Evaluation & Reporting:** Scores held-out test flights with saved `PipelineModel` artifacts and publishes metrics, subgroup slices, and stage timings to `results/`.
 
+Outbound schedule slack subtracts the historical median actual gate-to-gate time from the scheduled duration. Training uses completed flights from all prior training months and assumes those records are available at the next month boundary. Validation and test share one benchmark from the training period. Taxi-out surge and turnaround shortfall also use historical median baselines.
+
+See the [model feature reference](features.md) for predictor definitions, data sources, units, and examples.
+
 ---
 
 ## Pipeline Flowchart
@@ -42,9 +46,9 @@ flowchart LR
     end
 
     subgraph Modeling["Modeling & Evaluation"]
-        M1["Train Split<br/>(2024-01 to 2025-09)"]
-        M2["Val Split: F1 Threshold<br/>(2025-10 to 2025-11)"]
-        M3["Test Split: Frozen Score<br/>(2025-12 to 2026-01)"]
+        M1["Train Split<br/>(first 70% of months)"]
+        M2["Val Split: F1 Threshold<br/>(next 15% of months)"]
+        M3["Test Split: Frozen Score<br/>(last 15% of months)"]
     end
 
     B1 --> S1 --> G1
@@ -89,6 +93,8 @@ conda activate cs523_project_env
 ---
 
 ## How to Run
+
+Set the airport reference bundles in `config.json` with `origin_weather.reference_directory` and `destination_weather.reference_directory`. Both weather stages share `datasets.weather.output_directory` for NOAA downloads. Set `datasets.bts.start_month` and `datasets.bts.end_month` to choose the study period. By default, `split_percentages` assigns about 70% of calendar months to training, 15% to validation, and 15% to testing, in that order. The pipeline rounds to whole months and gives each split at least one month. Existing configs with explicit `splits` still use those dates. The pipeline selects date-specific reference bundles and builds missing ones automatically. An existing origin bundle with the exact date scope can be reused.
 
 | Task | Command | Notes |
 | :--- | :--- | :--- |

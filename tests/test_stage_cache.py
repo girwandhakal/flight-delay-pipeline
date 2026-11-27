@@ -9,6 +9,7 @@ import pytest
 
 from scripts.aircraft_rotation import run as rotation
 from scripts.common import stage_cache as cache
+from scripts.common.config import read_config, weather_reference_path
 from scripts.common.io import sha256, write_json
 from scripts.enroute_weather import run as aviation
 from scripts.enroute_weather.download import acquire
@@ -19,6 +20,29 @@ def partition(path, value=b"fixture"):
     path.mkdir(parents=True, exist_ok=True)
     (path / "part.parquet").write_bytes(value)
     (path / "_SUCCESS").touch()
+
+
+def test_weather_reference_paths_follow_study_dates(tmp_path):
+    config = {
+        "origin_weather": {"reference_directory": "refs/origin"},
+        "destination_weather": {"reference_directory": "refs/destination"},
+        "splits": {"train": {"start_date": "2024-01-01"}, "test": {"end_date": "2025-01-31"}},
+    }
+    seed = tmp_path / "refs/origin"
+    seed.mkdir(parents=True)
+    write_json(seed / "sources.json", {"scope": ["2024-01-01", "2025-01-31"]})
+    original_destination = weather_reference_path(tmp_path, config, "destination")
+    assert weather_reference_path(tmp_path, config, "origin") == seed
+
+    config["splits"]["test"]["end_date"] = "2026-01-31"
+    expanded = weather_reference_path(tmp_path, config, "origin")
+    assert expanded == seed.with_name("origin-2024-01-01-to-2026-01-31")
+    assert weather_reference_path(tmp_path, config, "destination") != original_destination
+
+    config["splits"]["train"]["start_date"] = "2024-02-01"
+    config["splits"]["test"]["end_date"] = "2025-01-30"
+    assert weather_reference_path(tmp_path, config, "origin") not in (seed, expanded)
+    assert (seed / "sources.json").is_file()
 
 
 def test_incomplete_generation_and_changed_output(tmp_path):
@@ -44,8 +68,8 @@ def test_aviation_and_rotation_dependency_matrix(tmp_path, monkeypatch):
     root = tmp_path
     source_root = Path(rotation.__file__).resolve().parents[2]
     shutil.copytree(source_root / "scripts", root / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
-    config = json.loads((source_root / "config.json").read_text())
-    references = root / config["destination_weather"]["reference_directory"]
+    config = read_config(source_root / "config.json")
+    references = weather_reference_path(root, config, "destination")
     references.mkdir(parents=True)
     (references / "airports.csv").write_text("Origin,time_zone,valid_from,valid_to,icao\nAAA,UTC,2020,2030,KAAA\n")
     (references / "sources.json").write_text("{}")
@@ -126,24 +150,30 @@ def test_bts_and_airport_weather_branches(tmp_path, monkeypatch):
     import pandas as pd
     from scripts.bts import build_features, clean
     from scripts.bts import cache as bts
-    from scripts.bts.block_time import BLOCK_TIME_SIDECAR, DEFAULT_MANIFEST
+    from scripts.bts.block_time import BLOCK_TIME_SIDECAR
     from scripts.bts.recent_delays import TAXI_BASELINE_FILE
 
     root = tmp_path
     project = Path(rotation.__file__).resolve().parents[2]
     shutil.copytree(project / "scripts", root / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
-    config = json.loads((project / "config.json").read_text())
+    config = read_config(project / "config.json")
     config["datasets"]["bts"].update(start_month="2024-01", end_month="2024-01")
     write_json(root / "config.json", config)
     bronze = root / config["datasets"]["bts"]["output_directory"] / "2024/01"
     bronze.mkdir(parents=True)
     (bronze / "flights.csv").write_text("flight")
     settings = dict(config["datasets"]["weather"])
+    settings["reference_directory"] = config["origin_weather"]["reference_directory"]
     for name in ("reference_directory", "output_directory"):
         settings[name] = root / settings[name]
-    for directory in (config["datasets"]["weather"]["reference_directory"],
-                      config["destination_weather"]["reference_directory"]):
-        shutil.copytree(project / directory, root / directory)
+    origin = config["origin_weather"]["reference_directory"]
+    destination = config["destination_weather"]["reference_directory"]
+    shutil.copytree(project / origin, root / origin)
+    origin_manifest = root / origin / "sources.json"
+    sources = json.loads(origin_manifest.read_text(encoding="utf-8"))
+    sources["scope"] = [config["splits"]["train"]["start_date"], config["splits"]["test"]["end_date"]]
+    write_json(origin_manifest, sources)
+    shutil.copytree(project / destination, weather_reference_path(root, config, "destination"))
 
     weather = settings["output_directory"]
     names = [f"2024/LCD_USW0000000{i}_2024.csv" for i in (1, 2)]
@@ -165,7 +195,7 @@ def test_bts_and_airport_weather_branches(tmp_path, monkeypatch):
         for split in config["splits"]:
             partition(gold_dir / split, gold_dir.name.encode())
         write_json(gold_dir / TAXI_BASELINE_FILE, [])
-        write_json(gold_dir / BLOCK_TIME_SIDECAR, kwargs["block_history"])
+        write_json(gold_dir / BLOCK_TIME_SIDECAR, {})
         write_json(gold_dir / "_features.json", {})
         return pd.DataFrame([{"total_flights": 1}])
 
@@ -202,14 +232,10 @@ def test_bts_and_airport_weather_branches(tmp_path, monkeypatch):
     with (root / "scripts/bts/recent_delays.py").open("a") as stream:
         stream.write("# changed BTS feature policy")
     assert run() == ["gold", "origin", "destination"]
-    release = root / DEFAULT_MANIFEST
-    write_json(release, {"schema_version": 1, "months": []})
-    assert run() == ["gold", "origin", "destination"]
     assert run() == []
     (bts.active(root, "gold") / BLOCK_TIME_SIDECAR).write_text("changed")
     assert not bts.features_current(root, config)
     assert run() == ["gold", "origin", "destination"]
-    release.unlink()
     assert run() == []
     assert bts.active(root, "gold") != frozen
     assert cache.consumed(frozen, config["splits"]) == pinned
@@ -234,9 +260,9 @@ def test_warm_aviation_skips_spark_actions_and_preserves_splits(tmp_path, spark,
 
     project = Path(rotation.__file__).resolve().parents[2]
     root = tmp_path
-    config = json.loads((project / "config.json").read_text())
+    config = read_config(project / "config.json")
     reference = config["destination_weather"]["reference_directory"]
-    shutil.copytree(project / reference, root / reference)
+    shutil.copytree(project / reference, weather_reference_path(root, config, "destination"))
     shutil.copytree(project / "scripts", root / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
     destination = root / "destination"
     taf = root / "taf.zip"

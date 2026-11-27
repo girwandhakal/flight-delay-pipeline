@@ -1,9 +1,10 @@
 """Resolve the BTS data generation separately from model and result publication."""
 
 import json
+from pathlib import Path
 from uuid import uuid4
 
-from scripts.common.config import project_path
+from scripts.common.config import project_path, read_config, weather_reference_path
 from scripts.common.io import file_fingerprints, sha256, write_json
 from scripts.common.results import records, update_results
 from scripts.common.stage_cache import consumed, logic_hash, resolve_stage
@@ -85,13 +86,13 @@ def prepare(spark, root, layer, publish_results):
     from .recent_delays import TAXI_BASELINE_FILE
     import pandas as pd
 
-    config = json.loads((root / "config.json").read_text())
+    config = read_config(root / "config.json")
     base = root / "data" / layer / "bts_generations"
     if layer == "silver":
         partitions = months(config)
 
         def inputs():
-            return silver_inputs(root, json.loads((root / "config.json").read_text()))
+            return silver_inputs(root, read_config(root / "config.json"))
 
         def build(path):
             summary = clean_bts_data(spark, bronze_dir=project_path(root, config["datasets"]["bts"]["output_directory"]),
@@ -108,18 +109,23 @@ def prepare(spark, root, layer, publish_results):
             # The standalone feature builder may be the first command after migration.
             prepare(spark, root, "silver", publish_results=False)
             silver = active(root, "silver")
+        reference = weather_reference_path(root, config, "origin")
+        if not (reference / "sources.json").is_file():
+            from scripts.origin_weather.download import prepare_references
+
+            splits = config["splits"]
+            start, end = splits["train"]["start_date"], splits["test"]["end_date"]
+            files = [str(silver / Path(month)) for month in months(config)]
+            flights = spark.read.parquet(*files).where(f"FlightDate BETWEEN DATE '{start}' AND DATE '{end}'")
+            origins = [row.Origin for row in flights.select("Origin").distinct().collect()]
+            prepare_references(origins, reference, start, end)
         partitions = list(config["splits"])
-        history = None
 
         def inputs():
-            nonlocal history
-            identity = gold_inputs(root, json.loads((root / "config.json").read_text()), silver)
-            history = identity["manifest"]["block_history"]
-            return identity
+            return gold_inputs(root, read_config(root / "config.json"), silver)
 
         def build(path):
-            summary = build_features(spark, silver_dir=silver, gold_dir=path, publish_results=False,
-                                     block_history=history)
+            summary = build_features(spark, silver_dir=silver, gold_dir=path, publish_results=False)
             write_json(path / "summary.json", records(summary))
             return {"silver": str(silver)}
 

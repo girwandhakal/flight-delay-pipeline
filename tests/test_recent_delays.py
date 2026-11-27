@@ -109,8 +109,8 @@ def test_taxi_baselines_use_prior_training_snapshots(spark):
                             F.to_timestamp("taken_off").cast("long").alias("event_seconds"))
     splits = {"train": {"start_date": "2024-01-01", "end_date": "2024-02-29"},
               "val": {"start_date": "2024-03-01"}}
-    rows = recent.compute_unimpeded_taxi_baselines(events, flights, splits, airports()).collect()
-    assert {row.taxi_snapshot: row.unimpeded_taxi_minutes for row in rows} == {"2024-02": 25.0, "evaluation": 3.0}
+    rows = recent.compute_taxi_baselines(events, flights, splits, airports()).collect()
+    assert {row.taxi_snapshot: row.median_taxi_minutes for row in rows} == {"2024-02": 25.0, "evaluation": 12.0}
 
 
 def test_dst_2400_missing_zones_and_historical_event_intervals(spark):
@@ -151,16 +151,17 @@ def test_feature_freshness_checks_sources_references_policy_and_splits(tmp_path)
     reference = tmp_path / "refs"
     reference.mkdir()
     (reference / "airports.csv").write_text("Origin,time_zone\nJFK,America/New_York\n")
-    sources = {"files": {"airports.csv": sha256(reference / "airports.csv")}}
+    sources = {"scope": ["2024-01-01", "2024-01-31"], "files": {"airports.csv": sha256(reference / "airports.csv")}}
     write_json(reference / "sources.json", sources)
-    config = {"bts_features": {"rolling_window_minutes": 120}, "splits": {"train": {}},
-              "datasets": {"bts": {"output_directory": "bronze", "start_month": "2024-01", "end_month": "2024-01"}, "weather": {"reference_directory": "refs"}}}
+    config = {"bts_features": {"rolling_window_minutes": 120}, "splits": {"train": {"start_date": "2024-01-01", "end_date": "2024-01-31"}, "test": {"end_date": "2024-01-31"}},
+              "datasets": {"bts": {"output_directory": "bronze", "start_month": "2024-01", "end_month": "2024-01"}}, "origin_weather": {"reference_directory": "refs"}}
     bronze = tmp_path / "bronze/2024/01/events.csv"
     bronze.parent.mkdir(parents=True)
     bronze.write_text("events")
     gold = tmp_path / "data/gold/bts"
-    (gold / "train").mkdir(parents=True)
-    (gold / "train/_SUCCESS").touch()
+    for split in config["splits"]:
+        (gold / split).mkdir(parents=True)
+        (gold / split / "_SUCCESS").touch()
     assert not recent.features_current(tmp_path, config)
     lookup = gold / recent.TAXI_BASELINE_FILE
     write_json(lookup, [])

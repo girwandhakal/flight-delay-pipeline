@@ -11,7 +11,7 @@ from scripts.common.time_utils import scheduled_clocks, valid_delay
 
 TURNAROUND_SHORTFALL = "rotation_turnaround_shortfall_minutes"
 TURNAROUND_MISSING = "rotation_turnaround_shortfall_missing"
-RECOVERY_FEATURES = ("rotation_shortfall_after_recovery_minutes", "rotation_shortfall_after_recovery_missing")
+RECOVERY_FEATURES = ("net_turnaround_shortfall_minutes", "net_turnaround_shortfall_missing")
 ROTATION_NUMERIC = ("rotation_scheduled_turnaround_minutes", "rotation_prior_arrival_delay_minutes", TURNAROUND_SHORTFALL)
 ROTATION_FLAGS = ("rotation_link_missing", "rotation_outcome_missing", TURNAROUND_MISSING)
 MAX_GAP_HOURS = 24

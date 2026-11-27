@@ -114,7 +114,7 @@ def build_rotation_gold(
             linked.select("flight_id", "FlightDate", "split", *AUDIT, "training_label_status").write.parquet(
                 str(directory / "rotation_links")
             )
-        with stage("Compute turnaround shortfall, recovery buffer, and write rotation Gold splits"):
+        with stage("Compute turnaround shortfall and net turnaround shortfall, then write rotation Gold splits"):
             splits = add_recovery_shortfall(add_turnaround_shortfall(linked, validation_bound)).select(
                 *IDENTITY, "split", "training_label_status", *BTS_FEATURE_COLUMNS, *SURFACE_WEATHER_COLUMNS,
                 *ROTATION_NUMERIC, *ROTATION_FLAGS, *RECOVERY_FEATURES,

@@ -15,13 +15,13 @@ from pyspark.sql import DataFrame, Row, Window, functions as F
 
 from scripts.bts.cache import active
 from scripts.bts.download import iter_months
-from scripts.common.config import project_path
+from scripts.common.config import project_path, weather_reference_path
 from scripts.common.io import reference_matches, sha256
 from scripts.common.references import airport_zone, load_airports
 from scripts.common.time_utils import (
     clock_matches, event_zone, local_cutoff, scheduled_clocks, valid_delay,
 )
-from .block_time import BLOCK_TIME_SIDECAR, POLICY as BLOCK_TIME_POLICY, SLACK_FEATURES, resolve_block_history
+from .block_time import BLOCK_TIME_SIDECAR, POLICY as BLOCK_TIME_POLICY, SLACK_FEATURES
 
 ROLLING_FEATURES = [
     f"{role}_{measurement}_2h"
@@ -34,6 +34,7 @@ TAXI_FEATURES = [TAXI_MEAN, TAXI_SURGE]
 ROLLING_FEATURES += TAXI_FEATURES
 TAXI_BASELINE_FILE = "_taxi_out_baselines.json"
 TAXI_BASELINE_FALLBACK_MINUTES = 12.0
+TAXI_BASELINE_PERCENTILE = 0.5
 MAX_TAXI_MINUTES = 120.0
 HOLIDAY_FEATURES = [
     "is_federal_holiday",
@@ -55,7 +56,7 @@ def feature_policy(root: Union[str, Path], config: dict[str, Any]) -> dict[str, 
     if not isinstance(window, int) or window != 120:
         raise ValueError("bts_features.rolling_window_minutes must be 120.")
 
-    reference = project_path(root, config["datasets"]["weather"]["reference_directory"])
+    reference = weather_reference_path(root, config, "origin")
     sources = json.loads((reference / "sources.json").read_text(encoding="utf-8"))
 
     for name, checksum in sources["files"].items():
@@ -63,7 +64,7 @@ def feature_policy(root: Union[str, Path], config: dict[str, Any]) -> dict[str, 
             raise ValueError(f"Reference changed: {name}")
 
     return {
-        "version": 8,
+        "version": 9,
         "rolling_window_minutes": window,
         "event_availability": "immediate",
         "delay_threshold_minutes": DELAY_THRESHOLD_MINUTES,
@@ -76,7 +77,7 @@ def feature_policy(root: Union[str, Path], config: dict[str, Any]) -> dict[str, 
             "availability": "verified wheels-off",
             "max_observation_minutes": MAX_TAXI_MINUTES,
             "fallback_baseline_minutes": TAXI_BASELINE_FALLBACK_MINUTES,
-            "baseline_percentile": 0.15,
+            "baseline_percentile": TAXI_BASELINE_PERCENTILE,
             "baseline": "expanding prior training months for train; frozen training baseline for validation and test",
         },
     }
@@ -104,17 +105,25 @@ def feature_manifest(
     config: dict[str, Any],
     bronze_dir: Optional[Union[str, Path]] = None,
     silver_dir: Optional[Union[str, Path]] = None,
-    block_history: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Build a complete provenance dictionary covering policy and input files."""
     root = Path(root)
     bronze = Path(bronze_dir or project_path(root, config["datasets"]["bts"]["output_directory"]))
     silver = Path(silver_dir or active(root, "silver"))
     core = feature_months(config["datasets"]["bts"])
+    train = config["splits"]["train"]
+    training_months = (
+        month for month in sorted(core)
+        if train["start_date"][:7] <= month.strftime("%Y-%m") <= train["end_date"][:7]
+    )
     return {
         **feature_policy(root, config),
         "block_time_code_sha256": sha256(Path(__file__).with_name("block_time.py")),
-        "block_history": block_history if block_history is not None else resolve_block_history(root, config, bronze_dir),
+        "block_history_sha256": {
+            path.relative_to(bronze).as_posix(): sha256(path)
+            for month in training_months
+            for path in sorted((bronze / month.strftime("%Y/%m")).glob("*.csv"))
+        },
         "bronze_files": file_fingerprints(bronze, "*.csv", core),
         "silver_files": file_fingerprints(silver, "*.parquet", core),
     }
@@ -361,7 +370,7 @@ def add_recent_delays(flights: DataFrame, events: DataFrame, window_minutes: int
     return flights.join(stats.groupBy("flight_id").agg(*expressions), "flight_id", "left").drop("_cutoff")
 
 
-def compute_unimpeded_taxi_baselines(
+def compute_taxi_baselines(
     events: DataFrame, flights: DataFrame, splits: dict, airports: dict,
 ) -> DataFrame:
     """Fit trailing-month training snapshots and a frozen evaluation reference."""
@@ -384,7 +393,7 @@ def compute_unimpeded_taxi_baselines(
             .where((F.col("FlightDate") < F.col("first_day"))
                    & (F.col("event_seconds") < F.col("bound_seconds")))
             .groupBy(F.col("airport").alias("Origin"), "taxi_snapshot")
-            .agg(F.percentile_approx("minutes", 0.15).alias("unimpeded_taxi_minutes")))
+            .agg(F.percentile_approx("minutes", TAXI_BASELINE_PERCENTILE).alias("median_taxi_minutes")))
 
 
 def add_holidays(flights: DataFrame, start_date: str, end_date: str) -> DataFrame:

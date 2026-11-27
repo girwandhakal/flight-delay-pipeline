@@ -1,13 +1,12 @@
 """Build schedule-based features and assign chronological splits for BTS modeling."""
 
-from datetime import date, datetime
-import json
+from datetime import date
 import os
 from pathlib import Path
 import sys
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
-from scripts.common.config import ROOT, project_path
+from scripts.common.config import ROOT, project_path, read_config, weather_reference_path
 from scripts.common.io import sha256, write_json
 from scripts.common.progress import stage
 from scripts.common.references import load_airports
@@ -20,13 +19,12 @@ from pyspark.sql import SparkSession, functions as F
 
 from .block_time import (
     BLOCK_TIME_SIDECAR, POLICY as BLOCK_TIME_POLICY, SLACK_FEATURES, add_outbound_schedule_slack,
-    read_block_history, resolve_block_history,
+    build_block_duration_history,
 )
-from .download import iter_months
 from .recent_delays import (
     FEATURES as RECENT_CALENDAR_FEATURES,
     TAXI_BASELINE_FALLBACK_MINUTES, TAXI_BASELINE_FILE, TAXI_MEAN, TAXI_SURGE,
-    add_cutoffs, add_holidays, add_recent_delays, build_events, compute_unimpeded_taxi_baselines,
+    add_cutoffs, add_holidays, add_recent_delays, build_events, compute_taxi_baselines,
     feature_manifest, feature_months,
 )
 
@@ -46,8 +44,6 @@ def build_features(
     config_path: Optional[Union[str, Path]] = None,
     publish_results: bool = True,
     bronze_dir: Optional[Union[str, Path]] = None,
-    *,
-    block_history: Optional[dict[str, Any]] = None,
 ) -> pd.DataFrame:
     """Construct schedule, rolling delay, taxi-out and holiday features for chronological splits.
 
@@ -78,10 +74,9 @@ def build_features(
 
     # Read config once for both splits and dataset settings
     config_file = Path(config_path or ROOT / "config.json")
-    config = json.loads(config_file.read_text(encoding="utf-8"))
+    config = read_config(config_file)
     splits = config["splits"]
-    manifest = feature_manifest(ROOT, config, bronze_dir, silver_dir, block_history)
-    block_history = manifest["block_history"]
+    manifest = feature_manifest(ROOT, config, bronze_dir, silver_dir)
 
     bronze = Path(bronze_dir or project_path(ROOT, config["datasets"]["bts"]["output_directory"]))
     csv_files = sorted(bronze.glob("*/*/*.csv"))
@@ -93,13 +88,15 @@ def build_features(
     core_files = [str(path) for path in csv_files if source_months[path] in core_months]
     if not core_files:
         raise FileNotFoundError(f"No configured BTS month CSVs found in {bronze}")
-    airports = load_airports(project_path(ROOT, config["datasets"]["weather"]["reference_directory"]))
+    airports = load_airports(weather_reference_path(ROOT, config, "origin"))
 
     silver_months = [silver_dir / f"{month.year:04d}" / f"{month.month:02d}" for month in sorted(core_months)]
     silver_paths = [str(path) for path in silver_months if path.is_dir()]
     if not silver_paths:
         raise FileNotFoundError(f"No configured BTS Silver partitions found in {silver_dir}")
-    silver_df = spark.read.parquet(*silver_paths)
+    silver_df = spark.read.parquet(*silver_paths).where(
+        F.col("FlightDate").between(splits["train"]["start_date"], splits["test"]["end_date"])
+    )
     input_count = silver_df.count()
     if input_count == 0:
         raise ValueError(f"No records found in {silver_dir}")
@@ -162,48 +159,34 @@ def build_features(
     events = None
     history = None
     try:
-        with stage("Extract completed flight events and taxi-out baselines"):
+        with stage("Extract completed flights and build historical duration references"):
             events = build_events(raw, airports).persist(StorageLevel.DISK_ONLY)
-            baselines = compute_unimpeded_taxi_baselines(events, feature_df, splits, airports)
+            baselines = compute_taxi_baselines(events, feature_df, splits, airports)
             # Materialize the small lookup once for both the join and the published reference.
             baseline_rows = baselines.orderBy("Origin", "taxi_snapshot").collect()
             baseline_lookup = spark.createDataFrame(baseline_rows, baselines.schema)
             identity = ["flight_id", "FlightDate", "ArrDel15", "split"]
             expected = feature_df.select(*identity)
             cutoffs = add_cutoffs(feature_df, airports)
-            history_months = {
-                f"{year:04d}-{month:02d}" for year, month in iter_months(
-                    splits["train"]["start_date"][:7], splits["train"]["end_date"][:7],
-                )
-            }
-            releases = [source for source in block_history["months"] if source["source_month"] in history_months]
-            source_coverage = []
-            if releases:
-                print(
-                    f"  Building schedule buffer baseline from {len(releases)} historical training months "
-                    f"(source: {block_history['status']}).",
-                    flush=True,
-                )
-                history, rejected = read_block_history(spark, ROOT, releases, airports, splits["train"])
-                history = history.persist(StorageLevel.DISK_ONLY)
-                counts = history.groupBy("_source_month", "reason").count().unionByName(rejected)
-                source_coverage = [row.asDict() for row in counts.orderBy("_source_month", "reason").collect()]
-            else:
-                print(
-                    "  No released BTS training history found; schedule buffer features will be marked missing.",
-                    flush=True,
-                )
+            source_month = F.regexp_extract(F.input_file_name(), r"/(\d{4}/\d{2})/[^/]+$", 1)
+            history, rejected = build_block_duration_history(
+                raw.withColumn("_source_month", F.regexp_replace(source_month, "/", "-")),
+                airports, splits["train"],
+            )
+            history = history.persist(StorageLevel.DISK_ONLY)
+            counts = history.groupBy("_source_month", "reason").count().unionByName(rejected)
+            source_coverage = [row.asDict() for row in counts.orderBy("_source_month", "reason").collect()]
 
-        with stage("Compute schedule buffer, 2h rolling airport delays, taxi surge, and holidays"):
-            feature_df = add_outbound_schedule_slack(cutoffs, history, splits, releases)
+        with stage("Compute schedule slack, 2h rolling airport delays, taxi surge, and holidays"):
+            feature_df = add_outbound_schedule_slack(cutoffs, history, splits, airports)
             feature_df = add_recent_delays(feature_df, events, manifest["rolling_window_minutes"])
             feature_df = (feature_df.withColumn(
                 "taxi_snapshot",
                 F.when(F.col("split") == "train", F.date_format("FlightDate", "yyyy-MM")).otherwise("evaluation"),
             ).join(F.broadcast(baseline_lookup), ["Origin", "taxi_snapshot"], "left")
-              .withColumn(TAXI_SURGE, F.col(TAXI_MEAN) - F.coalesce("unimpeded_taxi_minutes",
+              .withColumn(TAXI_SURGE, F.col(TAXI_MEAN) - F.coalesce("median_taxi_minutes",
                                                                    F.lit(TAXI_BASELINE_FALLBACK_MINUTES)))
-              .drop("taxi_snapshot", "unimpeded_taxi_minutes"))
+              .drop("taxi_snapshot", "median_taxi_minutes"))
             feature_df = add_holidays(feature_df, splits["train"]["start_date"], splits["test"]["end_date"])
             feature_df = feature_df.persist(StorageLevel.DISK_ONLY)
 
@@ -227,7 +210,7 @@ def build_features(
                 raise ValueError("BTS enrichment changed flight identity, label or split.")
         coverage = [
             row.asDict() for row in feature_df.groupBy(
-                "split", F.date_format("_snapshot", "yyyy-MM-dd'T'HH:mm:ss'Z'").alias("snapshot"), "_block_reason",
+                "split", F.col("_snapshot").cast("string").alias("snapshot"), "_block_reason",
             ).agg(
                 F.count("*").alias("count"),
                 F.countDistinct(F.when(F.col("_block_samples").isNotNull(), F.struct(
@@ -237,14 +220,6 @@ def build_features(
                 F.max("_block_samples").alias("max_reference_samples"),
             ).orderBy("split", "snapshot", "_block_reason").collect()
         ]
-        snapshots = sorted({row["snapshot"] for row in coverage if row["snapshot"] is not None})
-        usable_months = {row["_source_month"] for row in source_coverage if row["reason"] == "usable"}
-        available = sorted(datetime.fromisoformat(source["available_utc"]) for source in releases
-                           if source["source_month"] in usable_months)
-        bounds = {}
-        for snapshot in snapshots:
-            latest = next((instant for instant in reversed(available) if instant < datetime.fromisoformat(snapshot)), None)
-            bounds[snapshot] = latest.isoformat().replace("+00:00", "Z") if latest else None
         (gold_dir / "_features.json").unlink(missing_ok=True)
         summary_records = []
         with stage("Write BTS Gold train/val/test Parquet splits"):
@@ -290,10 +265,7 @@ def build_features(
         baseline_path = gold_dir / TAXI_BASELINE_FILE
         write_json(baseline_path, [row.asDict() for row in baseline_rows])
         block_path = gold_dir / BLOCK_TIME_SIDECAR
-        write_json(block_path, {"policy": BLOCK_TIME_POLICY, "history": block_history,
-                                "missing_source_months": sorted(history_months - {s["source_month"] for s in releases}),
-                                "sources": source_coverage, "snapshot_release_upper_bounds": bounds,
-                                "coverage": coverage})
+        write_json(block_path, {"policy": BLOCK_TIME_POLICY, "sources": source_coverage, "coverage": coverage})
         write_json(gold_dir / "_features.json", {
             **manifest, "taxi_baselines_sha256": sha256(baseline_path),
             "block_time_sha256": sha256(block_path),

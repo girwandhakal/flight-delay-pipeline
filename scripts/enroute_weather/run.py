@@ -7,7 +7,7 @@ from pathlib import Path
 from pyspark import StorageLevel
 from pyspark.sql import SparkSession, functions as F
 
-from scripts.common.config import project_path
+from scripts.common.config import project_path, weather_reference_path
 from scripts.common.context import PipelineContext
 from scripts.common.io import sha256, write_json
 from scripts.common.progress import pipeline_stage, stage
@@ -43,7 +43,7 @@ def prepare(spark: SparkSession, root: Path, config: dict, weather_gold: Path) -
     """Download configured UTC coverage and materialize typed deduplicated Silver tables."""
     spark.conf.set("spark.sql.session.timeZone", "UTC")
     cfg = config["datasets"]
-    references = project_path(root, config["destination_weather"]["reference_directory"])
+    references = weather_reference_path(root, config, "destination")
     airport_digest = sha256(references / "airports.csv")
     airports = load_airports(references)
     first = date.fromisoformat(config["splits"]["train"]["start_date"])

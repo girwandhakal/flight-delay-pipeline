@@ -9,7 +9,7 @@ from time import monotonic
 from typing import Any, Optional, Union
 from uuid import uuid4
 
-from .config import project_path
+from .config import project_path, weather_reference_path
 from .io import file_fingerprints, sha256, write_json
 
 
@@ -47,7 +47,7 @@ def input_identity(
     ]
     if parent is not None:
         references.append(
-            project_path(root, config["destination_weather"]["reference_directory"])
+            weather_reference_path(root, config, "destination")
         )
         code.append("destination_weather/build_features.py")
 

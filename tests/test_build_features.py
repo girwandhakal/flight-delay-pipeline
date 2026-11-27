@@ -72,6 +72,7 @@ class TestBuildFeatures(unittest.TestCase):
             earlier = (raw_events.filter("Flight_Number_Reporting_Airline = '101'")
                 .withColumn("Flight_Number_Reporting_Airline", F.lit("999"))
                 .withColumn("CRSDepTime", F.lit("0430"))
+                .withColumn("CRSArrTime", F.lit("0700"))
                 .withColumn("DepTime", F.lit("0500"))
                 .withColumn("DepDelay", F.lit("30"))
                 .withColumn("TaxiOut", F.lit("20"))
@@ -150,8 +151,12 @@ class TestBuildFeatures(unittest.TestCase):
             self.assertEqual(aa["origin_departure_taxi_out_surge_2h"], 8.0)
             self.assertIsNone(aa["destination_arrival_delay_rate_2h"])
             self.assertTrue((gold / "_features.json").exists())
+            manifest = json.loads((gold / "_features.json").read_text())
+            self.assertEqual(set(manifest["block_history_sha256"]), {"2024/01/events.csv"})
             block = json.loads((gold / "_block_time.json").read_text())
-            self.assertEqual(block["history"]["status"], "absent")
+            self.assertEqual(block["policy"]["percentile"], 0.5)
+            self.assertTrue(any(row["_source_month"] == "2024-01" and row["reason"] == "usable"
+                                for row in block["sources"]))
             for split in ("train", "val", "test"):
                 stored = self.spark.read.parquet(str(gold / split))
                 self.assertFalse(stored.where("outbound_schedule_slack_minutes is not null").take(1))

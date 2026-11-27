@@ -10,7 +10,7 @@ from pyspark import StorageLevel
 from pyspark.sql import DataFrame, SparkSession, functions as F
 
 from scripts.bts.cache import active
-from scripts.common.config import ROOT, load_config, project_path
+from scripts.common.config import ROOT, load_config, weather_reference_path
 from scripts.common.io import reference_matches, sha256, write_json
 from scripts.common.progress import stage as progress_stage
 from scripts.common.results import records
@@ -191,7 +191,7 @@ def main(
     if cached is not None:
         return cached, cached
     parent = validate_parent(origin_gold_dir, settings, policy, config)
-    reference = project_path(ROOT, config["destination_weather"]["reference_directory"])
+    reference = weather_reference_path(ROOT, config, "destination")
     if reference == settings["reference_directory"]:
         raise ValueError("Destination references must have a separate scope.")
     owns_spark = spark is None
