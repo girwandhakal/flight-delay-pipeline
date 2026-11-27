@@ -62,7 +62,7 @@ def test_run_ablation_reuses_phase1_full_and_publishes(spark, tmp_path: Path, fu
                 "training": {
                     "vector_dimension": 123,
                     "algorithm_comparison": {
-                        train.WEIGHTED_LOGISTIC: {
+                        ablation.ABLATION_MODEL: {
                             "best_threshold": 0.45,
                             "validation_metrics_at_selected_threshold": phase1_val,
                             "validation_metrics_at_default_0_5": phase1_val,
@@ -71,7 +71,7 @@ def test_run_ablation_reuses_phase1_full_and_publishes(spark, tmp_path: Path, fu
                 },
                 "test": {
                     "models": {
-                        train.WEIGHTED_LOGISTIC: {
+                        ablation.ABLATION_MODEL: {
                             "selected_threshold": 0.45,
                             "metrics_at_selected_threshold": phase1_test,
                             "metrics_at_default_0_5": phase1_test,
@@ -94,8 +94,8 @@ def test_run_ablation_reuses_phase1_full_and_publishes(spark, tmp_path: Path, fu
     payload = ablation.run_ablation(ctx)
     assert payload["reused_phase1_full"] is True
     assert payload["feature_groups"]["full"]["vector_dimension"] == 123
-    assert payload["feature_groups"]["full"]["algorithms"][train.WEIGHTED_LOGISTIC]["reused_from_run_id"] == "run_ablation_test"
-    assert payload["feature_groups"]["full"]["algorithms"][train.WEIGHTED_LOGISTIC]["test_metrics_at_selected_threshold"] == phase1_test
+    assert payload["feature_groups"]["full"]["algorithms"][ablation.ABLATION_MODEL]["reused_from_run_id"] == "run_ablation_test"
+    assert payload["feature_groups"]["full"]["algorithms"][ablation.ABLATION_MODEL]["test_metrics_at_selected_threshold"] == phase1_test
     assert "ablation" in ctx.timings
 
     published = json.loads((tmp_path / "results" / "results.json").read_text(encoding="utf-8"))

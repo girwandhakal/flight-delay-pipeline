@@ -20,6 +20,7 @@ from scripts.enroute_weather.build_features import ENROUTE_NUMERIC
 from . import train
 
 ABLATION_RESULT_KEY = "ablation"
+ABLATION_MODEL = "logistic_regression"
 GOLD_DIR = Path("data/gold/enroute")
 
 
@@ -54,7 +55,7 @@ def _resolve_gold_dir(ctx: PipelineContext) -> Path:
 
 
 def _extract_phase1_full_metrics(root: Path, run_id: str) -> Optional[dict[str, Any]]:
-    """Reuse Phase 1 full-feature metrics for class_weighted_logistic_regression when run_id matches."""
+    """Reuse Phase 1 full-feature metrics for logistic_regression when run_id matches."""
     results_path = project_path(root, "results/results.json")
     if not results_path.is_file():
         return None
@@ -63,15 +64,15 @@ def _extract_phase1_full_metrics(root: Path, run_id: str) -> Optional[dict[str, 
         return None
 
     training = fd.get("training", {})
-    algo_val = training.get("algorithm_comparison", {}).get(train.WEIGHTED_LOGISTIC)
-    algo_test = fd.get("test", {}).get("models", {}).get(train.WEIGHTED_LOGISTIC)
+    algo_val = training.get("algorithm_comparison", {}).get(ABLATION_MODEL)
+    algo_test = fd.get("test", {}).get("models", {}).get(ABLATION_MODEL)
     if not isinstance(algo_val, dict) or not isinstance(algo_test, dict):
         return None
 
     return {
         "vector_dimension": training.get("vector_dimension"),
         "algorithms": {
-            train.WEIGHTED_LOGISTIC: {
+            ABLATION_MODEL: {
                 "best_threshold": algo_val["best_threshold"],
                 "validation_metrics_at_selected_threshold": algo_val["validation_metrics_at_selected_threshold"],
                 "validation_metrics_at_default_0_5": algo_val["validation_metrics_at_default_0_5"],
@@ -155,10 +156,8 @@ def run_ablation(ctx: PipelineContext) -> dict[str, Any]:
         test_df = spark.read.parquet(str(gold_dir / "test")).select(*required_cols).persist(StorageLevel.MEMORY_AND_DISK)
 
         try:
-            with stage("Load Gold cohorts and compute prevalence"):
-                stats = train_df.agg(F.count("*").alias("rows"), F.avg(train.TARGET_COL).alias("prevalence")).first()
-                prevalence = float(stats["prevalence"])
-                train_rows = int(stats["rows"])
+            with stage("Load Gold cohorts"):
+                train_rows = train_df.count()
                 val_rows = val_df.count()
                 test_rows = test_df.count()
                 observed = train_df.agg(*(F.count(name).alias(name) for name in ENROUTE_NUMERIC)).first()
@@ -168,11 +167,8 @@ def run_ablation(ctx: PipelineContext) -> dict[str, Any]:
                 featuresCol="features", labelCol=train.TARGET_COL, family="binomial",
                 standardization=True, **train.LOGISTIC_PARAMS,
             )
-            if not 0 < prevalence < 1:
-                raise ValueError("Class-weighted logistic regression requires both target classes in training.")
-            class_weights = {"on_time": 0.5 / (1 - prevalence), "delayed": 0.5 / prevalence}
             estimators: list[tuple[str, Any]] = [
-                (train.WEIGHTED_LOGISTIC, logistic.copy({logistic.weightCol: train.CLASS_WEIGHT_COL})),
+                (ABLATION_MODEL, logistic),
             ]
 
             feature_groups_out: dict[str, Any] = {}
@@ -194,11 +190,7 @@ def run_ablation(ctx: PipelineContext) -> dict[str, Any]:
                         empty_enroute=empty_enroute, one_hot=True, feature_group=group_name,
                     ).fit(train_df)
 
-                    fit_features = active_preprocessor.transform(train_df).withColumn(
-                        train.CLASS_WEIGHT_COL,
-                        F.when(F.col(train.TARGET_COL) == 1, class_weights["delayed"])
-                        .otherwise(class_weights["on_time"]),
-                    )
+                    fit_features = active_preprocessor.transform(train_df)
                     classifier = estimator.fit(fit_features)
                     model = PipelineModel(stages=[*active_preprocessor.stages, classifier])
 
