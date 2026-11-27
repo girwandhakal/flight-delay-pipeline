@@ -134,3 +134,66 @@ def test_run_worker_task_executes_ml_workload_on_gold_schema(tmp_path: Path, ful
     assert "BENCHMARK_ROW_COUNT=" in proc.stdout
     assert "BENCHMARK_PREPROCESS_SECONDS=" in proc.stdout
     assert "BENCHMARK_FIT_SECONDS=" in proc.stdout
+
+
+def test_run_benchmark_suite_deduplicates_overlapping_case(tmp_path: Path, monkeypatch) -> None:
+    """Verify run_benchmark_suite executes overlapping (local[4], 1.0) once and isolates speedup."""
+    calls: list[list[str]] = []
+
+    def fake_monitor(cmd, poll_interval=0.25, cwd=None):
+        calls.append(cmd)
+        return {
+            "wall_time_seconds": 10.0 if "local[2]" in cmd else 5.0,
+            "peak_memory_gb": 1.25,
+            "stdout": "BENCHMARK_ROW_COUNT=1000\n",
+        }
+
+    monkeypatch.setattr("scripts.common.benchmark.run_with_memory_monitor", fake_monitor)
+    cfg = json.loads((REPO_ROOT / "config.json").read_text(encoding="utf-8"))
+    out = run_benchmark_suite(config=cfg, results_dir=tmp_path)
+    data = json.loads(out.read_text(encoding="utf-8"))
+
+    assert len(calls) == 5
+    assert len(data["data_size_scaling"]) == 3
+    assert all("speedup" not in row for row in data["data_size_scaling"])
+    assert len(data["worker_scaling"]) == 3
+    assert all("speedup" in row for row in data["worker_scaling"])
+
+
+def test_get_spark_session_accepts_custom_master_and_memory(monkeypatch) -> None:
+    """Verify get_spark_session applies tuned Spark settings for custom master and driver memory."""
+    from scripts.common import spark as spark_mod
+
+    recorded: dict[str, object] = {"configs": {}}
+
+    class FakeBuilder:
+        def master(self, value: str):
+            recorded["master"] = value
+            return self
+
+        def appName(self, value: str):
+            recorded["app_name"] = value
+            return self
+
+        def config(self, key: str, value: str):
+            recorded["configs"][key] = value
+            return self
+
+        def getOrCreate(self):
+            return recorded
+
+    class FakeSparkSession:
+        builder = FakeBuilder()
+
+    monkeypatch.setattr(spark_mod, "SparkSession", FakeSparkSession)
+    result = spark_mod.get_spark_session(
+        app_name="flight_delay_benchmark",
+        master="local[2]",
+        driver_memory="8g",
+    )
+
+    assert result["master"] == "local[2]"
+    assert result["app_name"] == "flight_delay_benchmark"
+    assert result["configs"]["spark.driver.memory"] == "8g"
+    assert result["configs"]["spark.sql.shuffle.partitions"] == "32"
+    assert result["configs"]["spark.local.dir"].endswith(".spark_tmp")

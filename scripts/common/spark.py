@@ -26,7 +26,11 @@ def configure_spark_env() -> None:
 configure_spark_env()
 
 
-def get_spark_session(app_name: str = "flight_delay") -> SparkSession:
+def get_spark_session(
+    app_name: str = "flight_delay",
+    master: str = "local[4]",
+    driver_memory: str = "6g",
+) -> SparkSession:
     """Create or retrieve a tuned local SparkSession bounded for laptop execution."""
     configure_spark_env()
     python_path = os.environ.get("PYTHONPATH", "")
@@ -36,12 +40,12 @@ def get_spark_session(app_name: str = "flight_delay") -> SparkSession:
     local_tmp_dir = ROOT / ".spark_tmp"
     local_tmp_dir.mkdir(parents=True, exist_ok=True)
     return (
-        SparkSession.builder.master("local[4]")
+        SparkSession.builder.master(master)
         .appName(app_name)
         .config("spark.local.dir", str(local_tmp_dir))
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.driver.bindAddress", "127.0.0.1")
-        .config("spark.driver.memory", "6g")
+        .config("spark.driver.memory", driver_memory)
         .config("spark.sql.shuffle.partitions", "32")
         .config("spark.sql.files.maxPartitionBytes", "32m")
         .config("spark.sql.parquet.columnarReaderBatchSize", "1024")
