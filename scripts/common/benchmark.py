@@ -3,7 +3,6 @@
 import argparse
 from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
 import platform
 import re
@@ -18,7 +17,7 @@ import pyspark
 
 from .config import ROOT
 from .results import replace_file
-from .spark import configure_spark_env
+from .spark import get_spark_session
 
 
 def collect_hardware_metadata() -> dict[str, Any]:
@@ -173,8 +172,13 @@ def run_benchmark_suite(
     seed: int = int(bench_cfg["seed"])
     poll_interval: float = float(bench_cfg.get("poll_interval_seconds", 0.25))
     resolved_gold = _resolve_gold_train_dir(gold_dir=gold_dir)
+    completed_cases: dict[tuple[str, float], dict[str, Any]] = {}
 
     def _run_case(master: str, fraction: float) -> dict[str, Any]:
+        # Reuse already-measured (master, fraction) points across sweeps without mutating cached rows.
+        cache_key = (master, fraction)
+        if cache_key in completed_cases:
+            return dict(completed_cases[cache_key])
         cmd = [
             sys.executable,
             "-m",
@@ -206,6 +210,7 @@ def run_benchmark_suite(
             entry["preprocess_seconds"] = prep_sec
         if fit_sec is not None:
             entry["fit_seconds"] = fit_sec
+        completed_cases[cache_key] = dict(entry)
         return entry
 
     data_size_scaling = [_run_case(fixed_worker, frac) for frac in fractions]
@@ -242,23 +247,15 @@ def _run_worker_task(
     """Execute a deterministic Spark preprocessing + LogisticRegression workload for one benchmark point."""
     from pyspark import StorageLevel
     from pyspark.ml.classification import LogisticRegression
-    from pyspark.sql import SparkSession, functions as F
+    from pyspark.sql import functions as F
 
     from scripts.enroute_weather.build_features import ENROUTE_NUMERIC
     from scripts.modeling import train
 
-    configure_spark_env()
-    python_path = os.environ.get("PYTHONPATH", "")
-    if str(ROOT) not in python_path.split(os.pathsep):
-        os.environ["PYTHONPATH"] = str(ROOT) + (os.pathsep + python_path if python_path else "")
-
-    spark = (
-        SparkSession.builder.master(master)
-        .appName("flight_delay_benchmark")
-        .config("spark.driver.host", "127.0.0.1")
-        .config("spark.driver.bindAddress", "127.0.0.1")
-        .config("spark.driver.memory", "8g")
-        .getOrCreate()
+    spark = get_spark_session(
+        app_name="flight_delay_benchmark",
+        master=master,
+        driver_memory="8g",
     )
     cached_df = None
     try:
