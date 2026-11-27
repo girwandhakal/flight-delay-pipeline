@@ -28,6 +28,10 @@ class TestBuildFeatures(unittest.TestCase):
             silver = tmp_path / "silver"
             gold = tmp_path / "gold"
             results = tmp_path / "results"
+            config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+            config["datasets"]["bts"].update(start_month="2024-01", end_month="2025-01")
+            config_path = tmp_path / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
 
             # Create synthetic rows across train, val, and test dates
             # 2024-01-01 is Monday (DayOfWeek=1 in BTS convention)
@@ -99,6 +103,7 @@ class TestBuildFeatures(unittest.TestCase):
                 bronze_dir=bronze,
                 gold_dir=gold,
                 results_dir=results,
+                config_path=config_path,
             )
 
             saved = json.loads((results / "results.json").read_text())["bts"]["splits"]
@@ -177,7 +182,10 @@ class TestBuildFeatures(unittest.TestCase):
                 return original_agg(frame, *expressions)
 
             with patch.object(DataFrame, "agg", aggregate), patch.object(features, "update_results") as publish:
-                quiet = build_features(self.spark, silver_dir=silver, bronze_dir=bronze, gold_dir=tmp_path / "quiet_gold", results_dir=tmp_path / "quiet_results", publish_results=False)
+                quiet = build_features(
+                    self.spark, silver_dir=silver, bronze_dir=bronze, gold_dir=tmp_path / "quiet_gold",
+                    results_dir=tmp_path / "quiet_results", config_path=config_path, publish_results=False,
+                )
                 publish.assert_not_called()
             self.assertEqual(quiet["total_flights"].tolist(), [2, 1, 1])
             self.assertNotIn("delayed_flights", quiet.columns)
