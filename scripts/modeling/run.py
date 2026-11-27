@@ -4,14 +4,14 @@ import json
 from pathlib import Path
 import re
 import shutil
-from typing import Any
+from typing import Any, Optional
 
 from scripts.common.config import project_path
 from scripts.common.context import PipelineContext
 from scripts.common.io import dir_size_bytes, fs_path, rmtree_retry, sha256, write_json
 from scripts.common.progress import DIVIDER, pipeline_stage
 from scripts.common.results import update_results
-from scripts.common.stage_cache import consumed
+from scripts.common.stage_cache import consumed, contract_digest
 
 from . import train
 
@@ -115,6 +115,107 @@ def inference_hashes(run_dir: Path, model: str, threshold: str) -> dict[str, str
     return {name: sha256(project_path(run_dir, name)) for name in names}
 
 
+def training_cache_key(gold_id: dict[str, Any], splits: dict[str, Any]) -> str:
+    """Compute a deterministic cache key for Phase 1 model training inputs, params, and code."""
+    run_file = Path(__file__).resolve()
+    train_file = run_file.parent / "train.py"
+    return contract_digest({
+        "version": 1,
+        "gold_identity": gold_id,
+        "splits": splits,
+        "input_columns": list(train.INPUT_COLUMNS),
+        "thresholds": list(train.THRESHOLDS),
+        "logistic_params": train.LOGISTIC_PARAMS,
+        "random_forest_params": train.RANDOM_FOREST_PARAMS,
+        "mlp_params": train.MLP_PARAMS,
+        "code": {
+            "train.py": sha256(train_file),
+            "run.py": sha256(run_file),
+        },
+    })
+
+
+def _validate_cached_run_dir(
+    run_dir: Path,
+    runs_root: Path,
+    gold_id: dict[str, Any],
+    splits: dict[str, Any],
+    expected_key: str,
+) -> Optional[Path]:
+    """Return validation.json if run_dir is a complete, verified model run matching inputs."""
+    if run_dir.is_symlink() or not run_dir.is_dir():
+        return None
+    resolved_root = runs_root.resolve()
+    resolved_dir = run_dir.resolve()
+    if resolved_dir.parent != resolved_root or not resolved_dir.is_relative_to(resolved_root):
+        return None
+
+    marker = run_dir / "_SUCCESS"
+    manifest_path = run_dir / "run.json"
+    report_path = run_dir / "validation.json"
+    if not (marker.is_file() and manifest_path.is_file() and report_path.is_file()):
+        return None
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            manifest.get("run_id") != run_dir.name
+            or manifest.get("splits") != splits
+            or manifest.get("gold_identity") != gold_id
+            or manifest.get("input_columns") != list(train.INPUT_COLUMNS)
+        ):
+            return None
+        # Legacy runs created before model caching lack training_cache_key; allow bootstrap reuse via data/hash checks.
+        if "training_cache_key" in manifest and manifest["training_cache_key"] != expected_key:
+            return None
+
+        variants = manifest.get("variants")
+        if not isinstance(variants, dict) or not variants:
+            return None
+        for variant in variants.values():
+            if not isinstance(variant, dict):
+                return None
+            actual_hashes = inference_hashes(run_dir, variant["model"], variant["threshold_file"])
+            if actual_hashes != variant.get("sha256"):
+                return None
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+    return report_path
+
+
+def _find_cached_run(
+    root: Path,
+    gold_id: dict[str, Any],
+    splits: dict[str, Any],
+    expected_key: str,
+) -> Optional[tuple[str, Path]]:
+    """Locate a verified completed run matching gold_id and splits, preferring the active run."""
+    runs_root = project_path(root, RUNS_DIR)
+    if not runs_root.exists():
+        return None
+
+    candidates: list[Path] = []
+    results_path = project_path(root, "results/results.json")
+    if results_path.is_file():
+        try:
+            active_id = json.loads(results_path.read_text(encoding="utf-8")).get(RESULT_KEY, {}).get("run_id")
+            if isinstance(active_id, str) and re.fullmatch(r"[A-Za-z0-9_-]+", active_id):
+                candidates.append(runs_root / active_id)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    completed = sorted(runs_root.glob("*/_SUCCESS"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for marker in completed:
+        if marker.parent not in candidates:
+            candidates.append(marker.parent)
+
+    for candidate in candidates:
+        report = _validate_cached_run_dir(candidate, runs_root, gold_id, splits, expected_key)
+        if report is not None:
+            return candidate.name, report
+    return None
+
+
 def format_classification_report(
     run_id: str,
     models: dict[str, Any],
@@ -175,18 +276,38 @@ def format_classification_report(
 
 def train_and_publish(
     spark, root: Path, run_id: str, gold: Path, splits: dict, coverage: dict, sources: dict,
+    *, force_retrain: bool = False,
 ) -> Path:
-    """Train once, save artifacts and manifests, and publish validation results."""
+    """Train once (or reuse a verified cached run), save artifacts, and publish validation results."""
+    gold = gold.resolve()
+    if gold.parent != project_path(root, GOLD_DIR):
+        raise ValueError("Training Gold must be under the en-route Gold directory.")
+
+    partition_names = ("train", "val", "test")
+    identity = gold_identity(gold, partition_names)
+    cache_key = training_cache_key(identity, splits)
+
+    if not force_retrain:
+        cached = _find_cached_run(root, identity, splits, cache_key)
+        if cached is not None:
+            cached_run_id, cached_report = cached
+            print(f"  [Cache HIT] Reusing Phase 1 models (run_id: {cached_run_id}).", flush=True)
+            cached_payload = json.loads(cached_report.read_text(encoding="utf-8"))
+            print(
+                format_classification_report(
+                    cached_run_id, cached_payload.get("algorithm_comparison", {}), split="VALIDATION"
+                ),
+                flush=True,
+            )
+            return cached_report
+
+    reason = "force_retrain" if force_retrain else "cache_miss"
+    print(f"  [Cache MISS] Training Phase 1 models (reason: {reason}, run_id: {run_id}).", flush=True)
+
     run_dir = project_path(root, RUNS_DIR / run_id)
     run_dir.mkdir(parents=True, exist_ok=False)
     marker = run_dir / "_SUCCESS"
     try:
-        gold = gold.resolve()
-        if gold.parent != project_path(root, GOLD_DIR):
-            raise ValueError("Training Gold must be under the en-route Gold directory.")
-
-        partition_names = ("train", "val", "test")
-        identity = gold_identity(gold, partition_names)
         summary = train.train(spark, gold, run_dir, splits)
 
         variants = {}
@@ -221,6 +342,7 @@ def train_and_publish(
         manifest = run_dir / "run.json"
         write_json(manifest, {
             "run_id": run_id,
+            "training_cache_key": cache_key,
             "splits": splits,
             "gold": gold.relative_to(root.resolve()).as_posix(),
             "gold_identity": identity,
@@ -264,9 +386,9 @@ def train_and_publish(
 
 
 def run(ctx: PipelineContext) -> Path:
-    """Stage 6 entry point: fit models on full-feature Gold and publish validation."""
+    """Stage 6 entry point: fit models on full-feature Gold (or reuse cache) and publish validation."""
     with pipeline_stage(6, 6, "Model Training & Validation", timings=ctx.timings):
-        return train_and_publish(
+        report = train_and_publish(
             ctx.spark,
             ctx.root,
             ctx.run_id,
@@ -274,4 +396,8 @@ def run(ctx: PipelineContext) -> Path:
             ctx.config["splits"],
             ctx.coverage,
             ctx.sources,
+            force_retrain=ctx.force_retrain,
         )
+        # Align ctx.run_id with the resolved run directory so downstream stages target the cached run.
+        ctx.run_id = report.parent.name
+        return report

@@ -28,9 +28,10 @@ class PipelineContext:
     coverage: dict[str, Any] = field(default_factory=dict)
     sources: dict[str, Any] = field(default_factory=lambda: {"sha256": {}})
     timings: dict[str, float] = field(default_factory=dict)
+    force_retrain: bool = False
 
     @classmethod
-    def create(cls, root: Path = ROOT) -> "PipelineContext":
+    def create(cls, root: Path = ROOT, *, force_retrain: bool = False) -> "PipelineContext":
         """Initialize configuration, root config digest, and a unique run ID."""
         settings, _, config = load_config(root)
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "_" + uuid4().hex[:8]
@@ -40,4 +41,5 @@ class PipelineContext:
             settings=settings,
             run_id=run_id,
             sources={"sha256": {"config.json": sha256(root / "config.json")}},
+            force_retrain=force_retrain,
         )
