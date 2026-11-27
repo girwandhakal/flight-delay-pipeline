@@ -357,3 +357,77 @@ def test_pipeline_four_flag_combinations(
     assert len(timings) == 1
     assert timings[0]["run_id"] == "run_001"
     assert ("benchmark" in timings[0]["stages"]) is expect_benchmark
+
+
+@pytest.mark.unit
+def test_pipeline_force_retrain_flag_and_cache_hit_skips(tmp_path, monkeypatch):
+    """Verify --force-retrain flag and Phase 1 cache-hit reuse of feature_importance and evaluate."""
+    assert pipeline.parse_args([]).force_retrain is False
+    assert pipeline.parse_args(["--force-retrain"]).force_retrain is True
+
+    spark = Mock()
+
+    @contextmanager
+    def fake_spark_session(app_name="flight_delay"):
+        yield spark
+
+    gold_dir = tmp_path / "data" / "gold" / "enroute" / "gen_001"
+    gold_dir.mkdir(parents=True)
+    cached_run_id = "cached_run_999"
+    report_path = tmp_path / "models" / "flight_delay" / cached_run_id / "validation.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text("{}")
+
+    (tmp_path / "results").mkdir(parents=True)
+    (tmp_path / "results" / "feature_importance.json").write_text(
+        json.dumps({"run_id": cached_run_id}), encoding="utf-8"
+    )
+    (tmp_path / "results" / "results.json").write_text(
+        json.dumps({"flight_delay": {"run_id": cached_run_id, "test": {"run_id": cached_run_id}}}),
+        encoding="utf-8",
+    )
+
+    seen_flags = []
+
+    def make_context():
+        return PipelineContext(
+            root=tmp_path,
+            config={"splits": SPLITS},
+            settings={"reference_directory": tmp_path},
+            run_id="fresh_run_001",
+            sources={"sha256": {}},
+        )
+
+    def fake_modeling_run(ctx):
+        seen_flags.append(ctx.force_retrain)
+        ctx.run_id = cached_run_id
+        return report_path
+
+    fi_mock = Mock()
+    eval_mock = Mock()
+    ablation_mock = Mock()
+
+    monkeypatch.setattr(pipeline.PipelineContext, "create", staticmethod(make_context))
+    monkeypatch.setattr(pipeline, "spark_session", fake_spark_session)
+    monkeypatch.setattr(pipeline.bts, "run", lambda ctx: None)
+    monkeypatch.setattr(pipeline.origin_weather, "run", lambda ctx: None)
+    monkeypatch.setattr(pipeline.destination_weather, "run", lambda ctx: None)
+    monkeypatch.setattr(pipeline.aircraft_rotation, "run", lambda ctx: None)
+    monkeypatch.setattr(pipeline.enroute_weather, "run", lambda ctx: setattr(ctx, "gold_dir", gold_dir))
+    monkeypatch.setattr(pipeline.modeling, "run", fake_modeling_run)
+    monkeypatch.setattr(pipeline.feature_importance, "run", fi_mock)
+    monkeypatch.setattr(pipeline.evaluate, "run", eval_mock)
+    monkeypatch.setattr(pipeline.ablation, "run_ablation", ablation_mock)
+
+    # Without --force-retrain: matching feature_importance & test eval are skipped, ablation gets cached run_id.
+    assert pipeline.main(["--ablation"]) == 0
+    assert seen_flags[-1] is False
+    fi_mock.assert_not_called()
+    eval_mock.assert_not_called()
+    assert ablation_mock.call_args.args[0].run_id == cached_run_id
+
+    # With --force-retrain: feature_importance and evaluate both run.
+    assert pipeline.main(["--force-retrain"]) == 0
+    assert seen_flags[-1] is True
+    fi_mock.assert_called_once()
+    eval_mock.assert_called_once()

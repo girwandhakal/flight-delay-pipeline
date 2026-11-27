@@ -109,3 +109,117 @@ def test_training_reads_only_development_and_persists_both_variants(spark, tmp_p
         assert (model / "validation_predictions").is_dir()
         assert (model / "threshold.json").is_file()
         assert set(reports["validation_per_class_at_selected_threshold"]) == {"on_time", "delayed"}
+
+
+def _build_fake_cached_run(
+    root: Path,
+    run_id: str,
+    gold_dir: Path,
+    splits: dict,
+    *,
+    include_cache_key: bool = True,
+    cache_key: str = "",
+) -> Path:
+    """Create a minimal verified model run directory on disk for cache-hit tests."""
+    from scripts.common.io import write_json
+    from scripts.modeling import run as modeling_run
+
+    run_dir = root / "models" / "flight_delay" / run_id
+    model_dir = run_dir / "model"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "metadata").write_text("{}", encoding="utf-8")
+    threshold_path = run_dir / "threshold.json"
+    write_json(threshold_path, {"threshold": 0.25})
+    write_json(run_dir / "validation.json", {"run_id": run_id, "algorithm_comparison": {}})
+
+    gold_id = modeling_run.gold_identity(gold_dir, ("train", "val", "test"))
+    manifest = {
+        "run_id": run_id,
+        "splits": splits,
+        "gold": gold_dir.relative_to(root.resolve()).as_posix(),
+        "gold_identity": gold_id,
+        "input_columns": list(train.INPUT_COLUMNS),
+        "sources": {"sha256": {}},
+        "variants": {
+            "logistic_regression": {
+                "model": "model",
+                "threshold_file": "threshold.json",
+                "threshold": 0.25,
+                "sha256": modeling_run.inference_hashes(run_dir, "model", "threshold.json"),
+            }
+        },
+    }
+    if include_cache_key:
+        manifest["training_cache_key"] = cache_key or modeling_run.training_cache_key(gold_id, splits)
+    write_json(run_dir / "run.json", manifest)
+    (run_dir / "_SUCCESS").touch()
+    write_json(root / "results" / "results.json", {"flight_delay": {"run_id": run_id}})
+    return run_dir
+
+
+def _build_fake_gold(root: Path) -> Path:
+    """Create minimal en-route Gold partitions and _stage.json via resolve_stage."""
+    from scripts.common.stage_cache import resolve_stage
+
+    def build_gold(directory: Path) -> dict:
+        for split in ("train", "val", "test"):
+            split_dir = directory / split
+            split_dir.mkdir()
+            (split_dir / "part-00000.parquet").write_bytes(b"fixture")
+            (split_dir / "_SUCCESS").touch()
+        return {}
+
+    return resolve_stage(root / "data" / "gold" / "enroute", lambda: {}, ("train", "val", "test"), (), build_gold)
+
+
+def test_model_cache_hit_and_legacy_bootstrap(tmp_path: Path, monkeypatch) -> None:
+    """Verify cache hit for both modern and legacy (no training_cache_key) runs without calling train.train."""
+    from scripts.common.context import PipelineContext
+    from scripts.modeling import run as modeling_run
+
+    gold_dir = _build_fake_gold(tmp_path)
+    splits = {"train": {"start_date": "2024-01-01", "end_date": "2024-09-30"}}
+
+    # Legacy run without training_cache_key (mirrors 20261127T000608624406Z_9783a601).
+    _build_fake_cached_run(tmp_path, "legacy_run_001", gold_dir, splits, include_cache_key=False)
+    monkeypatch.setattr(train, "train", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not train")))
+
+    ctx = PipelineContext(root=tmp_path, config={"splits": splits}, settings={}, run_id="fresh_run", gold_dir=gold_dir)
+    report = modeling_run.run(ctx)
+    assert ctx.run_id == "legacy_run_001"
+    assert report == tmp_path / "models" / "flight_delay" / "legacy_run_001" / "validation.json"
+
+    # Modern run with matching training_cache_key.
+    _build_fake_cached_run(tmp_path, "modern_run_002", gold_dir, splits, include_cache_key=True)
+    ctx2 = PipelineContext(root=tmp_path, config={"splits": splits}, settings={}, run_id="fresh_run_2", gold_dir=gold_dir)
+    report2 = modeling_run.run(ctx2)
+    assert ctx2.run_id == "modern_run_002"
+    assert report2 == tmp_path / "models" / "flight_delay" / "modern_run_002" / "validation.json"
+
+
+def test_model_cache_invalidation_and_force_retrain(tmp_path: Path, monkeypatch) -> None:
+    """Verify cache miss on key mismatch, tampered model hash, or force_retrain=True."""
+    from scripts.modeling import run as modeling_run
+
+    gold_dir = _build_fake_gold(tmp_path)
+    splits = {"train": {"start_date": "2024-01-01", "end_date": "2024-09-30"}}
+    run_dir = _build_fake_cached_run(tmp_path, "cached_run_001", gold_dir, splits, include_cache_key=True)
+
+    gold_id = modeling_run.gold_identity(gold_dir, ("train", "val", "test"))
+    expected_key = modeling_run.training_cache_key(gold_id, splits)
+    assert modeling_run._find_cached_run(tmp_path, gold_id, splits, expected_key) is not None
+
+    # Cache key mismatch invalidates modern run.
+    assert modeling_run._find_cached_run(tmp_path, gold_id, splits, "wrong_key") is None
+
+    # Tampered model artifact invalidates cached run.
+    (run_dir / "model" / "metadata").write_text("tampered", encoding="utf-8")
+    assert modeling_run._find_cached_run(tmp_path, gold_id, splits, expected_key) is None
+
+    # force_retrain=True bypasses even a valid cache.
+    _build_fake_cached_run(tmp_path, "cached_run_002", gold_dir, splits, include_cache_key=True)
+    called = []
+    monkeypatch.setattr(train, "train", lambda *args, **kwargs: called.append(True) or (_ for _ in ()).throw(RuntimeError("retrain_invoked")))
+    with pytest.raises(RuntimeError, match="retrain_invoked"):
+        modeling_run.train_and_publish(None, tmp_path, "new_run_003", gold_dir, splits, {}, {}, force_retrain=True)
+    assert called == [True]

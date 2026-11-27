@@ -2,6 +2,7 @@
 
 import argparse
 from datetime import datetime
+import json
 from pathlib import Path
 import sys
 import time
@@ -48,7 +49,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Run the systems performance and scalability benchmark suite (Issue #4).",
     )
+    parser.add_argument(
+        "--force-retrain",
+        action="store_true",
+        help="Bypass the Phase 1 model cache and force retraining from scratch.",
+    )
     return parser.parse_args(argv)
+
+
+def _has_matching_feature_importance(root: Path, run_id: str) -> bool:
+    """Return True when results/feature_importance.json already matches run_id."""
+    fi_path = root / "results" / "feature_importance.json"
+    if not fi_path.is_file():
+        return False
+    try:
+        payload = json.loads(fi_path.read_text(encoding="utf-8"))
+        return payload.get("run_id") == run_id
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _has_matching_test_evaluation(root: Path, run_id: str) -> bool:
+    """Return True when results/results.json already holds test evaluation for run_id."""
+    results_path = root / "results" / "results.json"
+    if not results_path.is_file():
+        return False
+    try:
+        payload = json.loads(results_path.read_text(encoding="utf-8"))
+        return payload.get("flight_delay", {}).get("test", {}).get("run_id") == run_id
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def _run_phase1(ctx: PipelineContext, *, run_ablation: bool = False) -> Path:
@@ -61,8 +91,14 @@ def _run_phase1(ctx: PipelineContext, *, run_ablation: bool = False) -> Path:
         aircraft_rotation.run(ctx)
         enroute_weather.run(ctx)
         report = modeling.run(ctx)
-        feature_importance.run(ctx)
-        evaluate.run(ctx)
+        if not ctx.force_retrain and _has_matching_feature_importance(ctx.root, ctx.run_id):
+            print(f"  [Cache HIT] Reusing feature importance for {ctx.run_id}.", flush=True)
+        else:
+            feature_importance.run(ctx)
+        if not ctx.force_retrain and _has_matching_test_evaluation(ctx.root, ctx.run_id):
+            print(f"  [Cache HIT] Reusing frozen test evaluation for {ctx.run_id}.", flush=True)
+        else:
+            evaluate.run(ctx)
         if run_ablation:
             ablation.run_ablation(ctx)
     ctx.spark = None
@@ -75,6 +111,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     ctx = PipelineContext.create()
+    ctx.force_retrain = args.force_retrain
 
     modes = ["PHASE 1 (PIPELINE & EVALUATION)"]
     if args.benchmark:
